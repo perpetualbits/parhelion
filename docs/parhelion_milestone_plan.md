@@ -21,6 +21,7 @@
 **Goal:** a repository that builds, tests itself headlessly, and carries the project's memory system.
 **Scope:** repo scaffolding per `CLAUDE.md` layout; docs installed and indexed; cargo workspace with crate skeletons (`core`, `harness`, `dialect`, backends); vendored SPINE core spec under `third_party/spine/`; headless backend rendering a test pattern to memory; golden-screenshot test rig (render → hash/compare with per-pixel tolerance); protocol test rig (spawn a scripted Wayland test client, assert on wire behavior and scene state); CI running build + tests; the Smithay threading investigation spike (can Smithay protocol types be driven from sharded dispatch threads with per-client ordering, or do we consume its backends only?) closed with a decision-log entry.
 **Acceptance:** `make test` green locally and in CI; headless golden test passes; a deliberately broken golden test fails (the rig is proven able to fail); Smithay decision logged; project index lists every document.
+**Status: complete 2026-07-24** (sessions: `_session_2026-07-24_scaffolding`, `_session_2026-07-24_smithay-spike`, `_session_2026-07-24_headless-golden-ci`, `_session_2026-07-24_protocolhost-rig`). Every acceptance item verified green; the item-by-item walk is in the last session summary. Deliverables: cargo workspace + docs/memory system; headless backend (`test_pattern`); golden rig with a proven-able-to-fail meta-test; `ProtocolHost` (shards = 1) + scene ledger + protocol rig; CI workflow; Smithay threading decision logged.
 
 ## M1 — One window, honestly
 

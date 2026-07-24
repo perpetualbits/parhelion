@@ -1,0 +1,48 @@
+# Parhelion CI — the completion gate (`make test`) on every push and PR.
+#
+# Governing docs: `docs/parhelion_milestone_plan.md` M0 (CI runs build + tests),
+# `CLAUDE.md` ("Test before declaring done" → `make test` = workspace tests +
+# clippy -D warnings). This is the M0 skeleton: one job, one gate.
+#
+# NO system-package (apt) step exists, on purpose. Per the Smithay spike
+# (`docs/smithay_threading_spike.md` §1) the protocol layer uses the pure-Rust
+# wayland-backend and needs no libwayland; and this milestone's harness uses no
+# Smithay at all — only the pure-Rust `png` codec. The runner therefore needs
+# nothing beyond a Rust toolchain. When a real DRM/KMS backend arrives (M2), the
+# hardware-touching tests get their own job with the packages they need.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: make test (build + tests + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Stable toolchain with clippy — `make test` runs `cargo clippy` with
+      # warnings denied, so the clippy component is required.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # Cache the cargo registry and target dir keyed on the lockfiles.
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # The one gate: workspace tests, then clippy -D warnings (the CI profile
+      # where the workspace's warn-level lints become hard failures).
+      - name: make test
+        run: make test

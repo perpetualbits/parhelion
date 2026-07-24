@@ -7,5 +7,17 @@
 //! particular the frame path must not block (I-1) and the core must not call a
 //! server synchronously (I-3) or run third-party code (I-4).
 //!
-//! M0 status: empty skeleton. The core is built up from M1 onward per
-//! `docs/parhelion_milestone_plan.md`; this session creates only the crate.
+//! # M0 contents
+//!
+//! - [`protocol::ProtocolHost`] — the Wayland protocol frontend at
+//!   `shards = 1`, per the decision "2026-07-24 — Smithay threading fit". It
+//!   owns a dispatch thread (the `Display`) and publishes surface lifecycle to
+//!   the scene by message (CORE-BOUNDARY §7, C3).
+//! - [`ledger::Ledger`] — the minimal receiving side of that edge: live
+//!   surfaces by core-assigned id, and nothing the M1 scene graph must fight.
+//!
+//! The scene graph, render loop, and everything else in CORE-BOUNDARY §3 arrive
+//! from M1 onward (`docs/parhelion_milestone_plan.md`).
+
+pub mod ledger;
+pub mod protocol;

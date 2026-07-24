@@ -24,7 +24,7 @@ This document draws the single most important line in the system: **what runs in
 
 ## 3. What is IN the core
 
-Exhaustive. Anything not listed here is outside (§4). Additions require an ADR.
+Exhaustive. Anything not listed here is outside (§4). Additions require a decision-log entry.
 
 | # | Component | Why it cannot leave |
 |---|-----------|---------------------|
@@ -50,7 +50,7 @@ For any proposed component, apply in order; first match wins:
 3. **Can it block, sleep, do I/O, or take unbounded time?** → Server, or restructure so the blocking part is a server and only a declarative result crosses into the core.
 4. **Is it policy?** (a decision that a reasonable user might want different) → Server on the control plane.
 5. **Is it on the frame path or does it own hardware privilege?** → Core.
-6. **Otherwise** → default to Server; in-core placement requires an ADR arguing timing necessity.
+6. **Otherwise** → default to Server; in-core placement requires a decision-log entry arguing timing necessity.
 
 Memory safety is *not* a criterion: Rust provides it in-process. Process boundaries here buy **fault**, **timing**, and **privilege** isolation only (VISION Thesis 2).
 
@@ -69,7 +69,7 @@ Each invariant names its enforcement mechanism. An invariant without a test is a
 - **I-9 — Regime collapse is mandatory.** After the last active animation/3D interaction on an output, that output MUST return to damage-tracked, plane-offloaded operation within 2 frames. *Enforced by:* instrumentation counters + CI scenario test.
 - **I-10 — Every byte of GPU work is attributable.** Per-client (including per-server) accounting of VRAM and GPU-time, so a misbehaving client is identifiable and quota-limitable. Prerequisite for I-8's quotas and for debugging the founding grievance ("what is stuttering my desktop?").
 - **I-11 — Explicit sync is the primary path.** `linux-drm-syncobj-v1` throughout; implicit sync is a compatibility shim. (Required by Rayland's remotable-sync design; also the modern driver reality.)
-- **I-12 — Ship intent across every boundary.** Any protocol, internal or external, that transports results (pixels, per-frame positions) where intent (descriptors, programs) would suffice requires an ADR documenting why. (VISION §2.)
+- **I-12 — Ship intent across every boundary.** Any protocol, internal or external, that transports results (pixels, per-frame positions) where intent (descriptors, programs) would suffice requires a decision-log entry documenting why. (VISION §2.)
 
 ## 6. Process inventory (initial)
 
@@ -87,7 +87,7 @@ Each invariant names its enforcement mechanism. An invariant without a test is a
 | W1 | Extension host: WASM components, fuel/epoch-preempted, capability-scoped imports | per-extension grants | kill/suspend per extension | control plane (scoped) |
 | U1 | Portal/screenshot/screencast service | explicit user-granted capabilities | kill-and-resync | Wayland ext + portals D-Bus |
 
-\* Lock screen requires special care: its *enforcement* (input capture, blanking policy) is core capability logic; only its *rendering* is S2. An unlockable-but-crashed lock UI must fail *locked*. → ADR required before implementation.
+\* Lock screen requires special care: its *enforcement* (input capture, blanking policy) is core capability logic; only its *rendering* is S2. An unlockable-but-crashed lock UI must fail *locked*. → decision-log entry (with reasoning in a design doc) required before implementation.
 
 ## 7. Threading model inside the core
 
@@ -115,7 +115,7 @@ RT honesty (from VISION): SCHED_FIFO on T-input/T-commit bounds *CPU-side* jitte
 - Every message carries the submitting client's security context; the core enforces (I-7).
 - Versioned; a server built against an older control plane keeps working or fails cleanly at connect.
 
-## 10. Open questions (each becomes an ADR when settled)
+## 10. Open questions (each becomes a decision-log entry when settled)
 
 1. Lock-screen fail-locked design (§6 note).
 2. Animation IR expressiveness: exact curve/spring/timeline vocabulary of C7; what is deliberately inexpressible.

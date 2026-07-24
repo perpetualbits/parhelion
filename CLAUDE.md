@@ -8,7 +8,7 @@ touching any file.
 
 ## What this project is
 
-**Parhelion** (working title) is a Wayland compositor built as a
+**Parhelion** is a Wayland compositor built as a
 3D-native scene-graph engine with microkernel discipline: a small,
 realtime-capable core surrounded by isolated, restartable,
 capability-scoped server processes. It exists to be three things at
@@ -116,7 +116,7 @@ by name.
 | Milestones | — | `docs/parhelion_milestone_plan.md` |
 | Core (scene, render loop, protocol) | `crates/core/` | `CORE-BOUNDARY.md` §3, §7 until it earns its own doc |
 | Backends (headless, winit, DRM/KMS) | `crates/backend-*/` | (no standalone doc yet) |
-| Test harness (golden + protocol rigs) | `crates/harness/` | (no standalone doc yet; M0 creates it) |
+| Test harness (golden + protocol rigs) | `crates/harness/` | `docs/harness_design.md` |
 | Supervisor (P0) | `crates/supervisor/` | `CORE-BOUNDARY.md` §6, §8 |
 | Reference policy daemon (S1) | `crates/policyd/` | (no standalone doc yet) |
 | Vendored SPINE core spec | `third_party/spine/` | ENO's spec at pinned version — read-only |

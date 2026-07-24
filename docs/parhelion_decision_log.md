@@ -136,9 +136,31 @@ below, reasoning now living in the dialect spec and VISION.md.)
   Firmament, Penumbra) are dropped. The repo, crate names (`parhelion-*`),
   and docs already use it.
 
+## 2026-07-24 — Smithay threading fit (M0 task 2)
+
+### Smithay is consumed as the protocol frontend (+ later hardware backends); its renderer and desktop/space layers are bypassed
+
+- **Source:** M0 task 2 investigation spike; report `docs/smithay_threading_spike.md`; runnable evidence `tools/spikes/smithay-threading/`.
+- **Affects:** `crates/core/` protocol layer; `CORE-BOUNDARY.md` §7 (satisfied, not amended) and open question §10.4 (resolved); M0 task 3 (headless backend + protocol harness).
+- **Decision:** Consume `smithay::wayland::*` (protocol handlers, delegate macros) on `wayland-server` 0.31 as the protocol frontend, and Smithay's `backend::*` (DRM/session/libinput/udev/egl/allocator, winit) at M1/M2. Bypass Smithay's `renderer` and `desktop` layers — Parhelion supplies its own 3D-native renderer, scene graph, and regime machine. Wrap `input` and dmabuf/syncobj.
+- **Reasoning:** `Display<State>` is unconditionally `Send + Sync` (State is borrowed at dispatch, not owned), so protocol state can live on a dispatch thread and publish scene changes by message — the §7 T-proto[n] → scene edge — proven to compile and run. Smithay's API churn is concentrated in the renderer/DRM layers (the bypassed/wrapped ones); the depended-upon frontend is its most stable layer.
+
+### Protocol dispatch runs at shards = 1 behind a shard-count-agnostic ProtocolHost interface
+
+- **Source:** same spike.
+- **Affects:** `crates/core/` protocol layer; M1 thread skeleton.
+- **Decision:** Dispatch runs single-threaded (shards = 1) now. The core's protocol layer is structured as a `ProtocolHost` that assigns each accepted client to a shard at accept time (`ListeningSocket::accept` → `DisplayHandle::insert_client`), so growing to N `Display`-per-thread shards is an implementation change, not an architectural one. Requirements: canonical state reachable from protocol threads only by message; only `Send` tokens (`ObjectId`/core `SurfaceId`) cross to the scene; globals/capabilities advertised identically per-`Display`.
+- **Reasoning:** CORE-BOUNDARY §7 specifies ownership, not a mandatory shard count. Protocol dispatch is not the frame path, so I-1/I-2 are unaffected by a single dispatch thread; escalate 1→N only on measured contention. No §7 conflict was found.
+
+### Smithay is pinned exactly (=0.7.0) with a committed lockfile; upgrades are deliberate
+
+- **Source:** same spike; cosmic-comp's git-pin pain as counter-example.
+- **Affects:** `crates/core/Cargo.toml` (when the protocol layer lands); dependency-update policy.
+- **Decision:** Pin `smithay = "=0.7.0"` (exact) + commit `Cargo.lock`; upgrades are batched, deliberate, and land behind the `ProtocolHost`/renderer-wrapper seams. Mirrors the SPINE vendored-pinned-deliberate-import discipline.
+- **Reasoning:** Smithay now ships on crates.io (0.4.0+, 2025); exact-pin + lockfile avoids the `wayland-backend` resolution conflicts that dominate downstream (cosmic-comp) breakage reports. Pins recorded in the spike's `Cargo.lock`: smithay 0.7.0, wayland-server 0.31.14, wayland-backend 0.3.16, calloop 0.14.4.
+
 ## Pending
 
-- Smithay threading fit (investigation task before M0).
 - Lock-screen fail-locked design (`CORE-BOUNDARY.md` §6 note).
 - Adoption of ENO's project-index + sessions/ + diary structure:
   agreed in principle; instantiate at repo creation.

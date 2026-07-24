@@ -1,11 +1,27 @@
 # crates/core — the Parhelion core process.
 # Canonical design: `docs/CORE-BOUNDARY.md` §3 (what is in the core) and §7
-# (in-core threading). M0 status: empty skeleton, no functional code.
+# (in-core threading). This crate hosts the M0 `ProtocolHost` skeleton (the
+# Wayland protocol frontend at shards = 1), governed by the decision-log entry
+# "2026-07-24 — Smithay threading fit".
 [package]
 name = "parhelion-core"
 version = "0.0.0"
 edition = "2024"
 publish = false
+
+[dependencies]
+# Smithay is the Wayland protocol frontend (decision 2026-07-24). Pinned EXACTLY
+# per that decision (upgrades are deliberate, batched, behind this seam), with
+# the workspace `Cargo.lock` committed as the authoritative resolved-version
+# record.
+#
+# `default-features = false` drops Smithay's whole hardware/renderer stack
+# (DRM/GBM/EGL/udev/libinput/winit/vulkan/xwayland/renderers) — none of which M0
+# uses, and all of which we bypass or wrap per the layer-selection decision.
+# `wayland_frontend` is the one feature we want: it pulls `wayland-server` +
+# `wayland-protocols` and enables `smithay::wayland::compositor` (the
+# `CompositorHandler` + `delegate_compositor!` machinery the ProtocolHost uses).
+smithay = { version = "=0.7.0", default-features = false, features = ["wayland_frontend"] }
 
 # Inherit the workspace lint policy (see the root Cargo.toml).
 [lints]

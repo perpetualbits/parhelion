@@ -36,6 +36,8 @@ the standing instruction set every session obeys.
 | `docs/parhelion_desktop_dialect.md` | The `desktop` SPINE dialect: the declarative control plane and C7 interpreter contract. | Installed, authoritative · stub v0.1 |
 | `docs/parhelion_milestone_plan.md` | Milestone sequencing M0..M9; each milestone is a usable compositor (P3). | Installed, authoritative · v0.1 |
 | `docs/parhelion_decision_log.md` | Append-only log of load-bearing decisions; read second, after this index. | Installed, living |
+| `docs/smithay_threading_spike.md` | M0 task 2 investigation spike: can Smithay be driven inside CORE-BOUNDARY §7, and which layers we consume. Report + recommendation; decision landed 2026-07-24. | Installed · complete |
+| `docs/harness_design.md` | Canonical design for the test harness: frame/golden format, comparator tolerance policy, blessing workflow, determinism contract, failure artifacts (P8). | Installed, authoritative · Draft v0.1 |
 | `docs/parhelion_project_index.md` | This file. | Living |
 | `docs/diary.md` | Running narrative diary; the why behind non-obvious choices, tagged. | Living |
 | `docs/sessions/` | One summary per Claude Code session (files changed, build/test result). | Living · `_session_2026-07-24_scaffolding.md` |
@@ -58,8 +60,8 @@ document; never create a parallel document on the same topic.
 | Control plane (`desktop` dialect, C7) | `crates/dialect/` | `docs/parhelion_desktop_dialect.md` | Skeleton crate |
 | Milestones | — | `docs/parhelion_milestone_plan.md` | Yes |
 | Core (scene, render loop, protocol) | `crates/core/` | `docs/CORE-BOUNDARY.md` §3, §7 (until it earns its own doc) | Skeleton crate |
-| Backends (headless, winit, DRM/KMS) | `crates/backend-*/` | (no standalone doc yet) | `backend-headless` skeleton only |
-| Test harness (golden + protocol rigs) | `crates/harness/` | (no standalone doc yet; M0 creates it) | Skeleton crate |
+| Backends (headless, winit, DRM/KMS) | `crates/backend-*/` | (no standalone doc yet) | `backend-headless` renders the M0 test pattern to memory |
+| Test harness (golden + protocol rigs) | `crates/harness/` | `docs/harness_design.md` | Golden rig present; protocol rig is task 3b |
 | Supervisor (P0) | `crates/supervisor/` | `docs/CORE-BOUNDARY.md` §6, §8 | Not yet (from M4) |
 | Reference policy daemon (S1) | `crates/policyd/` | (no standalone doc yet) | Not yet (from M4) |
 | Vendored SPINE core spec | `third_party/spine/` | ENO's spec at pinned v0.4 — read-only | Dir present, empty |
@@ -71,9 +73,15 @@ workspace members yet; they appear at the milestone that needs them.
 
 ## Current state
 
-- **Milestone:** M0 (Skeleton & harness). This session completed M0 task 1
-  (scaffolding); the headless backend, golden-test rig, protocol rig, CI, and
-  the Smithay threading spike are later M0 tasks, each with its own prompt
-  (`docs/parhelion_milestone_plan.md` M0).
-- **Workspace members:** `parhelion-core`, `parhelion-dialect`,
-  `parhelion-harness`, `parhelion-backend-headless` — all empty skeletons.
+- **Milestone:** M0 (Skeleton & harness) — **complete 2026-07-24** (see the
+  milestone plan's M0 status line). Task 1 (scaffolding); task 2 (Smithay
+  threading spike — `docs/smithay_threading_spike.md`, decision landed); task 3a
+  (headless backend + golden rig + CI — `docs/harness_design.md`); task 3b
+  (`ProtocolHost` shards = 1 + scene ledger + protocol rig + static guards). Next
+  is M1. `make test`: 20 tests green, clippy clean.
+- **Spikes:** `tools/spikes/smithay-threading/` — reference code for the M0
+  task 2 spike; its own cargo workspace, excluded from `make test`.
+- **Workspace members:** `parhelion-core` (protocol frontend: `ProtocolHost` +
+  ledger), `parhelion-harness` (golden + protocol rigs),
+  `parhelion-backend-headless` (test-pattern frame producer), `parhelion-dialect`
+  (still a skeleton — arrives at M3).

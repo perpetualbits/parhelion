@@ -1,0 +1,5 @@
+# This spike is its own cargo workspace, so its build output lands here rather
+# than in the repo-root /target that the top-level .gitignore covers. Cargo.lock
+# IS committed on purpose: it is the authoritative record of the exact resolved
+# dependency versions the report cites as evidence (smithay 0.7.0, wayland-*).
+/target/

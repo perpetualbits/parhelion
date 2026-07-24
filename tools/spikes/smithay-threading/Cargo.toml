@@ -1,0 +1,27 @@
+# Spike crate — Smithay threading fit (M0 task 2).
+#
+# This is investigation / reference code, NOT part of the production build.
+# The empty `[workspace]` table below makes this crate its OWN workspace root,
+# so the parent Parhelion workspace (../../../Cargo.toml) ignores it entirely:
+# `make test` runs `cargo test --workspace` from the repo root and never touches
+# this directory. That keeps the spike's heavy dependency tree (smithay + the
+# wayland-rs stack) out of the production gate, as the prompt requires.
+[workspace]
+
+[package]
+name = "smithay-threading-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The protocol foundation we actually care about. `smithay` re-exports and
+# builds on `wayland-server` / `wayland-backend`; we pull it in to read the
+# real Send/Sync bounds and to drive the split experiment against the same
+# types core/ would use. Exact resolved versions are recorded in the report.
+smithay = { version = "0.7", default-features = false, features = ["wayland_frontend"] }
+wayland-server = "0.31"
+# Client side of the split experiment: a scripted in-process Wayland client that
+# connects over a socketpair to the server thread. Same wayland-rs generation as
+# wayland-server (0.31) so the wire types line up.
+wayland-client = "0.31"

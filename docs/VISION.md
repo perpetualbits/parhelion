@@ -2,9 +2,9 @@
 
 > **Re-entrancy header** — read this block to reconstitute context.
 > **Status:** Draft v0.1 · **Date:** 2026-07-23 · **Kind:** P1 — founding vision, governs all other documents.
-> **What this is:** the why and the non-negotiables of the Parhelion compositor. Every design doc, ADR, and task description is downstream of this file. When code and this file disagree, this file wins until amended.
-> **Working name:** "Parhelion" is a placeholder (see §7).
-> **Companion documents:** `CORE-BOUNDARY.md` (what lives in the core process and why), `decisions/` (append-only decision log, ADR-style), `DIARY.md` (session diary).
+> **What this is:** the why and the non-negotiables of the Parhelion compositor. Every design doc, decision-log entry, and task description is downstream of this file. When code and this file disagree, this file wins until amended.
+> **Name:** Parhelion — settled 2026-07-24 (see §7 and the decision log).
+> **Companion documents:** `CORE-BOUNDARY.md` (what lives in the core process and why), `docs/parhelion_decision_log.md` (append-only decision log, ENO pointer style), `docs/diary.md` (session diary), `docs/parhelion_project_index.md` (master index).
 > **Sibling project:** [Rayland](https://github.com/perpetualbits/rayland) — native remote GPU rendering for Wayland. Parhelion is its reference S-side host.
 
 ---
@@ -83,14 +83,14 @@ Rayland clients attach through a proxy that holds enough state to detach and rea
 
 ## 7. Naming
 
-"Parhelion" — a *sundog*: a bright second sun that appears beside the real one, produced by refracted rays. The lineage nod (Sun Ray → Rayland → a companion that renders by rays) is intentional; the metaphor (a faithful second image of something whose light originates elsewhere) is on-point for the Rayland reference host. Alternatives considered: Sundog (friendlier, less unique), Analemma, Firmament, Penumbra. Final choice is ADR-0001; nothing below the repo name depends on it.
+**Parhelion** — a *sundog*: a bright second sun that appears beside the real one, produced by refracted rays. The lineage nod (Sun Ray → Rayland → a companion that renders by rays) is intentional; the metaphor (a faithful second image of something whose light originates elsewhere) is on-point for the Rayland reference host. Settled 2026-07-24 at repo creation (`github.com/perpetualbits/parhelion`); alternatives considered: Sundog, Analemma, Firmament, Penumbra. Recorded in the decision log.
 
 ## 8. How this project is run
 
 - **Documents are authoritative; code is downstream.** Claude Code tasks cite doc sections; contradictions discovered in implementation come back as design questions and amend the doc *before* the code.
-- **Decision log** (`decisions/`): append-only, dated, one decision per entry — chose X, rejected Y, because Z, revisit-if W. Never edited after acceptance; superseded by later entries. Existence rule: any argument that happens twice must become an entry.
-- **Diary** (`DIARY.md`): dated, informal, append-only; what was attempted, what surprised us, what to pick up next session. The diary is for narrative memory; the decision log is for settled reasoning.
-- **Re-entrant documents:** every governing document begins with a re-entrancy header (status, date, kind, what it governs, companions) sufficient for a cold session — human or model — to orient without reading history.
+- **Decision log** (`docs/parhelion_decision_log.md`): append-only, dated, one decision per entry in ENO's pointer style — Source, Affects, one-line reasoning; the full reasoning lives in the subsystem document the entry points to. Entries are never edited after acceptance; they are superseded by later entries. Existence rule: any argument that happens twice must become an entry.
+- **Diary** (`docs/diary.md`): dated, informal, append-only, tagged; what was attempted, what surprised us, what to pick up next session. The diary is for narrative memory; the decision log is for settled reasoning.
+- **Re-entrant documents:** every governing document begins with a re-entrancy header (status, date, kind, what it governs, companions) sufficient for a cold session — human or model — to orient without reading history. `docs/parhelion_project_index.md` is the entry point; the mandatory reading order for new sessions is index → decision log → `CORE-BOUNDARY.md` §4–§5.
 - **Milestones are usable compositors.** Every milestone from M0 onward boots, composes, and is daily-drivable at its own level of ambition. There is no "big bang integration" phase.
 
-*(These conventions inherit from the ENO project's practice; align details with ENO's actual formats when transcribing them into `decisions/0000-conventions.md`.)*
+*(These conventions are adopted from the ENO project's practice — see ENO's `CLAUDE.md` and `eno_decision_log.md`. Alignment performed 2026-07-24; the operational rules live in this repo's `CLAUDE.md`.)*

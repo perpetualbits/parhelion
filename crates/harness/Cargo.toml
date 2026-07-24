@@ -1,12 +1,29 @@
 # crates/harness — headless golden-screenshot and protocol test rigs.
 # Governing docs: `docs/parhelion_milestone_plan.md` M0 (the rig is the
-# project's velocity multiplier). M0 status: empty skeleton; the rigs are
-# later M0 tasks with their own prompts.
+# project's velocity multiplier) and `docs/harness_design.md` (this rig's
+# canonical design). M0 status: the golden rig (this crate) is task 3a; the
+# protocol rig is task 3b (prompt 03).
 [package]
 name = "parhelion-harness"
 version = "0.0.0"
 edition = "2024"
 publish = false
+
+[dependencies]
+# The frame producer under test. The harness compares `Frame`s and renders the
+# test pattern for its first real golden.
+parhelion-backend-headless = { path = "../backend-headless" }
+# The core under test by the protocol rig — the rig drives a real `ProtocolHost`.
+parhelion-core = { path = "../core" }
+# Client side of the protocol rig: an in-process scripted Wayland client that
+# connects to the ProtocolHost over a socketpair. Same wayland-rs generation
+# (0.31) as the wayland-server the core frontend uses.
+wayland-client = "0.31"
+# PNG codec for golden storage. `png` is the minimal, pure-Rust, C-free choice —
+# it keeps CI apt-install-free (spike report §1). Heavier alternatives (`image`)
+# pull many format decoders we do not need; `lodepng` is a C port. Not a
+# load-bearing decision, so recorded here rather than in the decision log.
+png = "0.17"
 
 # Inherit the workspace lint policy (see the root Cargo.toml).
 [lints]

@@ -88,12 +88,19 @@ window.PROJECT_MAP = {
       deps: [],
     },
     {
-      id: "buffers-shm", label: "wl_shm buffers", layer: "protocol", status: "active",
+      id: "buffers-shm", label: "wl_shm buffers", layer: "protocol", status: "done",
       tags: ["M1", "T3"],
-      desc: "Shared-memory buffer attach / commit / release. Committed pixels become an Shm texture source (a CPU copy, correctness over speed) and the buffer-release timing follows the protocol. This is also the seam-check: shm protocol handling without importing Smithay's renderer traits.",
-      files: [],
-      specs: [{ label: "M1 tasks — T3", href: "docs/plans/m1_tasks.md" }],
-      parts: [],
+      desc: "Shared-memory buffer attach / commit / release. At commit the dispatch thread copies + decodes the buffer into an owned pixel block and releases the wl_buffer immediately (single-buffer clients run; destroy-after-commit is safe by construction). The seam check PASSED: handled through smithay::wayland::shm with no smithay::backend::renderer type — grep-verifiable.",
+      files: ["crates/core/src/protocol.rs"],
+      specs: [
+        { label: "scene_graph_v1.md §3.1", href: "docs/scene_graph_v1.md" },
+        { label: "M1 tasks — T3", href: "docs/plans/m1_tasks.md" },
+      ],
+      parts: [
+        { label: "Copy-at-commit + release", status: "done", desc: "Dispatch-thread memcpy (off the frame path, I-1); immediate release." },
+        { label: "argb8888 / xrgb8888", status: "done", desc: "Decoded to RGBA; format folded into the node's opaque flag." },
+        { label: "Seam check", status: "done", desc: "No renderer types imported; the frontend/renderer split held." },
+      ],
       deps: ["protocol-host", "texture-seam"],
     },
     {
@@ -115,12 +122,20 @@ window.PROJECT_MAP = {
       deps: ["protocol-host", "winit"],
     },
     {
-      id: "frame-callbacks", label: "Frame callbacks & flush", layer: "protocol", status: "active",
+      id: "frame-callbacks", label: "Frame callbacks & flush", layer: "protocol", status: "done",
       tags: ["M1", "T2"],
-      desc: "The reverse direction: wl_surface.frame callbacks fired from the render side when a frame is presented, flush ownership settled (the dispatch thread flushes; the render side only enqueues), and a backpressure policy so a flooding client cannot stall its shard-mates.",
-      files: [],
-      specs: [{ label: "M1 tasks — T2", href: "docs/plans/m1_tasks.md" }],
-      parts: [],
+      desc: "The reverse direction: wl_surface.frame callbacks fired from the render side when a frame is presented, flush ownership settled (the dispatch thread flushes once per loop; the render side only enqueues), and the backpressure policy so a flooding client cannot stall its shard-mates. The render→dispatch notice is a wait-free atomic timestamp + a calloop ping (I-1); every Wayland object stays on the dispatch thread (§7).",
+      files: ["crates/core/src/protocol.rs", "crates/core/src/render.rs"],
+      specs: [
+        { label: "scene_graph_v1.md §8", href: "docs/scene_graph_v1.md" },
+        { label: "M1 tasks — T2", href: "docs/plans/m1_tasks.md" },
+      ],
+      parts: [
+        { label: "Frame-presented notice", status: "done", desc: "FramePresenter: atomic timestamp + ping, coalescing and single-slot bounded." },
+        { label: "wl_surface.frame → done", status: "done", desc: "Dispatch thread drains committed callbacks per tick; v1 fires all pending (occlusion gating is M2)." },
+        { label: "Single flush site", status: "done", desc: "One flush_clients per loop iteration; grep-verifiable." },
+        { label: "Per-client backpressure", status: "done", desc: "Pending-callback cap; over-bound clients unscheduled, not killed (I-10)." },
+      ],
       deps: ["protocol-host", "render-loop"],
     },
 
@@ -154,12 +169,12 @@ window.PROJECT_MAP = {
     {
       id: "texture-seam", label: "Texture-source seam", layer: "state", status: "seam",
       tags: ["Rayland", "C9"],
-      desc: "The single point where the scene decides what a node is textured with, carrying the rule that nothing may assume pixels are locally produced. Ships Solid now; Shm, dmabuf, and the Rayland token buffer attach here as later work fills them in.",
+      desc: "The single point where the scene decides what a node is textured with, carrying the rule that nothing may assume pixels are locally produced. Ships Solid and Shm now (Shm as a source-neutral PixelBuffer, so the renderer never learns its origin); dmabuf and the Rayland token buffer attach here as later work fills them in.",
       files: ["crates/core/src/scene/node.rs"],
       specs: [{ label: "scene_graph_v1.md §3", href: "docs/scene_graph_v1.md" }],
       parts: [
         { label: "Solid colour", status: "done", desc: "Test source + built-in C10 fallbacks." },
-        { label: "Shm", status: "active", desc: "Declared placeholder; T3 makes it real." },
+        { label: "Shm", status: "done", desc: "Real (T3): a wl_shm buffer decoded into a source-neutral pixel block." },
         { label: "dmabuf", status: "planned", desc: "Local GPU buffer import (M2)." },
         { label: "Rayland token buffer", status: "planned", desc: "S-side remote source (M6, CORE-BOUNDARY C9)." },
       ],
@@ -208,8 +223,8 @@ window.PROJECT_MAP = {
     },
     {
       id: "cpu-compositor", label: "CPU compositor v1", layer: "render", status: "done",
-      tags: ["M1", "T1"],
-      desc: "Paints a snapshot into an in-memory frame: clear, then draw each node back-to-front (painter's algorithm) as a clipped solid rectangle, integer-only and tolerance-0. Lives in the backend crate alongside the Frame it renders, so the core depends on no backend.",
+      tags: ["M1", "T1", "T3"],
+      desc: "Paints a snapshot into an in-memory frame: clear, then draw each node back-to-front (painter's algorithm), integer-only and tolerance-0. Blits both solid colours and shm pixel blocks through one clip + integer source-over path — it knows nothing about 'shm', just a PixelBuffer (T3). Lives in the backend crate alongside the Frame it renders, so the core depends on no backend.",
       files: ["crates/backend-headless/src/composite.rs"],
       specs: [{ label: "scene_graph_v1.md §6", href: "docs/scene_graph_v1.md" }],
       parts: [],

@@ -17,6 +17,8 @@
 //! scope creep; building types that *forbid* 3D would be a Thesis-1 violation —
 //! the vocabulary is open, the implementation is narrow.
 
+use std::sync::Arc;
+
 /// A core-assigned surface identifier — the key under which the scene holds a
 /// node. Assigned by the protocol dispatch thread when a surface is created and
 /// the only surface handle that crosses the channel into the scene (never a
@@ -72,6 +74,30 @@ impl Default for Transform {
     }
 }
 
+/// A block of decoded, tightly-packed RGBA8 pixels — the CPU-accessible pixel
+/// data a [`TextureSource`] can carry, shared cheaply by [`Arc`].
+///
+/// **Source-neutral on purpose.** This is where a `wl_shm` buffer's contents land
+/// after the dispatch thread copies and decodes them (T3), but the type says
+/// nothing about *where* the pixels came from — that is the seam rule below made
+/// concrete. A future dmabuf that gets read back to the CPU, or a Rayland replay
+/// that produces CPU pixels, would populate the same block; only the copy path
+/// (in the protocol frontend) knows the origin. The renderer blits this and asks
+/// no questions.
+///
+/// `rgba` is exactly `width * height * 4` bytes, row-major, top-left origin, no
+/// stride padding (the copy path strips the buffer's stride) — matching the
+/// `Frame` layout the compositor writes into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PixelBuffer {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// RGBA8 pixels, row-major, `width * height * 4` bytes, tightly packed.
+    pub rgba: Vec<u8>,
+}
+
 /// Where a node's pixels come from — **the Rayland seam**.
 ///
 /// This binding is the single point at which the scene graph and renderer decide
@@ -83,22 +109,23 @@ impl Default for Transform {
 /// A node does not know whether its texture came from a local shared-memory
 /// buffer, a local GPU dmabuf, or a Rayland replay service rendering on behalf of
 /// a board across the network (`docs/VISION.md` Thesis 1; `CORE-BOUNDARY.md` C9).
-/// M1 ships exactly two members: [`TextureSource::Solid`] (used by tests and by
-/// the C10 fallback family) and a declared [`TextureSource::Shm`] placeholder
-/// that T3 implements. The future members — `Dmabuf`, and the Rayland
-/// **token-buffer** source (`CORE-BOUNDARY.md` C9) — attach here; keeping them
-/// out of the type today is scope discipline, not a closed door.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// M1 ships two members: [`TextureSource::Solid`] (tests + the C10 fallback
+/// family) and [`TextureSource::Shm`] (T3 — a `wl_shm` buffer copied into a
+/// source-neutral [`PixelBuffer`]). The future members — `Dmabuf`, and the
+/// Rayland **token-buffer** source (`CORE-BOUNDARY.md` C9) — attach here; keeping
+/// them out of the type today is scope discipline, not a closed door.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TextureSource {
     /// A solid RGBA colour, `[r, g, b, a]`. The M1 test source and the substrate
     /// of the built-in C10 fallbacks (solid decorations, "server crashed"
     /// surface). Composited by the CPU compositor directly, no buffer import.
     Solid([u8; 4]),
-    /// Placeholder for shared-memory buffers (`wl_shm`), implemented in T3
-    /// (`docs/plans/m1_tasks.md`). Present so the seam's shape is fixed now; a
-    /// node carrying it is rejected by the M1 compositor (there are none in M1
-    /// tests). Not constructed anywhere in M1 code.
-    Shm,
+    /// A decoded shared-memory buffer's pixels (`wl_shm`, T3). The dispatch
+    /// thread copies the client's `argb8888`/`xrgb8888` buffer into this
+    /// source-neutral [`PixelBuffer`] at commit and releases the `wl_buffer`
+    /// immediately; the renderer blits the block knowing nothing about "shm"
+    /// (the seam rule above). Shared by [`Arc`] so snapshots are cheap.
+    Shm(Arc<PixelBuffer>),
     // Future sources (attach here; the seam rule above governs all of them):
     //   Dmabuf(..)        — local GPU buffer import (M2)
     //   RaylandToken(..)  — token-buffer S-side source (CORE-BOUNDARY C9)
@@ -113,7 +140,11 @@ pub enum TextureSource {
 /// and a non-empty size; a freshly-created surface with neither is live in the
 /// scene but contributes no pixels, exactly as a real client's surface is silent
 /// until it attaches a buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// No longer `Copy`: a node's [`TextureSource`] may hold an `Arc<PixelBuffer>`
+/// (shm), so the node is `Clone` (a cheap ref-count bump for the pixels) but not
+/// trivially copyable.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SceneNode {
     /// The client that created this surface (attribution + bulk cleanup).
     pub client: ClientKey,

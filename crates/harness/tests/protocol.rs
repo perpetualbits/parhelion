@@ -26,7 +26,7 @@ use parhelion_backend_headless::composite::CpuCompositor;
 use parhelion_core::protocol::{ProtocolHost, MAX_PENDING_FRAME_CALLBACKS};
 use parhelion_core::render::RenderLoop;
 use parhelion_core::scene::{ClientKey, SceneThread, SurfaceId};
-use parhelion_harness::protocol_rig::ScriptedClient;
+use parhelion_harness::protocol_rig::{ScriptedClient, ShmFormat};
 
 /// Bring up a scene, a host publishing into it, and one scripted client over a
 /// fresh socketpair. Returns all three; the client's `connect` already asserts
@@ -271,13 +271,20 @@ fn flooding_client_is_throttled_second_client_served_and_bounded() {
     let mut b = ScriptedClient::connect(cb);
 
     let surf_a = a.create_surface();
+    // A's commits now carry a real shm buffer (T3 regression): the same 2×2
+    // buffer, re-attached each commit, exercises the copy-at-commit path under
+    // flood. The throttle bounds the *callback* backlog regardless.
+    let mut pool_a = a.create_pool(2 * 2 * 4);
+    pool_a.write(&[255u8; 2 * 2 * 4]);
+    let buf_a = a.create_buffer(&pool_a, 2, 2, ShmFormat::Xrgb8888);
 
-    // Flood A up to the bound: each frame+commit+roundtrip adds exactly one
+    // Flood A up to the bound: each frame+attach+commit+roundtrip adds exactly one
     // pending callback. Stop the instant the bound is reached — one more
     // round-trip would hit A's now-throttled (unread) socket and block forever.
     let bound = MAX_PENDING_FRAME_CALLBACKS;
     while host.pending_frame_callbacks() < bound {
         let _cb = a.frame(&surf_a);
+        a.attach(&surf_a, &buf_a);
         a.commit(&surf_a);
         a.roundtrip();
     }
@@ -293,6 +300,7 @@ fn flooding_client_is_throttled_second_client_served_and_bounded() {
     const EXTRA: usize = 2000;
     for _ in 0..EXTRA {
         let _cb = a.frame(&surf_a);
+        a.attach(&surf_a, &buf_a);
         a.commit(&surf_a);
     }
     a.flush();
@@ -331,5 +339,48 @@ fn flooding_client_is_throttled_second_client_served_and_bounded() {
         h.query(|s| s.surface_count_for(ClientKey(0))),
         1,
         "A still connected (throttled, not disconnected)"
+    );
+}
+
+/// Null attach unmaps: after `wl_surface.attach(null)` + commit, the surface
+/// loses its source and stops being visible (the protocol's unmap), while the
+/// node itself stays live in the scene.
+#[test]
+fn null_attach_unmaps_the_surface() {
+    let scene = SceneThread::spawn();
+    let host = ProtocolHost::new(scene.handle());
+    let (server_end, client_end) = UnixStream::pair().expect("socketpair");
+    host.add_client(server_end);
+    let mut client = ScriptedClient::connect(client_end);
+
+    // Attach a buffer and commit → the surface is visible.
+    let surface = client.create_surface();
+    let mut pool = client.create_pool(4 * 4 * 4);
+    pool.write(&[255u8; 4 * 4 * 4]);
+    let buffer = client.create_buffer(&pool, 4, 4, ShmFormat::Xrgb8888);
+    client.attach(&surface, &buffer);
+    client.commit(&surface);
+    client.roundtrip();
+
+    let h = scene.handle();
+    assert_eq!(
+        h.query(|s| s.get(SurfaceId(0)).map(|n| n.is_visible())),
+        Some(true),
+        "surface visible after attach + commit"
+    );
+
+    // Null attach + commit → unmap: source cleared, node still present.
+    client.attach_null(&surface);
+    client.commit(&surface);
+    client.roundtrip();
+    assert_eq!(
+        h.query(|s| s.get(SurfaceId(0)).map(|n| n.is_visible())),
+        Some(false),
+        "surface unmapped (invisible) after null attach"
+    );
+    assert_eq!(
+        h.query(|s| s.surface_count()),
+        1,
+        "the node itself is still live (unmapped, not destroyed)"
     );
 }

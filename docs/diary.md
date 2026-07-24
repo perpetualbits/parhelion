@@ -310,3 +310,47 @@ guards. This closes M0.
   path (I-1 untouched). Roland's call: keep it simple, note it; the per-client
   readiness fix is M2. `make test`: 40 tests green (+3 T2 rig tests), clippy
   clean. `#tradeoff` `#core`
+
+## M1 T3 — first real pixels (wl_shm) and the seam check
+
+- **The seam held.** The whole point of T3 was the check flagged since the spike:
+  can we handle `wl_shm` through Smithay's *protocol* frontend without dragging in
+  its renderer? Verdict: clean. `smithay::wayland::shm::with_buffer_contents`
+  hands over a raw pointer + `BufferData{width,height,stride,format}` and never
+  mentions `smithay::backend::renderer`. It builds under our
+  `wayland_frontend`-only feature set (the shm module and the `backend::allocator`
+  format helpers it leans on aren't renderer-gated). Grep for the renderer path
+  finds nothing in the workspace — even my own doc comments had to be reworded off
+  the literal token so the acceptance grep stays honest. `#discovery` `#core`
+
+- **Decode at the copy, not the blit.** I folded the format distinction into the
+  copy path: `xrgb8888` → RGBA with alpha forced to 255 + node marked opaque;
+  `argb8888` → straight RGBA + not-opaque. Then the compositor's *existing*
+  `opaque`/`source_over` machinery just works on a source-neutral `PixelBuffer`,
+  and the renderer never learns "shm" exists. Format knowledge lives in exactly
+  one place. Roland OK'd this deviation from "carry the format to the blit" up
+  front. `#design-decision`
+
+- **Copy-at-commit + immediate release is the load-bearing choice.** Copying the
+  bytes into an owned `Arc<PixelBuffer>` at commit and releasing the `wl_buffer`
+  right away makes two hard things trivial: single-buffer clients run (they get
+  `release` and can redraw at once — the `shm_recommit` golden proves it), and
+  destroy-after-commit is safe *by construction* (the scene's copy outlives the
+  buffer — a test asserts it). The copy is a memcpy on the dispatch thread, which
+  is not the frame path, so I-1 is untouched. Zero-copy is a T4 problem. `#core`
+
+- **`Copy` had to go.** `TextureSource` now holds an `Arc`, so `TextureSource`,
+  `SnapshotNode`, and `SceneNode` dropped `Copy` (kept `Clone`). Nice side effect:
+  a full-copy snapshot now shares pixel data by ref-count instead of deep-copying
+  — snapshots stayed cheap even carrying real buffers. The one code change that
+  bit was `n.source.expect(...)` in the snapshot builder (can't move out of a
+  borrow) → `n.source.clone().expect(...)`. `#core`
+
+- **shm little-endian byte order is the usual trap.** `argb8888`/`xrgb8888` are
+  `0xAARRGGBB` little-endian, so in memory each pixel is `[B, G, R, A]`; the copy
+  reorders to the `[R, G, B, A]` the `Frame` wants. Got it right first try by
+  writing the exact expected blend value into the test (`[60,120,150,255]` for
+  50%-alpha light-blue over grey) and watching it pass before blessing the golden
+  — pixel asserts guard the goldens against blessing garbage. `make test`: 47
+  tests green (+7), clippy clean; the shm golden re-demonstrated it can fail (a
+  one-row marker change is rejected). `#harness` `#discovery`

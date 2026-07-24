@@ -38,12 +38,12 @@ the standing instruction set every session obeys.
 | `docs/parhelion_decision_log.md` | Append-only log of load-bearing decisions; read second, after this index. | Installed, living |
 | `docs/smithay_threading_spike.md` | M0 task 2 investigation spike: can Smithay be driven inside CORE-BOUNDARY §7, and which layers we consume. Report + recommendation; decision landed 2026-07-24. | Installed · complete |
 | `docs/harness_design.md` | Canonical design for the test harness: frame/golden format, comparator tolerance policy, blessing workflow, determinism contract, failure artifacts (P8). | Installed, authoritative · Draft v0.1 |
-| `docs/scene_graph_v1.md` | Canonical design for the scene graph, render loop, and snapshot mechanism (M1 T1–T2): node model (born-3D-ready/2.5D-implemented), texture-source seam, §7 thread ownership, snapshot semantics, CPU compositor, **the reverse path — frame callbacks / flush ownership / backpressure (§8, T2)**. Absorbs the M0 ledger. | Installed, authoritative · Draft v0.1 |
+| `docs/scene_graph_v1.md` | Canonical design for the scene graph, render loop, and snapshot mechanism (M1 T1–T3): node model (born-3D-ready/2.5D-implemented), texture-source seam incl. **real `wl_shm` copy-at-commit (§3.1, T3)**, §7 thread ownership, snapshot semantics, CPU compositor, the reverse path — frame callbacks / flush ownership / backpressure (§8, T2). Absorbs the M0 ledger. | Installed, authoritative · Draft v0.1 |
 | `docs/parhelion_project_index.md` | This file. | Living |
 | `docs/diary.md` | Running narrative diary; the why behind non-obvious choices, tagged. | Living |
 | `docs/sessions/` | One summary per Claude Code session (files changed, build/test result). | Living · `_session_2026-07-24_scaffolding.md` |
 | `docs/plans/` | Per-milestone task breakdowns (`mN_tasks.md`), written at each milestone's start. | `m1_tasks.md` (M1 "One window, honestly", T1–T7) |
-| `docs/prompts/` | Task prompts authored in the chat project for Claude Code. | `prompt_00_scaffolding.md`, `prompt_04_scene_graph_v1.md`, `prompt_05_frame_callbacks_backpressure.md` |
+| `docs/prompts/` | Task prompts authored in the chat project for Claude Code. | `prompt_00_scaffolding.md`, `prompt_04_scene_graph_v1.md`, `prompt_05_frame_callbacks_backpressure.md`, `prompt_06_shm_seam_check.md` |
 | `docs/archive/` | Superseded documents, kept verbatim; do not edit. | `0002-procedural-content-open-vocabulary.md` (superseded in format by the decision log) |
 | `third_party/spine/` | Vendored, pinned SPINE core spec (v0.4) from ENO; read-only. | Empty — pending Roland copying the spec files |
 
@@ -75,8 +75,15 @@ workspace members yet; they appear at the milestone that needs them.
 
 ## Current state
 
-- **Milestone:** M1 (One window, honestly) — **T2 complete 2026-07-24**
-  (`docs/plans/m1_tasks.md`, `docs/scene_graph_v1.md` §8). The reverse path:
+- **Milestone:** M1 (One window, honestly) — **T3 complete 2026-07-24**
+  (`docs/plans/m1_tasks.md`, `docs/scene_graph_v1.md` §3.1). First real pixels:
+  `wl_shm` buffers copied and decoded at commit into a source-neutral
+  `PixelBuffer` (`argb8888`/`xrgb8888`), the `wl_buffer` released immediately, and
+  the CPU compositor blitting them over solid nodes. **The seam check passed** —
+  shm is handled through `smithay::wayland::shm` with no `smithay::backend::renderer`
+  (grep-verifiable). Next is T4 (damage tracking). `make test`: 47 tests green,
+  clippy clean; shm goldens tolerance-0, discrimination re-demonstrated.
+- **M1 T2** complete 2026-07-24 (`docs/scene_graph_v1.md` §8). The reverse path:
   `wl_surface.frame` callbacks fired from the render side over a wait-free
   notice (`FramePresenter`: atomic timestamp + `calloop` ping), the dispatch
   thread the sole owner of every protocol object (§7); flush ownership settled to

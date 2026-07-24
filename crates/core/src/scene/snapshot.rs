@@ -28,7 +28,11 @@ use crate::scene::node::{TextureSource, Transform};
 /// (owner, committed) the canonical [`SceneNode`](crate::scene::SceneNode) holds.
 /// `source` is non-optional here because invisible (source-less) nodes are
 /// filtered out during snapshot assembly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy`: [`TextureSource`] may carry an `Arc<PixelBuffer>` (shm). Cloning a
+/// snapshot node is still cheap — the pixel block is shared by ref-count, never
+/// deep-copied — so a full-copy [`Snapshot`] does not duplicate pixel data.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotNode {
     /// Placement in the output (identity/translation only in M1).
     pub transform: Transform,

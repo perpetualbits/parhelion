@@ -111,6 +111,26 @@ impl Scene {
         }
     }
 
+    /// Set a node's size without touching its placement. The T3 commit path uses
+    /// this: a `wl_shm` buffer defines the surface's pixel size, but its position
+    /// is a separate concern (test setters now, xdg-shell in T5). No-op if absent.
+    pub fn set_size(&mut self, surface: SurfaceId, size: (u32, u32)) {
+        if let Some(node) = self.nodes.get_mut(&surface) {
+            node.size = size;
+        }
+    }
+
+    /// Clear a node's pixel source — it becomes invisible (contributes no
+    /// snapshot node). The T3 commit path uses this for a null attach
+    /// (`wl_surface.attach(null)` then commit), which unmaps the content per
+    /// protocol. No-op if absent.
+    pub fn clear_source(&mut self, surface: SurfaceId) {
+        if let Some(node) = self.nodes.get_mut(&surface) {
+            node.source = None;
+            node.opaque = false;
+        }
+    }
+
     /// Set a node's stacking order (higher composites on top). No-op if absent.
     pub fn set_z(&mut self, surface: SurfaceId, z: i32) {
         if let Some(node) = self.nodes.get_mut(&surface) {
@@ -163,8 +183,8 @@ impl Scene {
             .map(|(_, n)| SnapshotNode {
                 transform: n.transform,
                 size: n.size,
-                // is_visible guarantees Some; unwrap is sound here.
-                source: n.source.expect("visible node has a source"),
+                // is_visible guarantees Some; clone is cheap (Arc bump for shm).
+                source: n.source.clone().expect("visible node has a source"),
                 opaque: n.opaque,
             })
             .collect();

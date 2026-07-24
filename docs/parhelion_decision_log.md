@@ -219,6 +219,22 @@ below, reasoning now living in the dialect spec and VISION.md.)
 - **Decision:** A client whose pending frame-callback backlog reaches `MAX_PENDING_FRAME_CALLBACKS` has its socket left unread (the loop dispatches per client and skips it) until a tick drains it — never dropped, never a shard-mate stall. This bounds both the callback queue and, transitively, that client's scene emits. The render→dispatch notice is coalesced to a single slot. **Discovery (recorded):** the `rs` backend reads a ready client to `WouldBlock` in one call, so the bound is `cap + one socket-read burst`, not a tight per-event constant; and a throttled client with unread data keeps the level-triggered source ready, so the dispatch thread (not the frame path) spins during an active flood. The tighter fix is M2 (chosen deliberately: keep it simple).
 - **Reasoning:** The pending-callback backlog is the one queue a client can grow without bound on its own (callbacks drain only on a tick it does not control), so it is the correct throttle signal and the one that makes the flooding test fail if the bound is removed (verified). Bounding by socket-unschedule needs no blocking of the dispatch thread (I-3 spirit preserved: the emit edge stays fire-and-forget).
 
+## 2026-07-24 — wl_shm buffers, copy-at-commit, and the seam check (M1 T3)
+
+### Seam verdict: shm reaches buffer bytes through `smithay::wayland::shm` alone — clean
+
+- **Source:** M1 T3 (prompt 06), the seam check flagged since the spike review; `docs/scene_graph_v1.md` §3.1.
+- **Affects:** `crates/core/src/protocol.rs` (shm wiring), the consume/bypass layer table (decision "Smithay threading fit" entry 2 — confirmed, not amended).
+- **Verdict:** **Clean.** `smithay::wayland::shm::{ShmState, delegate_shm!, with_buffer_contents}` reaches the buffer bytes (`*const u8`, `len`, `BufferData{width,height,stride,format}`) with **no `smithay::backend::renderer` type**. Grep-verifiable: `smithay::backend::renderer` appears nowhere in the workspace. Builds under `default-features = false, features = ["wayland_frontend"]` (the shm module and `backend::allocator::format` it uses internally are not renderer-gated). The spike's layer-table prediction held.
+- **Reasoning:** This is exactly the frontend/renderer split the "Smithay threading fit" decision bought: consume the protocol frontend, supply our own renderer. Had the seam required a renderer trait to reach pixels, that would have been design news; it did not.
+
+### Copy-at-commit into a source-neutral pixel block, released immediately
+
+- **Source:** M1 T3; `docs/scene_graph_v1.md` §3, §3.1.
+- **Affects:** `crates/core/src/scene/node.rs` (`PixelBuffer`, `TextureSource::Shm(Arc<PixelBuffer>)`), `crates/core/src/protocol.rs` (`commit` buffer path, `copy_shm_to_pixels`), `crates/backend-headless/src/composite.rs` (pixel-block blit); C9.
+- **Decision:** At commit, on the dispatch thread, the attached `wl_shm` buffer is copied and decoded into an owned `PixelBuffer` (RGBA8, tightly packed), the `wl_buffer` released immediately, and the node's size + source set on the scene. `argb8888` → blend; `xrgb8888` → opaque (alpha forced 255). Format knowledge lives only in the copy path; the compositor blits a source-neutral `PixelBuffer` over the existing `opaque`/`source_over` machinery. `TextureSource`/`SnapshotNode`/`SceneNode` lose `Copy` (they may hold an `Arc`); snapshots share pixels by ref-count.
+- **Reasoning:** Correctness and client-compatibility first (immediate release runs single-buffer clients; an owned copy makes destroy-after-commit safe by construction). The copy is a memcpy on the dispatch thread, **not** the frame path (I-1). Zero-copy / damage-aware partial copy is T4. Decoding to neutral RGBA at the copy keeps the renderer source-agnostic — the seam sentence stays literally true.
+
 ## Pending
 
 - Lock-screen fail-locked design (`CORE-BOUNDARY.md` §6 note).

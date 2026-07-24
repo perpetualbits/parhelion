@@ -3,7 +3,7 @@
 > **Re-entrancy header.**
 > **Status:** Draft v0.1 · **Date:** 2026-07-24 · **Kind:** subsystem design (the scene graph, render loop, and snapshot mechanism).
 > **Upstream:** `VISION.md` Theses 1 & 3; `CORE-BOUNDARY.md` §3 (C4 scene graph, C5 render loop), §7 (threading), §10.3 (snapshot representation — open); `docs/plans/m1_tasks.md` T1.
-> **Downstream:** T2 (frame callbacks / flush ownership / backpressure — landed, §8), T3 (wl_shm → `Shm` source), T4 (damage tracking), T5 (xdg-shell geometry), T6 (input/winit).
+> **Downstream:** T2 (frame callbacks / flush ownership / backpressure — landed, §8), T3 (wl_shm → real `Shm` source — landed, §3.1), T4 (damage tracking), T5 (xdg-shell geometry), T6 (input/winit).
 > **Canonical for:** `crates/core/src/scene/`, `crates/core/src/render.rs`, and the CPU compositor in `crates/backend-headless/src/composite.rs`.
 > **Change control:** this document is the single canonical scene-graph doc (CLAUDE.md: one doc per subsystem). It supersedes the M0 ledger's role; the ledger is gone.
 
@@ -26,7 +26,7 @@ A [`SceneNode`](../crates/core/src/scene/node.rs) is one surface's canonical sta
 | `transform` | placement — a `Transform` | **Identity / Translate only** |
 | `size` | `(width, height)` in pixels | live |
 | `z` | stacking order (higher = on top) | live |
-| `source` | pixel source — `Option<TextureSource>` | `Solid` only (`Shm` declared) |
+| `source` | pixel source — `Option<TextureSource>` | `Solid` + `Shm` (real, T3) |
 | `opaque` | fully-opaque hint (blend + future occlusion) | live |
 
 **The narrow line (Thesis 1 vs Thesis 3).** The `transform` slot and the `source` binding exist because a conventional window is the *degenerate case* of a 3D-textured object, not the only case (Thesis 1). But in M1 **only the axis-aligned integer-translation path is implemented, composited, or tested** (Thesis 3, "the cheap regime is sacred"):
@@ -45,17 +45,26 @@ A node is **visible** — and so contributes a snapshot node — only once it ha
 
 > **Nothing in the scene or renderer may assume pixels are locally produced.**
 
-A node does not know whether its texture came from a local shared-memory buffer, a local GPU dmabuf, or a Rayland replay service rendering on behalf of a board across the network (`VISION.md` Thesis 1; `CORE-BOUNDARY.md` C9). M1 ships exactly two members:
+A node does not know whether its texture came from a local shared-memory buffer, a local GPU dmabuf, or a Rayland replay service rendering on behalf of a board across the network (`VISION.md` Thesis 1; `CORE-BOUNDARY.md` C9). M1 ships two members:
 
 ```
 enum TextureSource {
-    Solid([u8; 4]),   // tests + C10 fallbacks; composited directly, no import
-    Shm,              // declared placeholder — T3 implements it; rejected in M1
+    Solid([u8; 4]),        // tests + C10 fallbacks; composited directly, no import
+    Shm(Arc<PixelBuffer>), // T3: a wl_shm buffer decoded into a source-neutral pixel block
     // future (attach here, same rule governs all): Dmabuf(..), RaylandToken(..) [C9]
 }
 ```
 
-`Shm` exists so the seam's shape is fixed now; no M1 code constructs it, and the compositor rejects it (`unimplemented!`). The future `Dmabuf` and Rayland **token-buffer** sources attach at this enum — that is the whole of the M1 "Rayland interface obligation" the milestone plan pulls forward: a seam, not an implementation.
+The `Shm` payload is a **source-neutral** `PixelBuffer { width, height, rgba }` — decoded RGBA8, tightly packed. The type name says "shm" (the per-origin variant convention: `Solid`/`Shm`/future `Dmabuf`/`RaylandToken`), but the *payload* carries no origin: the renderer blits a `PixelBuffer` and asks no questions, so the seam sentence stays literally true. The future `Dmabuf` and Rayland **token-buffer** sources attach at this enum — the whole of the M1 "Rayland interface obligation" the milestone plan pulls forward.
+
+### 3.1 Copy-at-commit, immediate release (T3)
+
+The `wl_shm` handling is `smithay::wayland::shm` only — **Smithay's renderer layer is never touched** (the seam check; verified clean, grep-verifiable). At commit, on the dispatch thread where the Wayland objects live (§7):
+
+1. Take the just-committed `BufferAssignment` out of the surface's *current* state.
+2. `NewBuffer` → `with_buffer_contents` copies + decodes the pixels into an owned `PixelBuffer` (`argb8888` → RGBA blend; `xrgb8888` → RGBA, alpha forced 255, opaque), the `wl_buffer` is **released immediately**, and the node's size + source are set on the scene. `Removed` (null attach) → the source is cleared (unmap). No buffer change → source unchanged.
+
+**Rationale.** Correctness and client-compatibility first: immediate release lets single-buffer clients reuse their buffer at once, and an owned copy makes the buffer's lifetime irrelevant to the scene (destroy-after-commit is safe by construction). The copy is a memcpy on the **dispatch thread — not the frame path** (I-1). Zero-copy and damage-aware partial copies are later optimizations (**T4**). Format knowledge lives *only* in the copy path; the blit sees RGBA + the node's `opaque` flag. Snapshots share the `Arc<PixelBuffer>` by ref-count, so a full-copy snapshot never duplicates pixel data.
 
 ## 4. Thread ownership (CORE-BOUNDARY §7)
 
@@ -114,10 +123,11 @@ Ownership is absolute: each resource has exactly one owning thread; cross-thread
 
 - **Scene state** (`scene::state`): migrated ledger lifecycle (create/commit/destroy/client-gone), visibility, snapshot sort order, snapshot copy-isolation.
 - **Scene thread** (`scene::thread`): place+snapshot round-trip, query, cross-thread snapshot isolation, `wait_until` immediate/timeout.
-- **Compositor** (`backend-headless::composite`): single node, back-to-front stacking, edge clipping, translucent blend, empty-frame clear.
+- **Compositor** (`backend-headless::composite`): single node, back-to-front stacking, edge clipping, translucent blend, empty-frame clear, and (T3) opaque/translucent **pixel-block** blits.
 - **Render loop** (`render`): tick pulls a snapshot and accumulates counters.
 - **Protocol rig** (`harness/tests/protocol.rs`): the migrated ledger rig, now asserting on scene state through the host→scene edge, **plus the three T2 rig tests** (§8).
 - **Goldens** (`harness/tests/scene_render.rs`, tolerance-0): `scene_two_overlap` vs `scene_two_overlap_restacked` (stacking visible; restack changes output), `scene_clipped` (edge clipping), `scene_snapshot_isolation` (in-flight isolation). The rig's willingness to reject a wrong frame was demonstrated once (a 1-px shift fails with `actual`/`golden`/`diff` artifacts).
+- **Shm end-to-end** (`harness/tests/shm_render.rs`, tolerance-0): a scripted client draws a checkerboard-with-asymmetric-marker into a `wl_shm` buffer, attaches, and commits — `shm_xrgb` (opaque over solid), `shm_argb` (translucent blend visible), `shm_recommit` (single-buffer reuse: re-draw + re-commit the same buffer, second frame shown), plus `release`-after-commit and destroy-after-commit-safe assertions. Golden discrimination re-demonstrated for the new shm path (a one-row marker change is rejected).
 
 ## 8. The reverse path — frame callbacks, flush ownership, backpressure (T2)
 
@@ -247,8 +257,7 @@ tighter fix (per-client readiness / edge management) is M2.
 
 | Task | Adds to the scene graph |
 |------|-------------------------|
-| **T3** | `wl_shm` buffers → the `Shm` texture source becomes real (CPU copy); buffer attach/commit/release lifecycle drives node geometry/source. |
-| **T4** | Per-surface damage accumulation; region algebra (surface→scene→output); partial redraws honouring damage; the counter mechanism grows pixels-redrawn / region counts. |
+| **T4** | Per-surface damage accumulation; region algebra (surface→scene→output); partial redraws honouring damage; the counter mechanism grows pixels-redrawn / region counts; damage-aware **partial** shm copy (the §3.1 optimization). |
 | **T5** | xdg-shell: roles, configure/ack, map/unmap, title/app_id into scene state; default placement from C10. |
 | **T6** | Seat/input; focus = topmost mapped toplevel (temporary C10 policy); the winit nested backend presenting these frames. |
 

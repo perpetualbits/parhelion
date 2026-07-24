@@ -43,7 +43,7 @@ pub mod snapshot;
 pub mod state;
 pub mod thread;
 
-pub use node::{ClientKey, SceneNode, SurfaceId, TextureSource, Transform};
+pub use node::{ClientKey, PixelBuffer, SceneNode, SurfaceId, TextureSource, Transform};
 pub use snapshot::{Snapshot, SnapshotNode};
 pub use state::{ProtocolEvent, Scene};
 pub use thread::{SceneHandle, SceneThread};

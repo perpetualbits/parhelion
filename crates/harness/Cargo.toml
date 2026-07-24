@@ -24,6 +24,10 @@ wayland-client = "0.31"
 # pull many format decoders we do not need; `lodepng` is a C port. Not a
 # load-bearing decision, so recorded here rather than in the decision log.
 png = "0.17"
+# Backing file for the scripted client's `wl_shm` pools (T3 rig): an unnamed
+# temp file the client writes pixels into and the compositor mmaps. `tempfile`
+# is pure-Rust and already in the tree.
+tempfile = "3"
 
 # Inherit the workspace lint policy (see the root Cargo.toml).
 [lints]

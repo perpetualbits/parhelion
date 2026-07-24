@@ -65,12 +65,13 @@
 //! drains its callbacks — bounded memory, no dropped messages, no stall for
 //! shard-mates. Policy lives in `docs/scene_graph_v1.md` §8.
 //!
-//! # Protocol scope (M0/M1 T1–T2)
+//! # Protocol scope (M0/M1 T1–T3)
 //!
-//! `wl_compositor` only: surface create / commit / destroy, plus
-//! `wl_surface.frame` callbacks (T2), via `smithay::wayland::compositor` (the
-//! frontend layer the decision points at). Buffers (T3), xdg-shell (T5), and
-//! input (T6) are later.
+//! `wl_compositor` (surface create / commit / destroy, `wl_surface.frame`
+//! callbacks — T2) and `wl_shm` (T3: shared-memory buffers, copied at commit into
+//! a scene-side pixel block and released immediately), via
+//! `smithay::wayland::{compositor, shm}` (the frontend layers the decision points
+//! at; Smithay's renderer layer is never touched). xdg-shell (T5) and input (T6) are later.
 
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
@@ -86,14 +87,19 @@ use smithay::reexports::calloop::{
     EventLoop, Interest, Mode, PostAction,
 };
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason, ObjectId};
+use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_callback::WlCallback;
+use smithay::reexports::wayland_server::protocol::wl_shm::Format;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
+use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
-    with_states, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
+    with_states, BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
+    SurfaceAttributes,
 };
+use smithay::wayland::shm::{with_buffer_contents, BufferAccessError, ShmHandler, ShmState};
 
-use crate::scene::{ClientKey, ProtocolEvent, SceneHandle, SurfaceId};
+use crate::scene::{ClientKey, PixelBuffer, ProtocolEvent, SceneHandle, SurfaceId, TextureSource};
 
 /// Per-client cap on **pending** (committed but not-yet-fired) `wl_surface.frame`
 /// callbacks — the M1 backpressure bound and invariant **I-10**'s fairness rider
@@ -246,6 +252,11 @@ impl ClientData for ClientState {
 struct State {
     /// Smithay's compositor global/handler state.
     compositor_state: CompositorState,
+    /// Smithay's `wl_shm` global/handler state (T3). Advertises the mandatory
+    /// `argb8888`/`xrgb8888` formats and validates client pools/buffers; we reach
+    /// the bytes through `smithay::wayland::shm` alone — no renderer type (the
+    /// seam check, `docs/scene_graph_v1.md` §3).
+    shm_state: ShmState,
     /// Handle used to admit clients and resolve object→client.
     dh: DisplayHandle,
     /// Monotonic source of [`SurfaceId`]s.
@@ -323,10 +334,65 @@ impl CompositorHandler for State {
         });
     }
 
-    /// A surface committed: publish `SurfaceCommitted` for its [`SurfaceId`].
+    /// A surface committed: publish `SurfaceCommitted`, and apply the
+    /// double-buffered buffer state (attach) if this commit carried one.
+    ///
+    /// Copy-at-commit (T3): the buffer's pixels are copied here, on the dispatch
+    /// thread where the Wayland objects live (§7), into an owned scene-side
+    /// [`PixelBuffer`]; the `wl_buffer` is **released immediately** after the copy
+    /// so single-buffer clients can reuse it. This is a memcpy on the dispatch
+    /// thread — *not* the frame path (I-1), and correctness/compatibility first:
+    /// zero-copy and damage-aware partial copies are later optimizations (T4).
     fn commit(&mut self, surface: &WlSurface) {
-        if let Some(&sid) = self.obj_to_surface.get(&surface.id()) {
-            self.scene.emit(ProtocolEvent::SurfaceCommitted { surface: sid });
+        let Some(&sid) = self.obj_to_surface.get(&surface.id()) else {
+            return;
+        };
+        self.scene.emit(ProtocolEvent::SurfaceCommitted { surface: sid });
+
+        // Take the just-committed buffer assignment out of the surface's *current*
+        // state so it is processed once and we own the release (Smithay would
+        // otherwise release the previous buffer only on the next attach — too late
+        // for single-buffer clients).
+        let assignment = with_states(surface, |states| {
+            states
+                .cached_state
+                .get::<SurfaceAttributes>()
+                .current()
+                .buffer
+                .take()
+        });
+
+        match assignment {
+            Some(BufferAssignment::NewBuffer(buffer)) => {
+                // Copy + decode while the bytes live; then release immediately.
+                match copy_shm_to_pixels(&buffer) {
+                    Ok(Some((pixels, opaque))) => {
+                        let size = (pixels.width, pixels.height);
+                        let source = TextureSource::Shm(Arc::new(pixels));
+                        // Buffer defines pixel size; placement is a separate concern
+                        // (test setters now, xdg-shell in T5), so we set size, not
+                        // transform. Only owned `Send` data crosses to the scene.
+                        self.scene.mutate(move |s| {
+                            s.set_size(sid, size);
+                            s.set_source(sid, source, opaque);
+                        });
+                    }
+                    // Non-shm buffer or zero-size: nothing to show (no dmabuf in M1).
+                    Ok(None) => {}
+                    // Access error: Smithay has already posted the protocol error /
+                    // killed the client; nothing more to do.
+                    Err(_) => {}
+                }
+                buffer.release();
+            }
+            // Null attach (`wl_surface.attach(null)`): unmap — the node loses its
+            // source and becomes invisible.
+            Some(BufferAssignment::Removed) => {
+                self.scene.mutate(move |s| s.clear_source(sid));
+            }
+            // No buffer change this commit: the node keeps its current pixels
+            // (which we already copied into the scene, independent of the wl_buffer).
+            None => {}
         }
     }
 
@@ -343,6 +409,92 @@ impl CompositorHandler for State {
 // wl_compositor/wl_surface/wl_subcompositor/wl_region/wl_callback, routing them
 // to `CompositorState` and the `CompositorHandler` impl above.
 smithay::delegate_compositor!(State);
+
+impl ShmHandler for State {
+    fn shm_state(&self) -> &ShmState {
+        &self.shm_state
+    }
+}
+
+impl BufferHandler for State {
+    /// A client destroyed a `wl_buffer`. We copy-at-commit and release
+    /// immediately, so we never hold a buffer past a commit — nothing to do here.
+    fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
+}
+
+// `delegate_shm!` supplies the Dispatch/GlobalDispatch impls for
+// wl_shm/wl_shm_pool/wl_buffer, routing them to `ShmState` (which validates
+// pools/buffers) and the `ShmHandler`/`BufferHandler` impls above. This is the
+// entire seam: `smithay::wayland::shm`; Smithay's renderer layer is untouched.
+smithay::delegate_shm!(State);
+
+/// Copy an attached `wl_shm` buffer's pixels into an owned, decoded
+/// [`PixelBuffer`], returning it plus whether it is opaque (the format→blend
+/// mapping). Runs on the dispatch thread inside `commit`.
+///
+/// Format handling lives *only* here (the seam): `argb8888` → straight RGBA,
+/// not opaque (blend); `xrgb8888` → RGBA with alpha forced to 255, opaque
+/// (overwrite). `wl_shm` bytes are little-endian `0xAARRGGBB` / `0xXXRRGGBB`, so
+/// in memory each pixel is `[B, G, R, A/X]`; we reorder to the `Frame`/scene
+/// `[R, G, B, A]` and strip the buffer's stride to a tight row.
+///
+/// Returns `Ok(None)` for a non-shm buffer, an unsupported format, a zero-size
+/// buffer, or geometry that does not fit the pool (a hostile-input guard — this
+/// is a trust boundary, so we reject rather than index out of bounds). Smithay
+/// has already validated buffer geometry against the pool at `create_buffer`
+/// time; the guard is defence in depth.
+///
+/// `unsafe` is confined to the one documented pool read; the workspace lints
+/// warn on `unsafe_code`, and this use is allowed with the SAFETY justification
+/// at the block (same pattern as `pump_display`).
+#[allow(unsafe_code)]
+fn copy_shm_to_pixels(
+    buffer: &WlBuffer,
+) -> Result<Option<(PixelBuffer, bool)>, BufferAccessError> {
+    with_buffer_contents(buffer, |ptr, len, data| {
+        let (width, height) = (data.width.max(0) as usize, data.height.max(0) as usize);
+        let stride = data.stride.max(0) as usize;
+        let offset = data.offset.max(0) as usize;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        // Per-format decode rule; unadvertised formats cannot occur (Smithay
+        // rejects them at buffer creation), but reject defensively.
+        let (opaque, has_alpha) = match data.format {
+            Format::Xrgb8888 => (true, false),
+            Format::Argb8888 => (false, true),
+            _ => return None,
+        };
+        // Hostile-input guard: the buffer must fit within the mapped pool.
+        if stride < width * 4 || offset.saturating_add(height * stride) > len {
+            return None;
+        }
+        // SAFETY: `ptr`/`len` describe the pool mapping, valid for the duration of
+        // this callback (the `with_buffer_contents` contract). We only read within
+        // `[0, len)` — enforced by the guard above — and copy out immediately; the
+        // slice does not outlive the callback. A client concurrently mutating its
+        // own shm can only produce torn pixels, never a memory-safety fault.
+        let pool = unsafe { std::slice::from_raw_parts(ptr, len) };
+        let mut rgba = Vec::with_capacity(width * height * 4);
+        for y in 0..height {
+            let row = offset + y * stride;
+            for x in 0..width {
+                let p = row + x * 4;
+                let (b, g, r) = (pool[p], pool[p + 1], pool[p + 2]);
+                let a = if has_alpha { pool[p + 3] } else { 255 };
+                rgba.extend_from_slice(&[r, g, b, a]);
+            }
+        }
+        Some((
+            PixelBuffer {
+                width: width as u32,
+                height: height as u32,
+                rgba,
+            },
+            opaque,
+        ))
+    })
+}
 
 // ==========================================================================
 // The ProtocolHost handle.
@@ -587,9 +739,13 @@ fn run_dispatch(
     let display: Display<State> = Display::new().expect("create wayland display");
     let dh = display.handle();
     let compositor_state = CompositorState::new::<State>(&dh);
+    // Advertise `wl_shm`. The mandatory `argb8888`/`xrgb8888` formats are added by
+    // `ShmState::new`; we request no extras (T3 handles exactly those two).
+    let shm_state = ShmState::new::<State>(&dh, std::iter::empty());
 
     let mut state = State {
         compositor_state,
+        shm_state,
         dh: dh.clone(),
         next_surface_id: 0,
         next_client_key: 0,

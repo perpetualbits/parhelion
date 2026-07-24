@@ -11,8 +11,10 @@
 //!
 //! - Clears to a fixed colour, then draws each snapshot node **back-to-front**
 //!   (the snapshot is pre-sorted; we iterate as-is — painter's algorithm).
-//! - Solid sources only (M1). `Shm` is a declared placeholder (T3); a node
-//!   carrying it panics, and none exist in M1.
+//! - Two source kinds (M1): `Solid` colours and `Shm` pixel blocks (T3). Both go
+//!   through the same clip + integer-blend path; the compositor knows nothing
+//!   about "shm" — it blits whatever [`PixelBuffer`] the snapshot hands it (the
+//!   texture-source seam, `docs/scene_graph_v1.md` §3).
 //! - Integer-only, deterministic, tolerance-0 — it honours the golden
 //!   determinism contract (`docs/harness_design.md` §4): no floats, no time, no
 //!   randomness. Opaque nodes overwrite; translucent nodes use an integer
@@ -26,7 +28,7 @@
 //! composited arm here — until then the `match` is exhaustive over what exists.
 
 use parhelion_core::render::Compositor;
-use parhelion_core::scene::{Snapshot, TextureSource, Transform};
+use parhelion_core::scene::{PixelBuffer, Snapshot, TextureSource, Transform};
 
 use crate::Frame;
 
@@ -75,12 +77,12 @@ impl Compositor for CpuCompositor {
                 Transform::Identity => (0i32, 0i32),
                 Transform::Translate { dx, dy } => (dx, dy),
             };
-            match node.source {
+            match &node.source {
                 TextureSource::Solid(rgba) => {
-                    blit_solid(&mut self.frame, ox, oy, node.size, rgba, node.opaque);
+                    blit_solid(&mut self.frame, ox, oy, node.size, *rgba, node.opaque);
                 }
-                TextureSource::Shm => {
-                    unimplemented!("shm source arrives in T3; no Shm nodes exist in M1")
+                TextureSource::Shm(pixels) => {
+                    blit_pixels(&mut self.frame, ox, oy, pixels, node.opaque);
                 }
             }
         }
@@ -112,6 +114,41 @@ fn blit_solid(frame: &mut Frame, ox: i32, oy: i32, size: (u32, u32), rgba: [u8; 
                 rgba
             } else {
                 source_over(rgba, frame.pixel(ux, uy))
+            };
+            frame.set_pixel(ux, uy, out);
+        }
+    }
+}
+
+/// Blit a decoded [`PixelBuffer`] whose top-left is at signed screen offset
+/// `(ox, oy)`, clipped to the frame. Same shape as [`blit_solid`] but the colour
+/// varies per pixel (read from `buf`, which is tightly-packed RGBA8). `opaque`
+/// (from the node — set by the copy path: `xrgb8888` → opaque, `argb8888` →
+/// blend) selects overwrite vs integer [`source_over`]. The renderer neither
+/// knows nor cares that these bytes came from `wl_shm`.
+fn blit_pixels(frame: &mut Frame, ox: i32, oy: i32, buf: &PixelBuffer, opaque: bool) {
+    let (fw, fh) = (frame.width() as i32, frame.height() as i32);
+    // Intersect the buffer rect [ox, ox+w) × [oy, oy+h) with the frame.
+    let x0 = ox.max(0);
+    let y0 = oy.max(0);
+    let x1 = (ox + buf.width as i32).min(fw);
+    let y1 = (oy + buf.height as i32).min(fh);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    for y in y0..y1 {
+        for x in x0..x1 {
+            // Source pixel in buffer-local coordinates (guaranteed in-bounds by
+            // the clip above, since bx < width and by < height).
+            let bx = (x - ox) as usize;
+            let by = (y - oy) as usize;
+            let i = (by * buf.width as usize + bx) * 4;
+            let src = [buf.rgba[i], buf.rgba[i + 1], buf.rgba[i + 2], buf.rgba[i + 3]];
+            let (ux, uy) = (x as u32, y as u32);
+            let out = if opaque {
+                src
+            } else {
+                source_over(src, frame.pixel(ux, uy))
             };
             frame.set_pixel(ux, uy, out);
         }
@@ -244,6 +281,68 @@ mod tests {
         };
         c.composite(&snap);
         // out = (255*128 + 0*127 + 127)/255 = (32640 + 127)/255 = 32767/255 = 128.
+        assert_eq!(c.frame().pixel(0, 0), [128, 128, 128, 255]);
+    }
+
+    /// Build a one-node snapshot from a pixel block (the shm shape).
+    fn pixels_node(
+        transform: Transform,
+        buf: PixelBuffer,
+        opaque: bool,
+    ) -> SnapshotNode {
+        let size = (buf.width, buf.height);
+        SnapshotNode {
+            transform,
+            size,
+            source: TextureSource::Shm(std::sync::Arc::new(buf)),
+            opaque,
+        }
+    }
+
+    /// An opaque (xrgb-style) pixel block overwrites per-pixel and is clipped to
+    /// the frame — the shm blit path, exercising per-pixel colour and clipping.
+    #[test]
+    fn opaque_pixel_block_blits_and_clips() {
+        let mut c = CpuCompositor::new(4, 4, BLACK);
+        // 2×2 block: distinct colours per pixel so orientation is observable.
+        // Row-major, top-left origin: [TL, TR, BL, BR] = red, green, blue, white.
+        let buf = PixelBuffer {
+            width: 2,
+            height: 2,
+            rgba: vec![
+                255, 0, 0, 255, // (0,0) red
+                0, 255, 0, 255, // (1,0) green
+                0, 0, 255, 255, // (0,1) blue
+                255, 255, 255, 255, // (1,1) white
+            ],
+        };
+        let snap = Snapshot {
+            nodes: vec![pixels_node(Transform::Translate { dx: 1, dy: 1 }, buf, true)],
+        };
+        assert_eq!(c.composite(&snap), 1);
+        assert_eq!(c.frame().pixel(1, 1), [255, 0, 0, 255], "TL red at (1,1)");
+        assert_eq!(c.frame().pixel(2, 1), [0, 255, 0, 255], "TR green at (2,1)");
+        assert_eq!(c.frame().pixel(1, 2), [0, 0, 255, 255], "BL blue at (1,2)");
+        assert_eq!(c.frame().pixel(2, 2), [255, 255, 255, 255], "BR white at (2,2)");
+        assert_eq!(c.frame().pixel(0, 0), BLACK, "outside the block stays clear");
+    }
+
+    /// A translucent (argb-style) pixel block blends over what is beneath it,
+    /// per pixel, via the same integer source-over as solids.
+    #[test]
+    fn translucent_pixel_block_blends() {
+        let mut c = CpuCompositor::new(1, 1, BLACK);
+        // Single 50%-alpha white pixel over black → mid-grey (128), same formula
+        // as the solid translucent case.
+        let buf = PixelBuffer {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 255, 255, 128],
+        };
+        let snap = Snapshot {
+            nodes: vec![pixels_node(Transform::Identity, buf, false)],
+        };
+        c.composite(&snap);
         assert_eq!(c.frame().pixel(0, 0), [128, 128, 128, 255]);
     }
 }

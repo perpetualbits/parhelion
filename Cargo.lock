@@ -351,6 +351,7 @@ dependencies = [
  "parhelion-backend-headless",
  "parhelion-core",
  "png",
+ "tempfile",
  "wayland-client",
 ]
 

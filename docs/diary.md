@@ -256,3 +256,57 @@ guards. This closes M0.
   graph must not fight." Deleted `ledger.rs`; its lifecycle is now
   `Scene::apply(ProtocolEvent)` and its four rig tests assert on scene state.
   `make test`: 37 tests green, clippy clean. `#core`
+
+## M1 T2 — the reverse direction (frame callbacks, flush, backpressure)
+
+- **The reverse edge is deliberately thin.** T-render tells T-proto exactly one
+  thing: "a frame was presented at `t`" — an atomic store plus a `calloop` ping,
+  wait-free (I-1). Every Wayland object stays on the dispatch thread; the render
+  side never posts an event. That single constraint (§7, "one thread touches
+  protocol objects") made the whole design fall out: the ping wakes the dispatch
+  loop, which drains each surface's committed `frame_callbacks` and sends
+  `done(t)`. No cross-thread object posting, no re-audit needed when we shard.
+  `#core` `#protocol`
+
+- **Callbacks are NOT gated on visibility, and that's correct.** My first instinct
+  was "fire callbacks for surfaces in the snapshot." The attach-less-commit proof
+  test kills that: an unmapped surface with a frame request must still get its
+  `done`. So v1 fires *all* committed callbacks per tick; occlusion gating is M2
+  (needs T4's visibility). Bonus: not consulting the snapshot means snapshot
+  semantics are untouched (which the prompt put out of scope). `#protocol`
+  `#design-decision`
+
+- **Flush ownership: one site, and it had to move.** M0's flush lived inside the
+  `Display` source callback. But `present` (a *different* source) also needs its
+  `done` events flushed. Two flush sites would violate "exactly one." Fix: flush
+  once in the loop body after `event_loop.dispatch()` returns — every source only
+  *enqueues*, one flush pushes it all. `DisplayHandle::flush_clients` exists, so
+  the site doesn't need the `Display` back from the calloop source. Grep proves
+  it: one `flush_clients`, zero `DisplayHandle` outside `protocol.rs`. `#protocol`
+
+- **The backpressure discovery (`#discovery`).** I expected to bound a flooding
+  client to a tight per-event cap. Reading the `rs` wayland-backend killed that:
+  `dispatch_single_client` reads a ready socket *to `WouldBlock` in one call* —
+  no per-request limit. So the real bound is `cap + one socket-read burst`; the
+  throttle stops the *next* read, and the client's own writes block when its
+  kernel buffer fills (the true end-to-end backpressure). This also reshaped the
+  *test*: to make throttling observable and deterministic I flood A one
+  frame+commit+roundtrip at a time up to the bound (no blocking), then pile
+  unread extras on and prove they stay unadmitted while B is served in one tick.
+  `#discovery` `#tradeoff`
+
+- **The right throttle signal was the non-obvious one.** Bounding the scene
+  channel is untestable here — the scene thread drains it so fast the throttle
+  never engages, so "an invariant without a test is a wish." The queue a client
+  can *actually* grow unbounded is its pending frame-callback backlog, because
+  callbacks drain only on a render tick it doesn't control. Throttling on *that*
+  is what makes the flooding test fail when the bound is removed (verified:
+  backlog jumps to `bound + 2000`). Unscheduling the socket bounds the scene
+  direction transitively. `#protocol` `#discovery`
+
+- **v1 cost, taken with eyes open.** A throttled client with unread data keeps the
+  level-triggered `Display` source ready, so the dispatch thread spins to keep
+  serving others during an active flood. It's the dispatch thread, not the frame
+  path (I-1 untouched). Roland's call: keep it simple, note it; the per-client
+  readiness fix is M2. `make test`: 40 tests green (+3 T2 rig tests), clippy
+  clean. `#tradeoff` `#core`

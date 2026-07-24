@@ -196,6 +196,29 @@ below, reasoning now living in the dialect spec and VISION.md.)
 - **Decision:** The M0 ledger (`Ledger`, `LedgerMsg`, `ProtocolHost::{sync,ledger,wait_until}`) is gone. Its lifecycle behaviour is now `Scene::apply(ProtocolEvent)`; its rig tests migrated to scene-state assertions via `SceneHandle::query`. `ProtocolHost::new` now takes a `SceneHandle`.
 - **Reasoning:** The ledger was explicitly a M0 stand-in "the M1 scene graph must not fight" — M1 replaces it wholesale, as designed. One canonical receiver of the protocol→scene edge, not two.
 
+## 2026-07-24 — Reverse path: frame callbacks, flush ownership, backpressure (M1 T2)
+
+### The render side only enqueues a notice; the dispatch thread owns all protocol-object interaction and the single flush
+
+- **Source:** M1 T2 (prompt 05); `docs/scene_graph_v1.md` §8.
+- **Affects:** `crates/core/src/protocol.rs` (`FramePresenter`, `present`, single `flush_clients` site, `PingSource`), `crates/core/src/render.rs` (`RenderLoop::tick(time_ms)`, optional presenter); CORE-BOUNDARY §7, I-1.
+- **Decision:** T-render never touches a Wayland object. It calls `FramePresenter::present(t)` — a wait-free atomic store + `calloop` ping — and the dispatch thread turns that into `wl_surface.frame` → `wl_callback.done(t)` sends. Flushing is one site only: the loop body flushes once per iteration after all sources ran; every source callback only enqueues. Grep-verifiable (one `flush_clients`, no `DisplayHandle` use outside `protocol.rs`).
+- **Reasoning:** One thread owning protocol state (§7) is the simplest model and keeps the door open to sharding without re-auditing send sites. The present notice is non-blocking from the frame path (I-1). Concentrating the flush makes ordering obvious and keeps the render side a pure enqueuer.
+
+### Callback semantics v1: every tick fires all pending callbacks, not gated on visibility
+
+- **Source:** M1 T2; `docs/scene_graph_v1.md` §8.3.
+- **Affects:** `crates/core/src/protocol.rs` (`present`); snapshot semantics **unchanged** (deliberately out of scope).
+- **Decision:** On each render tick, all *committed* (current, not pending) frame callbacks on every surface fire with the tick's timestamp; `wl_callback` is one-shot. Firing is **not** gated on snapshot visibility — an attach-less/unmapped surface's callback still fires. Real vsync pacing (`presentation-time`) and occlusion-aware throttling are M2 (need damage/visibility from T4).
+- **Reasoning:** The reverse-direction proof test requires an invisible surface's callback to fire, so visibility gating would be wrong in v1. Not consulting the snapshot for callback routing means no change to snapshot semantics.
+
+### Backpressure: per-client pending-callback cap enforced by leaving the socket unread
+
+- **Source:** M1 T2; `docs/scene_graph_v1.md` §8.5; the I-10 fairness rider from the spike review; Roland's "keep it simple, note it" ruling on the flood-time CPU cost.
+- **Affects:** `crates/core/src/protocol.rs` (`MAX_PENDING_FRAME_CALLBACKS = 64`, per-client `pump_display` throttle via `dispatch_single_client`); invariant I-10.
+- **Decision:** A client whose pending frame-callback backlog reaches `MAX_PENDING_FRAME_CALLBACKS` has its socket left unread (the loop dispatches per client and skips it) until a tick drains it — never dropped, never a shard-mate stall. This bounds both the callback queue and, transitively, that client's scene emits. The render→dispatch notice is coalesced to a single slot. **Discovery (recorded):** the `rs` backend reads a ready client to `WouldBlock` in one call, so the bound is `cap + one socket-read burst`, not a tight per-event constant; and a throttled client with unread data keeps the level-triggered source ready, so the dispatch thread (not the frame path) spins during an active flood. The tighter fix is M2 (chosen deliberately: keep it simple).
+- **Reasoning:** The pending-callback backlog is the one queue a client can grow without bound on its own (callbacks drain only on a tick it does not control), so it is the correct throttle signal and the one that makes the flooding test fail if the bound is removed (verified). Bounding by socket-unschedule needs no blocking of the dispatch thread (I-3 spirit preserved: the emit edge stays fire-and-forget).
+
 ## Pending
 
 - Lock-screen fail-locked design (`CORE-BOUNDARY.md` §6 note).

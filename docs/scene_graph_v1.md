@@ -3,7 +3,7 @@
 > **Re-entrancy header.**
 > **Status:** Draft v0.1 · **Date:** 2026-07-24 · **Kind:** subsystem design (the scene graph, render loop, and snapshot mechanism).
 > **Upstream:** `VISION.md` Theses 1 & 3; `CORE-BOUNDARY.md` §3 (C4 scene graph, C5 render loop), §7 (threading), §10.3 (snapshot representation — open); `docs/plans/m1_tasks.md` T1.
-> **Downstream:** T2 (frame callbacks / flush ownership), T3 (wl_shm → `Shm` source), T4 (damage tracking), T5 (xdg-shell geometry), T6 (input/winit).
+> **Downstream:** T2 (frame callbacks / flush ownership / backpressure — landed, §8), T3 (wl_shm → `Shm` source), T4 (damage tracking), T5 (xdg-shell geometry), T6 (input/winit).
 > **Canonical for:** `crates/core/src/scene/`, `crates/core/src/render.rs`, and the CPU compositor in `crates/backend-headless/src/composite.rs`.
 > **Change control:** this document is the single canonical scene-graph doc (CLAUDE.md: one doc per subsystem). It supersedes the M0 ledger's role; the ledger is gone.
 
@@ -116,14 +116,137 @@ Ownership is absolute: each resource has exactly one owning thread; cross-thread
 - **Scene thread** (`scene::thread`): place+snapshot round-trip, query, cross-thread snapshot isolation, `wait_until` immediate/timeout.
 - **Compositor** (`backend-headless::composite`): single node, back-to-front stacking, edge clipping, translucent blend, empty-frame clear.
 - **Render loop** (`render`): tick pulls a snapshot and accumulates counters.
-- **Protocol rig** (`harness/tests/protocol.rs`): the migrated ledger rig, now asserting on scene state through the host→scene edge.
+- **Protocol rig** (`harness/tests/protocol.rs`): the migrated ledger rig, now asserting on scene state through the host→scene edge, **plus the three T2 rig tests** (§8).
 - **Goldens** (`harness/tests/scene_render.rs`, tolerance-0): `scene_two_overlap` vs `scene_two_overlap_restacked` (stacking visible; restack changes output), `scene_clipped` (edge clipping), `scene_snapshot_isolation` (in-flight isolation). The rig's willingness to reject a wrong frame was demonstrated once (a 1-px shift fails with `actual`/`golden`/`diff` artifacts).
 
-## 8. What later tasks add here
+## 8. The reverse path — frame callbacks, flush ownership, backpressure (T2)
+
+M1 T1 opened one direction: client → scene. Wayland also needs the reverse —
+`wl_surface.frame` callbacks fire when the compositor has *used* a commit, and
+that decision is born on the render side. T2 builds that path, and installs the
+backpressure policy at the same time, because the moment two threads feed each
+other queues "what happens when one floods" stops being theoretical.
+
+**Canonical for:** `crates/core/src/protocol.rs` (the dispatch-side machinery,
+`FramePresenter`, `present`, `pump_display`) and the `RenderLoop` present call in
+`crates/core/src/render.rs`.
+
+### 8.1 One thread touches protocol objects (§7)
+
+Every Wayland object — `WlSurface`, `WlCallback` — stays on the **dispatch
+thread**. The render side never posts a protocol event; it only *enqueues a
+notice* that a frame was presented. The dispatch thread, waking on that notice,
+turns it into `wl_callback.done` sends. This is the simplest model that satisfies
+CORE-BOUNDARY §7, and it keeps the door open to sharding without re-auditing send
+sites. `DisplayHandle` is `Send + Sync`, but v1 deliberately does not exercise
+cross-thread event posting.
+
+```
+   ┌──────────────────────────┐                       ┌────────────────────────┐
+   │  T-render                │  FramePresenter        │  T-proto[0] (dispatch) │
+   │  RenderLoop::tick(t):     │  ::present(t)          │  OWNS every WlSurface / │
+   │  composite → then, if a   │──atomic store + ping──▶│  WlCallback             │
+   │  presenter is attached,   │  (wait-free, I-1)      │                         │
+   │  notify "presented @ t"   │  coalescing, 1 slot    │  ping wakes calloop →   │
+   └──────────────────────────┘                       │  present(): drain each  │
+                                                        │  surface's pending      │
+                                                        │  frame_callbacks, send  │
+                                                        │  wl_callback.done(t)    │
+                                                        └───────────┬─────────────┘
+                                                    ONE flush per loop│ iteration
+                                                    (after all sources ran)
+                                                                     ▼ to client sockets
+```
+
+### 8.2 The notice and the wakeup
+
+The render→dispatch notice is the smallest thing that can cross the boundary: a
+`u32` timestamp in an `AtomicU32` plus a `calloop` **ping**. `FramePresenter::present(t)`
+does an atomic store then a ping — **wait-free from T-render** (a frame-path
+thread): no lock shared with the dispatch thread, no synchronous reply, so I-1
+holds. The ping wakes the dispatch loop's `PingSource` promptly — one wakeup, no
+polling sleeps in the delivery path; callback latency *is* this wakeup.
+
+### 8.3 Callback semantics v1 (documented as v1)
+
+On each render tick, the dispatch thread fires **all** pending frame callbacks on
+**every** surface, with the tick's timestamp. "Pending" means *committed*: a
+`wl_surface.frame` request lands in the surface's double-buffered *pending* state
+and is merged into *current* only on the commit that carries it — so a callback
+never fires before its carrying commit (Smithay's `compositor` cache enforces
+this; we only drain *current*). `wl_callback` is one-shot: draining sends `done`
+and destroys it, so a later tick with no new frame request delivers nothing.
+
+Firing is **not** gated on snapshot visibility. That is required, not a shortcut:
+a client may commit a frame request on an unmapped, attach-less surface and must
+still get its `done` (this is the milestone's reverse-direction proof test).
+Real vsync pacing (`presentation-time`) and occlusion-aware throttling — only
+firing for surfaces actually presented, which needs damage/visibility — are
+**M2** (T4 supplies the visibility). The tick's timestamp is test-controlled and
+deterministic here; monotonic-ms wall-clock in production.
+
+### 8.4 Flush ownership — exactly one site
+
+The dispatch loop flushes **once per iteration**, in the loop body, *after* every
+source callback has run. Each source only *enqueues* bytes — client replies in
+`pump_display`, `wl_callback.done` in `present` — and this is the sole place they
+are pushed to the sockets. There is no other `flush_clients` in the core
+(grep-verifiable). Concentrating the flush is what lets the render side stay a
+pure enqueuer and keeps ordering obvious.
+
+### 8.5 Backpressure policy (the I-10 fairness rider)
+
+Both queues that now couple the two threads are bounded, and the policy is
+kept deliberately simple (no QoS):
+
+- **Render→dispatch notice: coalesced, single slot.** Many presents before the
+  dispatch thread drains collapse to one wakeup (the ping edge) carrying the
+  latest timestamp (the atomic). Bounded by construction.
+- **Frame-callback state coalesces.** Per surface, pending callbacks are the list
+  the protocol already bounds per commit; the per-tick notice collapses to "a
+  frame happened" rather than a queue of per-event notices.
+- **Per-client accounting at the `ProtocolHost` boundary.** A client's pending
+  frame-callback backlog is capped at `MAX_PENDING_FRAME_CALLBACKS` (64 — ~1 s of
+  unacknowledged frames at 60 Hz, orders of magnitude past honest need). This is
+  the one queue a client can grow *without bound* on its own, since callbacks
+  only drain on a tick it does not control. Over the cap, the dispatch loop
+  **stops reading that client's socket** (it dispatches per client and skips the
+  offender) until a tick drains its callbacks — never dropping messages, never
+  stalling shard-mates. Unscheduling the socket also halts that client's scene
+  emits, so the protocol→scene direction is bounded transitively; a pure
+  scene-event flood is additionally bounded by the scene thread keeping up (a
+  general slow-consumer bound is future work).
+
+**A discovery worth recording (`#discovery`).** The `rs` wayland-backend reads a
+ready client's socket *to `WouldBlock` in a single `dispatch_single_client`
+call* — there is no per-request read cap. So the backlog is bounded by
+`MAX_PENDING_FRAME_CALLBACKS` **plus one socket-read burst**, not a tight
+per-event constant; the throttle prevents the *next* read, not the current one.
+The client's own writes block once its kernel socket buffer fills — that is the
+end-to-end backpressure. **v1 cost, chosen deliberately (keep it simple):** while
+a throttled client has unread data the level-triggered `Display` source stays
+ready, so the dispatch loop spins to keep serving others during an active flood.
+This is the dispatch thread, *not* the frame path (I-1 is unaffected), and the
+tighter fix (per-client readiness / edge management) is M2.
+
+### 8.6 T2 tests (`harness/tests/protocol.rs`)
+
+- **`scene_triggered_frame_callback_reaches_client`** — the milestone's
+  reverse-direction proof: an attach-less commit carrying a frame request, then a
+  render tick, delivers `done` with the tick's deterministic timestamp.
+- **`frame_callback_lifecycle_conformance`** — no `done` before the carrying
+  commit; fires once the commit is presented, with the tick's timestamp; one-shot
+  (a later tick delivers nothing more).
+- **`flooding_client_is_throttled_second_client_served_and_bounded`** — client A
+  floods commits + frame requests; its backlog stays at the bound (its flood left
+  unread), a well-behaved client B is served in one tick, and A is throttled, not
+  disconnected. Verified to fail if the throttle is removed (backlog blows past
+  the bound).
+
+## 9. What later tasks add here
 
 | Task | Adds to the scene graph |
 |------|-------------------------|
-| **T2** | `wl_surface.frame` callbacks fired from the render side; flush ownership; backpressure policy at the `ProtocolHost` boundary (bounded per-client queues). |
 | **T3** | `wl_shm` buffers → the `Shm` texture source becomes real (CPU copy); buffer attach/commit/release lifecycle drives node geometry/source. |
 | **T4** | Per-surface damage accumulation; region algebra (surface→scene→output); partial redraws honouring damage; the counter mechanism grows pixels-redrawn / region counts. |
 | **T5** | xdg-shell: roles, configure/ack, map/unmap, title/app_id into scene state; default placement from C10. |

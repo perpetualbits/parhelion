@@ -19,6 +19,7 @@
 //! the real frame scheduler (render-as-late-as-possible) arrives with the DRM
 //! backend in M2.
 
+use crate::protocol::FramePresenter;
 use crate::scene::{SceneHandle, Snapshot};
 
 /// The seam between the core's render loop and a concrete pixel target.
@@ -81,26 +82,54 @@ pub struct RenderLoop<C: Compositor> {
     compositor: C,
     /// Running frame/nodes instrumentation.
     counters: FrameCounters,
+    /// Optional reverse edge to the protocol side (T2). When present, each tick
+    /// notifies it that a frame was presented, so `wl_surface.frame` callbacks
+    /// fire. `None` for render-only paths (e.g. golden tests with no protocol
+    /// host); the notice is the *only* thing T-render tells T-proto, and it is
+    /// non-blocking (I-1) — see [`FramePresenter`].
+    presenter: Option<FramePresenter>,
 }
 
 impl<C: Compositor> RenderLoop<C> {
     /// Build a render loop over `scene` (snapshot source) and `compositor`
-    /// (pixel target). Produces no frame until [`tick`](Self::tick) is called.
+    /// (pixel target). Produces no frame until [`tick`](Self::tick) is called,
+    /// and fires no callbacks until a [`FramePresenter`] is attached with
+    /// [`with_presenter`](Self::with_presenter).
     pub fn new(scene: SceneHandle, compositor: C) -> Self {
         RenderLoop {
             scene,
             compositor,
             counters: FrameCounters::default(),
+            presenter: None,
         }
     }
 
+    /// Attach the reverse edge (T2): after this, each [`tick`](Self::tick) tells
+    /// the protocol side a frame was presented, firing that frame's
+    /// `wl_surface.frame` callbacks. Obtain the presenter from
+    /// [`ProtocolHost::frame_presenter`](crate::protocol::ProtocolHost::frame_presenter).
+    pub fn with_presenter(mut self, presenter: FramePresenter) -> Self {
+        self.presenter = Some(presenter);
+        self
+    }
+
     /// Produce one frame: pull the current [`Snapshot`] (scene→render edge),
-    /// composite it, and advance the counters. Test-controlled — no timer.
-    pub fn tick(&mut self) {
+    /// composite it, advance the counters, and — if a presenter is attached —
+    /// notify the protocol side that a frame was presented at `time_ms` (the
+    /// reverse edge, firing frame callbacks). Test-controlled — `time_ms` is the
+    /// deterministic timestamp the callbacks report (monotonic ms per protocol);
+    /// there is no timer.
+    pub fn tick(&mut self, time_ms: u32) {
         let snapshot = self.scene.snapshot();
         let composited = self.compositor.composite(&snapshot);
         self.counters.frames_produced += 1;
         self.counters.nodes_composited += composited as u64;
+
+        // Reverse edge (T-render → T-proto). Non-blocking enqueue only (I-1); the
+        // dispatch thread owns the actual `wl_callback.done` sends and the flush.
+        if let Some(presenter) = &self.presenter {
+            presenter.present(time_ms);
+        }
     }
 
     /// The instrumentation counters (frames produced, nodes composited so far).
@@ -161,12 +190,13 @@ mod tests {
 
         let mut render = RenderLoop::new(h.clone(), CountingCompositor { last_nodes: 0 });
 
-        render.tick();
+        // No presenter attached: tick composites and counts, fires no callbacks.
+        render.tick(0);
         assert_eq!(render.counters().frames_produced, 1);
         assert_eq!(render.counters().nodes_composited, 2);
         assert_eq!(render.compositor().last_nodes, 2);
 
-        render.tick();
+        render.tick(0);
         assert_eq!(render.counters().frames_produced, 2, "counters accumulate");
         assert_eq!(render.counters().nodes_composited, 4);
     }

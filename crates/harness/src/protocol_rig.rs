@@ -36,15 +36,21 @@
 use std::os::unix::net::UnixStream;
 
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
+use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
 
-/// Client-side dispatch state. The rig's client sends requests and cares only
-/// that round-trips complete; none of the globals emit events it must act on,
-/// so every handler is empty.
-struct App;
+/// Client-side dispatch state. The rig's client sends requests and, for T2, must
+/// observe one kind of event: `wl_callback.done` from `wl_surface.frame`
+/// callbacks. Every other global's handler stays empty.
+#[derive(Default)]
+struct App {
+    /// Timestamps carried by every `wl_callback.done` received, in arrival order
+    /// — the reverse-direction evidence a test asserts on.
+    frame_dones: Vec<u32>,
+}
 
 impl Dispatch<WlRegistry, GlobalListContents> for App {
     fn event(
@@ -82,15 +88,34 @@ impl Dispatch<WlSurface, ()> for App {
     }
 }
 
+impl Dispatch<WlCallback, ()> for App {
+    /// Record the timestamp from each frame callback's `done`. `wl_callback` is
+    /// one-shot: `done` is the only event and fires at most once per callback.
+    fn event(
+        state: &mut Self,
+        _: &WlCallback,
+        event: wl_callback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { callback_data } = event {
+            state.frame_dones.push(callback_data);
+        }
+    }
+}
+
 /// A scripted Wayland client on an in-process connection to a [`ProtocolHost`].
 ///
 /// [`ProtocolHost`]: parhelion_core::protocol::ProtocolHost
 pub struct ScriptedClient {
-    /// Kept alive for the duration of the client; dropping it disconnects.
-    _conn: Connection,
+    /// The connection. Kept alive for the client's duration (dropping it
+    /// disconnects) and used to [`flush`](Self::flush) requests without a
+    /// round-trip.
+    conn: Connection,
     /// The client's event queue.
     queue: EventQueue<App>,
-    /// Client-side app state (empty).
+    /// Client-side app state (records frame-callback timestamps).
     app: App,
     /// The bound `wl_compositor`, present iff the global was advertised.
     compositor: WlCompositor,
@@ -112,9 +137,9 @@ impl ScriptedClient {
             .bind(&qh, 1..=4, ())
             .expect("wl_compositor global advertised");
         ScriptedClient {
-            _conn: conn,
+            conn,
             queue,
-            app: App,
+            app: App::default(),
             compositor,
         }
     }
@@ -123,6 +148,15 @@ impl ScriptedClient {
     pub fn create_surface(&mut self) -> WlSurface {
         let qh = self.queue.handle();
         self.compositor.create_surface(&qh, ())
+    }
+
+    /// Request a frame callback on `surface` (`wl_surface.frame`) and return its
+    /// client-side proxy. The callback is *pending* until the commit that
+    /// carries it; its `done` (recorded in [`frame_dones`](Self::frame_dones))
+    /// fires when the compositor presents that commit.
+    pub fn frame(&mut self, surface: &WlSurface) -> WlCallback {
+        let qh = self.queue.handle();
+        surface.frame(&qh, ())
     }
 
     /// Commit a surface.
@@ -135,11 +169,27 @@ impl ScriptedClient {
         surface.destroy();
     }
 
+    /// Flush buffered requests to the socket **without** waiting for the server
+    /// (no round-trip). Used to pile requests onto a deliberately-throttled
+    /// socket in the backpressure test, where a round-trip would block forever
+    /// (the server has stopped reading that client).
+    pub fn flush(&self) {
+        self.conn.flush().expect("client flush");
+    }
+
     /// Flush pending requests and block until the server has processed them
     /// (the round-trip's internal `wl_display.sync` returns only afterwards).
+    /// This also dispatches any events already received — including
+    /// `wl_callback.done` — into [`frame_dones`](Self::frame_dones).
     pub fn roundtrip(&mut self) {
         self.queue
             .roundtrip(&mut self.app)
             .expect("client roundtrip");
+    }
+
+    /// The timestamps of every `wl_callback.done` this client has received so
+    /// far (in arrival order). Populated as round-trips dispatch the events.
+    pub fn frame_dones(&self) -> &[u32] {
+        &self.app.frame_dones
     }
 }

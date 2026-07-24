@@ -40,7 +40,9 @@ fn render_scene(place: impl FnOnce(&SceneHandle)) -> (Frame, FrameCounters) {
     let h = scene.handle();
     place(&h);
     let mut render = RenderLoop::new(h.clone(), CpuCompositor::new(W, H, CLEAR));
-    render.tick();
+    // No presenter here: these goldens exercise the render/composite path only,
+    // so the timestamp is irrelevant (0) and no frame callbacks are involved.
+    render.tick(0);
     (render.compositor().frame().clone(), *render.counters())
 }
 

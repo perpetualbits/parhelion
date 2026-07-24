@@ -1,0 +1,13 @@
+# crates/backend-headless — in-memory rendering backend for deterministic tests.
+# Governing doc: `docs/parhelion_milestone_plan.md` M0 (renders a test pattern
+# to memory, feeding the golden-screenshot rig). Backends are catalogued in the
+# subsystem table in `CLAUDE.md`. M0 status: empty skeleton.
+[package]
+name = "parhelion-backend-headless"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Inherit the workspace lint policy (see the root Cargo.toml).
+[lints]
+workspace = true

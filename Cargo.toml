@@ -1,0 +1,37 @@
+# Parhelion — cargo workspace root.
+#
+# Governs: the "Repo layout" and "Subsystems" tables in `CLAUDE.md`, and the
+# process/crate placement rules in `docs/CORE-BOUNDARY.md` §4. Only the crates
+# the current milestone needs are members; future crates (backend-winit,
+# backend-drm, supervisor, policyd) appear at the milestone that needs them
+# (M0 rule: "crates appear at the milestone that needs them").
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/dialect",
+    "crates/harness",
+    "crates/backend-headless",
+]
+
+# Workspace-wide lint policy. Each crate opts in with `[lints] workspace = true`.
+#
+# Levels are `warn` here so that plain local `cargo build` stays ergonomic
+# during development. The completion gate — `make test`, which is what CI runs —
+# invokes clippy with `-D warnings`, so in the CI profile every one of these
+# warnings is a hard failure (CLAUDE.md: "warnings deny in CI profile").
+[workspace.lints.rust]
+# Unsafe is rare in Parhelion and, outside FFI-adjacent code, discouraged; each
+# block must carry a `// SAFETY:` comment (CLAUDE.md coding rules). Warn keeps
+# it visible; a crate that genuinely needs unsafe (e.g. the DRM/KMS backend
+# later) overrides this locally with justification.
+unsafe_code = "warn"
+# Every crate, module, and public item is documented (CLAUDE.md: `//!` and `///`
+# on all code). This lint makes an undocumented public item a warning — and,
+# under CI's `-D warnings`, a build failure.
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# The full default clippy set at warn; lints are fixed, not silenced, and any
+# `#[allow(...)]` carries a comment saying why (CLAUDE.md coding rules).
+all = "warn"

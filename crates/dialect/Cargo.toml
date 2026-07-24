@@ -1,0 +1,12 @@
+# crates/dialect — SPINE `desktop` dialect types and the C7 interpreter.
+# Canonical design: `docs/parhelion_desktop_dialect.md`. M0 status: empty
+# skeleton; the v0.1 types and interpreter arrive in M3.
+[package]
+name = "parhelion-dialect"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Inherit the workspace lint policy (see the root Cargo.toml).
+[lints]
+workspace = true

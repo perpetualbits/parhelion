@@ -1,0 +1,12 @@
+# crates/core — the Parhelion core process.
+# Canonical design: `docs/CORE-BOUNDARY.md` §3 (what is in the core) and §7
+# (in-core threading). M0 status: empty skeleton, no functional code.
+[package]
+name = "parhelion-core"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Inherit the workspace lint policy (see the root Cargo.toml).
+[lints]
+workspace = true

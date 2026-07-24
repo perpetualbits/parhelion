@@ -1,0 +1,10 @@
+# Rust build artifacts (single workspace-wide target dir at the repo root).
+/target/
+
+# Scratch area — never committed; Roland manages it (CLAUDE.md repo layout).
+/tmp/
+
+# Landing area for chat-authored files. Files are installed into their
+# canonical locations as a task step; the originals here are provenance only.
+# Gitignored per Roland's decision on 2026-07-24 (M0 scaffolding session).
+/downloads/

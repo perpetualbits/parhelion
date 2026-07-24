@@ -1,0 +1,13 @@
+# crates/harness — headless golden-screenshot and protocol test rigs.
+# Governing docs: `docs/parhelion_milestone_plan.md` M0 (the rig is the
+# project's velocity multiplier). M0 status: empty skeleton; the rigs are
+# later M0 tasks with their own prompts.
+[package]
+name = "parhelion-harness"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Inherit the workspace lint policy (see the root Cargo.toml).
+[lints]
+workspace = true

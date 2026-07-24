@@ -22,6 +22,11 @@
 //! produce byte-identical pixels on any machine — the property the golden rig
 //! depends on (`docs/harness_design.md`).
 
+// The CPU compositor v1 (M1): paints a scene `Snapshot` from `parhelion-core`
+// into a `Frame`. Lives here — with the `Frame` it renders into — so the core
+// depends on no backend (see the crate/module docs and `crates/core/render.rs`).
+pub mod composite;
+
 /// An in-memory image: tightly-packed 8-bit RGBA, row-major, top-left origin.
 ///
 /// The pixel buffer length is always exactly `width * height * 4`. There is no

@@ -5,7 +5,8 @@
 //! publishes changes to the scene by message). Governing decision: the three
 //! entries under "2026-07-24 — Smithay threading fit" in the decision log —
 //! this module implements their four interface requirements. It is governed by
-//! CORE-BOUNDARY §3/§7 until it earns its own document (subsystem table).
+//! CORE-BOUNDARY §3/§7 and, for the scene edge it now feeds, by
+//! `docs/scene_graph_v1.md`.
 //!
 //! # The four requirements, and where each lives
 //!
@@ -18,12 +19,14 @@
 //!    `add_client` change (pick a shard), not an architectural one.
 //! 2. **Dispatch thread owns `Display` + a thin protocol-only [`State`]; only
 //!    `Send` tokens cross out.** The thread (see [`run_dispatch`]) owns the
-//!    `Display`; everything it tells the world is a [`LedgerMsg`] carrying
+//!    `Display`; everything it tells the world is a [`ProtocolEvent`] carrying
 //!    core-assigned [`SurfaceId`]/[`ClientKey`], never a borrowed `WlSurface`.
-//! 3. **The receiving side is the minimal [`crate::ledger::Ledger`].** Owned
-//!    here on the consumer side; [`ProtocolHost::sync`] folds pending messages
-//!    into it. In production the consumer is the scene-graph thread; here the
-//!    harness pumps it. Either way the edge is one-directional and async (I-3).
+//! 3. **The receiving side is the scene owner.** Where M0 published to a minimal
+//!    in-`ProtocolHost` ledger, M1 publishes to the real canonical scene through
+//!    a [`SceneHandle`] (`crate::scene`): the ledger was absorbed
+//!    (`docs/scene_graph_v1.md`). The edge is still one-directional and async —
+//!    the dispatch thread calls [`SceneHandle::emit`], which never blocks on a
+//!    reply (I-3).
 //! 4. **Globals advertised identically per shard.** `wl_compositor` (+ the
 //!    subcompositor machinery Smithay's delegate brings) is created once per
 //!    `Display`; with one shard that is one advertisement, and the code path is
@@ -36,17 +39,16 @@
 //! `Display` fd is a `Generic` source; a `calloop` channel carries control
 //! messages (admit client / shut down) into the thread.
 //!
-//! # Protocol scope (M0)
+//! # Protocol scope (M0/M1-T1)
 //!
 //! `wl_compositor` only: surface create / commit / destroy, via
 //! `smithay::wayland::compositor` (the frontend layer the decision points at).
-//! xdg-shell, buffers, input, and frame callbacks are M1.
+//! Buffers (T3), xdg-shell (T5), input (T6), and frame callbacks (T2) are later.
 
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use smithay::reexports::calloop::{
     channel::{channel as calloop_channel, Channel, Event as ChannelEvent, Sender as CalloopSender},
@@ -56,11 +58,9 @@ use smithay::reexports::calloop::{
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason, ObjectId};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
-use smithay::wayland::compositor::{
-    CompositorClientState, CompositorHandler, CompositorState,
-};
+use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState};
 
-use crate::ledger::{ClientKey, Ledger, LedgerMsg, SurfaceId};
+use crate::scene::{ClientKey, ProtocolEvent, SceneHandle, SurfaceId};
 
 // ==========================================================================
 // Static Send/Sync regression guards (spike §5.5).
@@ -86,13 +86,16 @@ const _GUARD_DISPLAY_SEND_SYNC: fn() = || {
     assert_sync::<DisplayHandle>();
 };
 
-/// Guards the same decision's requirement 2: the tokens that cross the
-/// dispatch→scene channel are `Send`, so they may ride a cross-thread message.
+/// Guards the same decision's requirement 2: the tokens that cross to the scene
+/// are `Send`, and the [`SceneHandle`] the dispatch thread publishes through is
+/// itself `Send` (it is moved into that thread). So the whole publish edge rides
+/// a cross-thread message with no borrowed protocol state.
 const _GUARD_TOKENS_SEND: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<SurfaceId>();
     assert_send::<ClientKey>();
-    assert_send::<LedgerMsg>();
+    assert_send::<ProtocolEvent>();
+    assert_send::<SceneHandle>();
 };
 
 // ==========================================================================
@@ -114,28 +117,30 @@ enum Control {
 // ==========================================================================
 
 /// Per-client data, stored in the client's `ClientData` so it is cleaned up
-/// automatically on disconnect. Holds the Smithay compositor client state and
-/// the core-assigned [`ClientKey`] used for ledger attribution.
+/// automatically on disconnect. Holds the Smithay compositor client state, the
+/// core-assigned [`ClientKey`], and a [`SceneHandle`] so disconnect can publish
+/// `ClientGone`.
 struct ClientState {
     /// Required by `smithay::wayland::compositor` (per-client protocol state).
     compositor_state: CompositorClientState,
     /// This client's core-assigned key.
     key: ClientKey,
-    /// Channel to the ledger, so disconnect can publish `ClientGone`.
-    ledger_tx: mpsc::Sender<LedgerMsg>,
+    /// Publish edge to the scene, so disconnect can emit `ClientGone`.
+    scene: SceneHandle,
 }
 
 impl ClientData for ClientState {
-    /// On disconnect, publish `ClientGone` so the ledger drops this client's
+    /// On disconnect, publish `ClientGone` so the scene drops this client's
     /// surfaces. Runs on the dispatch thread during `dispatch_clients`.
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {
-        // Best-effort: if the host is being torn down the receiver may be gone.
-        let _ = self.ledger_tx.send(LedgerMsg::ClientGone { client: self.key });
+        // Best-effort: `emit` ignores the error if the scene is shutting down.
+        self.scene.emit(ProtocolEvent::ClientGone { client: self.key });
     }
 }
 
 /// The dispatch shard's protocol state — thin, protocol-only. Owns no scene
-/// data: its whole job is to translate protocol callbacks into [`LedgerMsg`]s.
+/// data: its whole job is to translate protocol callbacks into [`ProtocolEvent`]s
+/// published to the scene owner.
 struct State {
     /// Smithay's compositor global/handler state.
     compositor_state: CompositorState,
@@ -147,8 +152,8 @@ struct State {
     next_client_key: u64,
     /// Maps live protocol surfaces to their core id, for commit/destroy lookup.
     obj_to_surface: HashMap<ObjectId, SurfaceId>,
-    /// The publish edge to the ledger owner.
-    ledger_tx: mpsc::Sender<LedgerMsg>,
+    /// The publish edge to the scene owner.
+    scene: SceneHandle,
     /// Set by a `Shutdown` control message to end the loop.
     stop: bool,
 }
@@ -195,7 +200,7 @@ impl CompositorHandler for State {
             .expect("admitted client has ClientState")
             .key;
 
-        let _ = self.ledger_tx.send(LedgerMsg::SurfaceCreated {
+        self.scene.emit(ProtocolEvent::SurfaceCreated {
             surface: sid,
             client: key,
         });
@@ -204,14 +209,14 @@ impl CompositorHandler for State {
     /// A surface committed: publish `SurfaceCommitted` for its [`SurfaceId`].
     fn commit(&mut self, surface: &WlSurface) {
         if let Some(&sid) = self.obj_to_surface.get(&surface.id()) {
-            let _ = self.ledger_tx.send(LedgerMsg::SurfaceCommitted { surface: sid });
+            self.scene.emit(ProtocolEvent::SurfaceCommitted { surface: sid });
         }
     }
 
     /// A surface was destroyed: drop the mapping and publish `SurfaceDestroyed`.
     fn destroyed(&mut self, surface: &WlSurface) {
         if let Some(sid) = self.obj_to_surface.remove(&surface.id()) {
-            let _ = self.ledger_tx.send(LedgerMsg::SurfaceDestroyed { surface: sid });
+            self.scene.emit(ProtocolEvent::SurfaceDestroyed { surface: sid });
         }
     }
 }
@@ -222,42 +227,36 @@ impl CompositorHandler for State {
 smithay::delegate_compositor!(State);
 
 // ==========================================================================
-// The ProtocolHost handle (owner of the consumer side).
+// The ProtocolHost handle.
 // ==========================================================================
 
 /// The protocol frontend, seen from the rest of the core (and the harness).
 ///
-/// Owns the consumer side of the dispatch→scene edge: the [`Ledger`] and the
-/// receiver it is folded from, plus the control channel and join handle for the
-/// dispatch thread. Dropping it shuts the thread down cleanly.
+/// Owns the control channel and join handle for the dispatch thread; the
+/// dispatch thread publishes surface lifecycle to the [`SceneHandle`] it was
+/// given at construction. Dropping this shuts the thread down cleanly.
 pub struct ProtocolHost {
     /// Control channel into the dispatch thread (admit client / shutdown).
     control_tx: CalloopSender<Control>,
-    /// Incoming ledger messages from the dispatch thread.
-    ledger_rx: mpsc::Receiver<LedgerMsg>,
-    /// The consumer-side ledger, folded from `ledger_rx` by [`Self::sync`].
-    ledger: Ledger,
     /// The dispatch thread, joined on drop.
     dispatch: Option<JoinHandle<()>>,
 }
 
 impl ProtocolHost {
-    /// Start a `shards = 1` protocol host: spin up the dispatch thread (which
-    /// creates the `Display`, advertises `wl_compositor`, and runs the calloop
-    /// loop) and return a handle to its consumer side.
-    pub fn new() -> Self {
+    /// Start a `shards = 1` protocol host publishing to `scene`: spin up the
+    /// dispatch thread (which creates the `Display`, advertises `wl_compositor`,
+    /// and runs the calloop loop) and return a handle to it. Surface lifecycle
+    /// from any admitted client is emitted into `scene`.
+    pub fn new(scene: SceneHandle) -> Self {
         let (control_tx, control_rx) = calloop_channel::<Control>();
-        let (ledger_tx, ledger_rx) = mpsc::channel::<LedgerMsg>();
 
         let dispatch = std::thread::Builder::new()
             .name("parhelion-proto-0".into())
-            .spawn(move || run_dispatch(control_rx, ledger_tx))
+            .spawn(move || run_dispatch(control_rx, scene))
             .expect("spawn dispatch thread");
 
         ProtocolHost {
             control_tx,
-            ledger_rx,
-            ledger: Ledger::new(),
             dispatch: Some(dispatch),
         }
     }
@@ -268,46 +267,6 @@ impl ProtocolHost {
     pub fn add_client(&self, stream: UnixStream) {
         // If the dispatch thread is gone the host is being torn down; drop it.
         let _ = self.control_tx.send(Control::AddClient(stream));
-    }
-
-    /// Fold all currently-available ledger messages into the ledger, without
-    /// blocking. Use after a client round-trip, when protocol ordering
-    /// guarantees the messages of interest are already enqueued.
-    pub fn sync(&mut self) {
-        while let Ok(msg) = self.ledger_rx.try_recv() {
-            self.ledger.apply(msg);
-        }
-    }
-
-    /// Fold messages until `pred` holds on the ledger or `timeout` elapses.
-    /// Returns whether `pred` was satisfied. Used where there is no round-trip
-    /// to synchronize on (e.g. observing a client disconnect), so the wait is
-    /// on a definite condition rather than a fixed sleep.
-    pub fn wait_until(&mut self, timeout: Duration, pred: impl Fn(&Ledger) -> bool) -> bool {
-        let deadline = Instant::now() + timeout;
-        self.sync();
-        while !pred(&self.ledger) {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return pred(&self.ledger);
-            }
-            match self.ledger_rx.recv_timeout(remaining) {
-                Ok(msg) => self.ledger.apply(msg),
-                Err(_) => return pred(&self.ledger),
-            }
-        }
-        true
-    }
-
-    /// Read-only view of the ledger for assertions.
-    pub fn ledger(&self) -> &Ledger {
-        &self.ledger
-    }
-}
-
-impl Default for ProtocolHost {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -351,8 +310,9 @@ fn pump_display(
 }
 
 /// Run the shard-0 dispatch loop: own the `Display`, advertise `wl_compositor`,
-/// and pump calloop until a `Shutdown` control message arrives.
-fn run_dispatch(control_rx: Channel<Control>, ledger_tx: mpsc::Sender<LedgerMsg>) {
+/// and pump calloop until a `Shutdown` control message arrives. Surface
+/// lifecycle is published to `scene`.
+fn run_dispatch(control_rx: Channel<Control>, scene: SceneHandle) {
     let display: Display<State> = Display::new().expect("create wayland display");
     let dh = display.handle();
     let compositor_state = CompositorState::new::<State>(&dh);
@@ -363,7 +323,7 @@ fn run_dispatch(control_rx: Channel<Control>, ledger_tx: mpsc::Sender<LedgerMsg>
         next_surface_id: 0,
         next_client_key: 0,
         obj_to_surface: HashMap::new(),
-        ledger_tx: ledger_tx.clone(),
+        scene: scene.clone(),
         stop: false,
     };
 
@@ -380,9 +340,11 @@ fn run_dispatch(control_rx: Channel<Control>, ledger_tx: mpsc::Sender<LedgerMsg>
         )
         .expect("register display source");
 
-    // Control channel: admit clients (the accept seam) and shutdown.
+    // Control channel: admit clients (the accept seam) and shutdown. The stop
+    // flag lives in `State` so both this closure (via its `&mut State` argument)
+    // and the dispatch loop below observe the same value.
     handle
-        .insert_source(control_rx, move |event, _, state: &mut State| {
+        .insert_source(control_rx, |event, _, state: &mut State| {
             if let ChannelEvent::Msg(control) = event {
                 match control {
                     Control::AddClient(stream) => {
@@ -390,7 +352,7 @@ fn run_dispatch(control_rx: Channel<Control>, ledger_tx: mpsc::Sender<LedgerMsg>
                         let data = ClientState {
                             compositor_state: CompositorClientState::default(),
                             key,
-                            ledger_tx: ledger_tx.clone(),
+                            scene: state.scene.clone(),
                         };
                         // Insert on this thread's Display — the assignment seam.
                         let _ = state.dh.insert_client(stream, std::sync::Arc::new(data));

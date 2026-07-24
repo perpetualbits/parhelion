@@ -159,6 +159,43 @@ below, reasoning now living in the dialect spec and VISION.md.)
 - **Decision:** Pin `smithay = "=0.7.0"` (exact) + commit `Cargo.lock`; upgrades are batched, deliberate, and land behind the `ProtocolHost`/renderer-wrapper seams. Mirrors the SPINE vendored-pinned-deliberate-import discipline.
 - **Reasoning:** Smithay now ships on crates.io (0.4.0+, 2025); exact-pin + lockfile avoids the `wayland-backend` resolution conflicts that dominate downstream (cosmic-comp) breakage reports. Pins recorded in the spike's `Cargo.lock`: smithay 0.7.0, wayland-server 0.31.14, wayland-backend 0.3.16, calloop 0.14.4.
 
+## 2026-07-24 — Scene graph v1 (M1 T1)
+
+### Scene state is born 3D-ready but implemented 2.5D via an extensible `Transform` enum
+
+- **Source:** M1 T1 (prompt 04); `docs/scene_graph_v1.md` §2.
+- **Affects:** `crates/core/src/scene/node.rs` (`Transform`, `TextureSource`, `SceneNode`); VISION Theses 1 & 3.
+- **Decision:** A scene node carries a `transform` slot and a `source` binding from day one, but only `Transform::{Identity, Translate}` (integer, axis-aligned) is constructible/composited/tested. `Transform` is an enum so real transforms (affine, 4×4) are future variants, each landing with its own composited path; the compositor's `match` is exhaustive over what exists, so no transform math beyond translation is reachable.
+- **Reasoning:** Building 3D now is scope creep; a type that *forbids* 3D is a Thesis-1 violation. An extensible enum keeps the vocabulary open and the implementation narrow — the exact line Thesis 3 draws.
+
+### Texture sources are an extensible binding; the seam rule is "nothing may assume pixels are locally produced"
+
+- **Source:** M1 T1; `docs/scene_graph_v1.md` §3.
+- **Affects:** `crates/core/src/scene/node.rs` (`TextureSource`); `CORE-BOUNDARY.md` C9; Rayland hosting obligation.
+- **Decision:** `TextureSource` has exactly two members in M1: `Solid([u8;4])` (tests + C10 fallbacks) and a declared `Shm` placeholder (T3 implements; rejected until then). `Dmabuf` and the Rayland token-buffer source (C9) attach at this enum later. The module doc carries the seam sentence verbatim.
+- **Reasoning:** This binding is the whole M1 "Rayland interface obligation" — a fixed seam, not an implementation. Fixing its shape now means no scene or renderer code ever assumes locally-produced pixels.
+
+### The render target lives behind a core-defined `Compositor` seam; the core depends on no backend
+
+- **Source:** M1 T1; `docs/scene_graph_v1.md` §6; `crates/core/src/render.rs`.
+- **Affects:** `crates/core` (the `Compositor` trait, `RenderLoop`), `crates/backend-headless` (implements it, gains a `parhelion-core` dependency), the crate dependency graph.
+- **Decision:** `crates/core` defines a one-method `Compositor` trait (`composite(&Snapshot) -> usize`) and drives it from `RenderLoop::tick`, never naming a concrete frame type. The CPU compositor and the `Frame` it paints live in `backend-headless`, which depends on `core` (never the reverse). M2's DRM backend implements the same trait.
+- **Reasoning:** Keeps `Frame` and every backend type out of the core — the same discipline that keeps Smithay's renderer types out (decision "Smithay threading fit"). The one small trait is the C5↔C1/backend seam, not a premature abstraction; without it, `core` would have to depend on a backend crate.
+
+### Scene owned by a dedicated thread; T-render is a test-ticked skeleton in M1
+
+- **Source:** M1 T1; `docs/scene_graph_v1.md` §4; `CORE-BOUNDARY.md` §7.
+- **Affects:** `crates/core/src/scene/thread.rs` (`SceneThread`/`SceneHandle`), `crates/core/src/render.rs` (`RenderLoop`), `crates/core/src/protocol.rs` (now publishes to the scene).
+- **Decision:** `Scene` (canonical state) is owned by one dedicated `SceneThread`; all access is by message through a cloneable `SceneHandle` (emit / mutate / snapshot / query / wait_until). `ProtocolHost` publishes lifecycle into it. Snapshots cross to T-render as immutable owned values. T-render is a **skeleton** driven by an externally-controlled `tick()` (deterministic, no wall-clock); the real vblank-tied frame scheduler is M2 (DRM backend).
+- **Reasoning:** The load-bearing §7 property is single-owner canonical state with snapshots crossing threads — that is real now. Standing up a full vblank-driven render thread before there is real hardware or a frame deadline would be dishonest RT; the test-ticked skeleton is the correct scaffold and is documented as such. §10.3 (persistent snapshot sharing) stays open — snapshot v1 is a full copy.
+
+### The M0 scene ledger is absorbed into the scene graph and deleted
+
+- **Source:** M1 T1; `docs/scene_graph_v1.md` §1.
+- **Affects:** `crates/core/src/ledger.rs` (deleted); `crates/core/src/scene/state.rs` (`ProtocolEvent` succeeds `LedgerMsg`); `crates/harness/tests/protocol.rs` (asserts on scene state).
+- **Decision:** The M0 ledger (`Ledger`, `LedgerMsg`, `ProtocolHost::{sync,ledger,wait_until}`) is gone. Its lifecycle behaviour is now `Scene::apply(ProtocolEvent)`; its rig tests migrated to scene-state assertions via `SceneHandle::query`. `ProtocolHost::new` now takes a `SceneHandle`.
+- **Reasoning:** The ledger was explicitly a M0 stand-in "the M1 scene graph must not fight" — M1 replaces it wholesale, as designed. One canonical receiver of the protocol→scene edge, not two.
+
 ## Pending
 
 - Lock-screen fail-locked design (`CORE-BOUNDARY.md` §6 note).

@@ -8,6 +8,14 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 
+[dependencies]
+# The CPU compositor (M1) reads the core's immutable scene `Snapshot` and
+# implements the core's `render::Compositor` seam. The dependency points
+# backend → core (never the reverse): the core names no backend, so
+# `crates/core` must not depend on this crate. `Frame` stays here (the headless
+# render target); only the snapshot/node/trait types cross in from core.
+parhelion-core = { path = "../core" }
+
 # Inherit the workspace lint policy (see the root Cargo.toml).
 [lints]
 workspace = true

@@ -7,17 +7,23 @@
 //! particular the frame path must not block (I-1) and the core must not call a
 //! server synchronously (I-3) or run third-party code (I-4).
 //!
-//! # M0 contents
+//! # Contents (M0 → M1-T1)
 //!
+//! - [`scene`] — the canonical scene graph (C4): node model, [`scene::Scene`],
+//!   immutable [`scene::Snapshot`], and the scene-owner thread
+//!   ([`scene::SceneThread`]) that owns it (§7). This is I-5's canonical state.
+//!   The M0 ledger was absorbed into it.
+//! - [`render`] — the render seam ([`render::Compositor`]) and the T-render
+//!   skeleton ([`render::RenderLoop`]) that composites snapshots (C5). Carries
+//!   no backend type — the concrete pixel target lives in a backend crate.
 //! - [`protocol::ProtocolHost`] — the Wayland protocol frontend at
 //!   `shards = 1`, per the decision "2026-07-24 — Smithay threading fit". It
 //!   owns a dispatch thread (the `Display`) and publishes surface lifecycle to
 //!   the scene by message (CORE-BOUNDARY §7, C3).
-//! - [`ledger::Ledger`] — the minimal receiving side of that edge: live
-//!   surfaces by core-assigned id, and nothing the M1 scene graph must fight.
 //!
-//! The scene graph, render loop, and everything else in CORE-BOUNDARY §3 arrive
-//! from M1 onward (`docs/parhelion_milestone_plan.md`).
+//! The remaining CORE-BOUNDARY §3 components (DRM/KMS, input, buffers, regime
+//! machine, capabilities) arrive across M1..M9 (`docs/parhelion_milestone_plan.md`).
 
-pub mod ledger;
 pub mod protocol;
+pub mod render;
+pub mod scene;

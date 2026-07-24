@@ -114,7 +114,8 @@ by name.
 | Core boundary / process model | `crates/*` (governs all) | `docs/CORE-BOUNDARY.md` |
 | Control plane (`desktop` dialect, C7) | `crates/dialect/` | `docs/parhelion_desktop_dialect.md` |
 | Milestones | — | `docs/parhelion_milestone_plan.md` |
-| Core (scene, render loop, protocol) | `crates/core/` | `CORE-BOUNDARY.md` §3, §7 until it earns its own doc |
+| Core: scene graph, render loop, snapshot | `crates/core/` (`scene/`, `render.rs`) | `docs/scene_graph_v1.md` |
+| Core: protocol frontend (`ProtocolHost`) | `crates/core/src/protocol.rs` | `CORE-BOUNDARY.md` §3 (C3), §7 |
 | Backends (headless, winit, DRM/KMS) | `crates/backend-*/` | (no standalone doc yet) |
 | Test harness (golden + protocol rigs) | `crates/harness/` | `docs/harness_design.md` |
 | Supervisor (P0) | `crates/supervisor/` | `CORE-BOUNDARY.md` §6, §8 |

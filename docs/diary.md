@@ -197,3 +197,62 @@ guards. This closes M0.
 - **M0 closed.** Walked the acceptance list item by item (all green) and stamped
   the plan's M0 section `Status: complete 2026-07-24`. `make test`: 20 tests,
   clippy `-D warnings` clean.
+
+---
+
+## 2026-07-24 — Scene graph v1 (M1 T1) `#core` `#scene`
+
+- **The narrow line, in the type system.** The hard part of T1 was not code, it
+  was Thesis 1 vs Thesis 3: born 3D-ready, implemented 2.5D. Landed on
+  `enum Transform { Identity, Translate{dx,dy} }` — the compositor's `match` is
+  exhaustive over what exists, so *no transform math beyond translation is
+  reachable*, yet adding a real affine/4×4 is a new variant, not a redesign. An
+  enum is 3D-ready in the vocabulary without being a half-built matrix path. The
+  alternative (a struct with reserved rotation/scale fields) would have carried
+  dead fields and invited a half-working code path; rejected. `#design-decision`
+  `#tradeoff`
+
+- **Keeping `Frame` out of the core.** The render loop is C5 (core), but the
+  `Frame` it paints and the CPU compositor are backend concerns — and the M0
+  test-pattern code lives in `backend-headless`. If the core called the
+  compositor directly it would depend on a backend crate; if the compositor held
+  the core's `Snapshot` and the core also drove it, that is a dependency cycle.
+  Resolved with one core-defined `Compositor` trait: core drives it via
+  `RenderLoop::tick` and never names `Frame`; `backend-headless` implements it
+  and depends on `core` (one direction). This is the exact C5↔C1 seam M2's DRM
+  backend plugs into — a seam the task needs, not a speculative abstraction.
+  `#design-decision` `#core`
+
+- **Honest about the render thread.** §7 wants T-render to own the GPU context
+  and consume snapshots on the frame path. There is no GPU, no vblank, no frame
+  deadline yet — so a "real" render thread spinning a loop would be theatre.
+  Made T-scene a real dedicated thread (the load-bearing single-owner property)
+  but left T-render a **skeleton driven by a test-controlled `tick()`**. This is
+  the honest RT stance from VISION: don't pretend a clock exists before the
+  hardware does. Documented as a deliberate scaffold in `scene_graph_v1.md` §4
+  and the decision log, not buried. `#tradeoff` `#open-question`
+
+- **Single FIFO gives free determinism.** Both the protocol dispatch thread and
+  the test thread send into the scene's *one* mpsc inbox. After
+  `client.roundtrip()` the dispatch thread has already emitted (during
+  `dispatch_clients`, before the sync reply unblocks the round-trip), so a
+  later `scene.query(...)` from the test observes those events — happens-before +
+  FIFO, no sleep. The disconnect case (no round-trip) waits on a condition via
+  `SceneHandle::wait_until`, parked on the scene thread where the `ClientGone`
+  arrives. `#harness`
+
+- **Two self-inflicted bugs, both caught fast.** (1) In the ProtocolHost rewire I
+  "cleaned up" the shutdown flag into a `let mut stop` captured by the `move`
+  control closure — a bool is `Copy`, so the closure got its own copy and the
+  loop would never see `stop`, hanging on drop. Caught it re-reading before
+  running; restored the `State.stop` field the M0 code used for exactly this
+  reason. (2) The prove-it-can-fail discipline earned its keep: perturbing a
+  node's x by one pixel made `scene_two_overlap` fail with `actual`/`golden`/
+  `diff` artifacts, and reversing the compositor's draw order flipped the
+  overlap colour — both confirmed the goldens actually discriminate before I
+  trusted them. `#bug` `#discovery`
+
+- **Ledger died as designed.** M0's ledger was always a stand-in "the M1 scene
+  graph must not fight." Deleted `ledger.rs`; its lifecycle is now
+  `Scene::apply(ProtocolEvent)` and its four rig tests assert on scene state.
+  `make test`: 37 tests green, clippy clean. `#core`

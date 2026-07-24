@@ -12,23 +12,26 @@
 //! ```no_run
 //! # use parhelion_harness::protocol_rig::ScriptedClient;
 //! # use parhelion_core::protocol::ProtocolHost;
+//! # use parhelion_core::scene::SceneThread;
 //! # use std::os::unix::net::UnixStream;
-//! let mut host = ProtocolHost::new();
+//! let scene = SceneThread::spawn();            // owns the canonical scene
+//! let host = ProtocolHost::new(scene.handle()); // publishes lifecycle into it
 //! let (server_end, client_end) = UnixStream::pair().unwrap();
 //! host.add_client(server_end);                 // the accept seam
 //! let mut client = ScriptedClient::connect(client_end);
 //! let surface = client.create_surface();
 //! client.commit(&surface);
 //! client.roundtrip();                          // block until the server saw it
-//! host.sync();                                 // fold ledger messages
-//! assert_eq!(host.ledger().surface_count(), 1);
+//! let h = scene.handle();
+//! assert_eq!(h.query(|s| s.surface_count()), 1); // query the scene
 //! ```
 //!
 //! Determinism: the client's `roundtrip` returns only after the server has
 //! processed its requests, and protocol ordering guarantees the resulting
-//! ledger messages are already enqueued — so `host.sync()` observes them
-//! without any sleep. Disconnect (no round-trip to sync on) uses
-//! [`ProtocolHost::wait_until`] instead.
+//! scene messages are already enqueued — so a subsequent `scene.query(...)`
+//! observes them without any sleep. Disconnect (no round-trip to sync on) uses
+//! [`SceneHandle::wait_until`](parhelion_core::scene::SceneHandle::wait_until)
+//! instead.
 
 use std::os::unix::net::UnixStream;
 

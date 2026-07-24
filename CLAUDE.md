@@ -198,6 +198,19 @@ and future contributors who want to know why, not just what.
 When a new document is created, add it to
 `docs/parhelion_project_index.md` in the same session.
 
+### Project map
+
+The repository has an interactive project map — `project-map.js` (pure data:
+`window.PROJECT_MAP`, the single source of truth) rendered by
+`project-map.html`. **After every completed task or milestone, update
+`project-map.js` in the same session** so node/part `status` values, `files`,
+`specs`, and any new nodes reflect the tree. Status is *derived, never
+invented*: `done` means code is in the tree and green under `make test`;
+`active` is current-milestone work not yet shipped; `planned` is a later
+milestone; `seam` is a reserved interface filled later. The HTML derives its
+glyphs and counts from the data, so editing the data file is enough; verify it
+still parses (`node -e "global.window={}; require('./project-map.js')"`).
+
 ---
 
 ## Coding rules

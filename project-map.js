@@ -1,0 +1,371 @@
+/* ==========================================================================
+ * project-map.js — DATA for the Parhelion project map.
+ *
+ * This file is the single source of truth the renderer (project-map.html)
+ * reads. It is intentionally pure data: `window.PROJECT_MAP` and nothing else.
+ *
+ * Status is DERIVED, never invented:
+ *   - "done"    = code is in the tree with tests (verified via `make test`).
+ *   - "active"  = part of the current milestone (M1) and not yet shipped.
+ *   - "planned" = scheduled for a later milestone (M2..M9); no code yet.
+ *   - "seam"    = a deliberate interface that exists now but is filled later
+ *                 (e.g. the texture-source binding, the render-target trait).
+ *
+ * Sources: docs/parhelion_milestone_plan.md (roadmap), docs/scene_graph_v1.md,
+ * docs/CORE-BOUNDARY.md, docs/parhelion_project_index.md, and the crate tree.
+ * Keep this file in sync with the roadmap whenever status changes.
+ * ========================================================================== */
+
+window.PROJECT_MAP = {
+  project: {
+    name: "PARHELION",
+    tagline:
+      "A Wayland compositor built as a 3D-native scene-graph engine with microkernel discipline — a small realtime core ringed by isolated, restartable, capability-scoped processes.",
+    repo: "github.com/perpetualbits/parhelion",
+    updated: "2026-07-24",
+  },
+
+  // Four reserved states. Each ships with a glyph + label so meaning never
+  // rests on colour alone (the palette is CVD-validated, but shape carries it).
+  statuses: {
+    done:    { label: "Shipped",     hint: "Built and tested — in the tree, green under `make test`." },
+    active:  { label: "In progress", hint: "Part of the current milestone (M1); not yet shipped." },
+    planned: { label: "Planned",     hint: "Scheduled for a later milestone; no code yet." },
+    seam:    { label: "Seam",        hint: "A deliberate interface reserved now, filled by later work." },
+  },
+
+  // Architectural bands, drawn top (what connects) → bottom (what everything
+  // rests on). Each node lives in exactly one band.
+  layers: [
+    { id: "edge",      label: "Edge",              hint: "Clients that speak to the core — local and remote." },
+    { id: "protocol",  label: "Protocol frontend", hint: "Wayland machinery: dispatch, globals, surface lifecycle." },
+    { id: "state",     label: "Canonical state",   hint: "The core-owned truth: scene graph, snapshots, control plane." },
+    { id: "render",    label: "Render loop",       hint: "Snapshot → composite → submit; regimes and damage." },
+    { id: "backend",   label: "Backends & input",  hint: "Where frames land and input comes from." },
+    { id: "processes", label: "Microkernel processes", hint: "Isolated, restartable server processes around the core." },
+    { id: "foundation",label: "Foundation",        hint: "The harness, the memory system, the vendored language." },
+  ],
+
+  nodes: [
+    /* ---- Edge ------------------------------------------------------------ */
+    {
+      id: "wl-clients", label: "Wayland clients", layer: "edge", status: "active",
+      tags: ["M1"],
+      desc: "Ordinary applications speaking the Wayland protocol. Today a scripted in-process client drives the protocol rig; the M1 goal is a real terminal (foot / weston-terminal) that maps, renders, and echoes typed input.",
+      files: ["crates/harness/src/protocol_rig.rs"],
+      specs: [{ label: "milestone M1", href: "docs/parhelion_milestone_plan.md" }],
+      parts: [
+        { label: "Scripted rig client", status: "done", desc: "In-process Wayland client for deterministic protocol tests." },
+        { label: "Real terminal client", status: "planned", desc: "foot / weston-terminal under the nested backend (M1 T7)." },
+      ],
+      deps: ["protocol-host"],
+    },
+    {
+      id: "rayland", label: "Rayland remote", layer: "edge", status: "planned",
+      tags: ["M6"],
+      desc: "A remote client rendering across the network via Rayland. To the core it is an ordinary Wayland client with a smaller capability grant; no core code path ever names Rayland. Attaches its pixels through the texture-source seam as a token buffer.",
+      files: [],
+      specs: [{ label: "VISION — Rayland host", href: "docs/VISION.md" }],
+      parts: [],
+      deps: ["texture-seam", "rayland-replay"],
+    },
+
+    /* ---- Protocol frontend ---------------------------------------------- */
+    {
+      id: "protocol-host", label: "ProtocolHost (shards=1)", layer: "protocol", status: "done",
+      tags: ["M0"],
+      desc: "The Wayland protocol frontend: a dispatch thread owning the Smithay Display, advertising wl_compositor, assigning each client to a shard at accept time, and publishing surface lifecycle to the scene by message. Structured so growing from one shard to many is an implementation change, not an architectural one.",
+      files: ["crates/core/src/protocol.rs"],
+      specs: [
+        { label: "CORE-BOUNDARY §3 (C3), §7", href: "docs/CORE-BOUNDARY.md" },
+        { label: "Smithay threading spike", href: "docs/smithay_threading_spike.md" },
+      ],
+      parts: [
+        { label: "Accept seam / shard assignment", status: "done", desc: "add_client routes a socket to a shard." },
+        { label: "wl_compositor / wl_surface", status: "done", desc: "create / commit / destroy via Smithay's compositor handler." },
+        { label: "Send/Sync static guards", status: "done", desc: "Compile-time regression guards on the threading facts." },
+      ],
+      deps: [],
+    },
+    {
+      id: "buffers-shm", label: "wl_shm buffers", layer: "protocol", status: "active",
+      tags: ["M1", "T3"],
+      desc: "Shared-memory buffer attach / commit / release. Committed pixels become an Shm texture source (a CPU copy, correctness over speed) and the buffer-release timing follows the protocol. This is also the seam-check: shm protocol handling without importing Smithay's renderer traits.",
+      files: [],
+      specs: [{ label: "M1 tasks — T3", href: "docs/plans/m1_tasks.md" }],
+      parts: [],
+      deps: ["protocol-host", "texture-seam"],
+    },
+    {
+      id: "xdg-shell", label: "xdg-shell toplevel", layer: "protocol", status: "active",
+      tags: ["M1", "T5"],
+      desc: "The window lifecycle: xdg_wm_base / xdg_surface / xdg_toplevel with the configure/ack dance, map/unmap, roles, and title/app_id captured into scene state. Default placement comes from the core's built-in fallback until a policy daemon exists (M4).",
+      files: [],
+      specs: [{ label: "M1 tasks — T5", href: "docs/plans/m1_tasks.md" }],
+      parts: [],
+      deps: ["protocol-host", "scene-graph"],
+    },
+    {
+      id: "seat-input", label: "wl_seat (kbd + pointer)", layer: "protocol", status: "active",
+      tags: ["M1", "T6"],
+      desc: "Input delivery to the focused client: keyboard and pointer via wl_seat, with focus following the topmost mapped toplevel as a temporary core fallback. Input must never wait on rendering (I-2).",
+      files: [],
+      specs: [{ label: "M1 tasks — T6", href: "docs/plans/m1_tasks.md" }],
+      parts: [],
+      deps: ["protocol-host", "winit"],
+    },
+    {
+      id: "frame-callbacks", label: "Frame callbacks & flush", layer: "protocol", status: "active",
+      tags: ["M1", "T2"],
+      desc: "The reverse direction: wl_surface.frame callbacks fired from the render side when a frame is presented, flush ownership settled (the dispatch thread flushes; the render side only enqueues), and a backpressure policy so a flooding client cannot stall its shard-mates.",
+      files: [],
+      specs: [{ label: "M1 tasks — T2", href: "docs/plans/m1_tasks.md" }],
+      parts: [],
+      deps: ["protocol-host", "render-loop"],
+    },
+
+    /* ---- Canonical state ------------------------------------------------- */
+    {
+      id: "scene-graph", label: "Scene graph v1", layer: "state", status: "done",
+      tags: ["M1", "T1"],
+      desc: "The canonical state (I-5): every live surface as a node with placement, size, stacking, texture source, and opacity, owned by one dedicated scene thread and reached only by message. Born 3D-ready (a transform slot and texture-source binding from day one) but implemented 2.5D (only the axis-aligned integer path is reachable). Absorbed the M0 ledger.",
+      files: ["crates/core/src/scene/"],
+      specs: [
+        { label: "scene_graph_v1.md", href: "docs/scene_graph_v1.md" },
+        { label: "CORE-BOUNDARY §3 (C4)", href: "docs/CORE-BOUNDARY.md" },
+      ],
+      parts: [
+        { label: "Node model + Transform", status: "done", desc: "Extensible enum: Identity/Translate now, 3D variants later." },
+        { label: "Scene thread ownership (§7)", status: "done", desc: "SceneThread owns the state; SceneHandle is the only door." },
+        { label: "Surface lifecycle", status: "done", desc: "create / commit / destroy / client-gone folded from protocol events." },
+        { label: "Damage tracking", status: "active", desc: "Per-surface damage + region algebra (M1 T4)." },
+      ],
+      deps: ["protocol-host"],
+    },
+    {
+      id: "snapshot", label: "Snapshot mechanism", layer: "state", status: "done",
+      tags: ["M1", "T1"],
+      desc: "The immutable, owned, back-to-front value that is the only way the scene crosses to the render thread — so no lock is ever shared with the frame path (I-1). v1 is a full copy of the visible-node list; persistent structural sharing stays a deliberately open question.",
+      files: ["crates/core/src/scene/snapshot.rs"],
+      specs: [{ label: "scene_graph_v1.md §5", href: "docs/scene_graph_v1.md" }],
+      parts: [],
+      deps: ["scene-graph"],
+    },
+    {
+      id: "texture-seam", label: "Texture-source seam", layer: "state", status: "seam",
+      tags: ["Rayland", "C9"],
+      desc: "The single point where the scene decides what a node is textured with, carrying the rule that nothing may assume pixels are locally produced. Ships Solid now; Shm, dmabuf, and the Rayland token buffer attach here as later work fills them in.",
+      files: ["crates/core/src/scene/node.rs"],
+      specs: [{ label: "scene_graph_v1.md §3", href: "docs/scene_graph_v1.md" }],
+      parts: [
+        { label: "Solid colour", status: "done", desc: "Test source + built-in C10 fallbacks." },
+        { label: "Shm", status: "active", desc: "Declared placeholder; T3 makes it real." },
+        { label: "dmabuf", status: "planned", desc: "Local GPU buffer import (M2)." },
+        { label: "Rayland token buffer", status: "planned", desc: "S-side remote source (M6, CORE-BOUNDARY C9)." },
+      ],
+      deps: ["scene-graph"],
+    },
+    {
+      id: "damage", label: "Damage tracking", layer: "state", status: "active",
+      tags: ["M1", "T4"],
+      desc: "Per-surface damage accumulation and region algebra (surface → scene → output coordinates), so a small commit redraws a proportionally small region. Damage changes cost, never output — the golden frames stay identical.",
+      files: [],
+      specs: [{ label: "M1 tasks — T4", href: "docs/plans/m1_tasks.md" }],
+      parts: [],
+      deps: ["scene-graph"],
+    },
+    {
+      id: "control-plane", label: "Control plane (SPINE C7)", layer: "state", status: "planned",
+      tags: ["M3"],
+      desc: "The declarative control plane: a dialect of ENO's SPINE language over a JSON socket, with a C7 interpreter that runs animation programs on the core's own clock. Servers describe intent (target states, springs, timelines); the core executes it. The dialect crate is a skeleton today.",
+      files: ["crates/dialect/"],
+      specs: [{ label: "desktop dialect spec", href: "docs/parhelion_desktop_dialect.md" }],
+      parts: [],
+      deps: ["scene-graph"],
+    },
+
+    /* ---- Render loop ----------------------------------------------------- */
+    {
+      id: "render-loop", label: "Render loop (T-render)", layer: "render", status: "done",
+      tags: ["M1", "T1"],
+      desc: "The render skeleton: pull an immutable snapshot, hand it to the compositor, and count the frame. Driven by a test-controlled tick today (no wall-clock, deterministic goldens); the vblank-tied frame scheduler that replaces the tick arrives with the DRM backend.",
+      files: ["crates/core/src/render.rs"],
+      specs: [{ label: "scene_graph_v1.md §4", href: "docs/scene_graph_v1.md" }],
+      parts: [
+        { label: "Tick + frame counters", status: "done", desc: "frames-produced / nodes-composited instrumentation." },
+        { label: "Frame scheduler (vblank)", status: "planned", desc: "Render-as-late-as-possible, tied to T-commit (M2)." },
+      ],
+      deps: ["snapshot", "compositor-seam"],
+    },
+    {
+      id: "compositor-seam", label: "Compositor seam", layer: "render", status: "seam",
+      tags: ["C5→C1"],
+      desc: "A one-method trait the core defines and drives, so the core names no backend and no frame type. The headless CPU compositor implements it now; M2's DRM/GPU renderer implements the same trait. This is the seam that keeps Frame out of the core.",
+      files: ["crates/core/src/render.rs"],
+      specs: [{ label: "scene_graph_v1.md §6", href: "docs/scene_graph_v1.md" }],
+      parts: [],
+      deps: ["render-loop"],
+    },
+    {
+      id: "cpu-compositor", label: "CPU compositor v1", layer: "render", status: "done",
+      tags: ["M1", "T1"],
+      desc: "Paints a snapshot into an in-memory frame: clear, then draw each node back-to-front (painter's algorithm) as a clipped solid rectangle, integer-only and tolerance-0. Lives in the backend crate alongside the Frame it renders, so the core depends on no backend.",
+      files: ["crates/backend-headless/src/composite.rs"],
+      specs: [{ label: "scene_graph_v1.md §6", href: "docs/scene_graph_v1.md" }],
+      parts: [],
+      deps: ["compositor-seam", "snapshot"],
+    },
+    {
+      id: "gpu-renderer", label: "GPU renderer + dmabuf", layer: "render", status: "planned",
+      tags: ["M2"],
+      desc: "The real renderer: GPU-backed compositing with dmabuf import and explicit sync as the primary path (I-11). Implements the compositor seam for hardware, replacing the CPU compositor on the metal.",
+      files: [],
+      specs: [{ label: "milestone M2", href: "docs/parhelion_milestone_plan.md" }],
+      parts: [],
+      deps: ["compositor-seam", "drm"],
+    },
+    {
+      id: "regime-machine", label: "Regime machine (2.5D ↔ 3D)", layer: "render", status: "planned",
+      tags: ["M8"],
+      desc: "The engineering crown jewel: a per-output state machine that flips to game-style full-frame rendering when transforms make damage non-local, then collapses back to the cheap damage-tracked regime within two frames of the last animation ending (I-9).",
+      files: [],
+      specs: [{ label: "VISION — Thesis 3", href: "docs/VISION.md" }],
+      parts: [],
+      deps: ["render-loop"],
+    },
+
+    /* ---- Backends & input ------------------------------------------------ */
+    {
+      id: "headless", label: "Headless backend", layer: "backend", status: "done",
+      tags: ["M0"],
+      desc: "In-memory rendering for deterministic tests: a tightly-packed RGBA8 Frame and the integer-only test pattern the golden rig was built on. The velocity multiplier — nothing lands without a headless-verifiable test.",
+      files: ["crates/backend-headless/src/lib.rs"],
+      specs: [{ label: "harness_design.md", href: "docs/harness_design.md" }],
+      parts: [],
+      deps: [],
+    },
+    {
+      id: "winit", label: "winit nested backend", layer: "backend", status: "active",
+      tags: ["M1", "T6"],
+      desc: "A development backend that presents the core's CPU frames in a window and feeds window input into the input path — a window Roland can actually see, without needing real hardware.",
+      files: [],
+      specs: [{ label: "M1 tasks — T6", href: "docs/plans/m1_tasks.md" }],
+      parts: [],
+      deps: ["cpu-compositor"],
+    },
+    {
+      id: "drm", label: "DRM/KMS + libinput", layer: "backend", status: "planned",
+      tags: ["M2"],
+      desc: "The metal: atomic KMS commits, plane assignment, mode setting, and a hardware cursor plane driven straight from the input thread; libinput for real devices; VT switching and modeset survival.",
+      files: [],
+      specs: [{ label: "milestone M2", href: "docs/parhelion_milestone_plan.md" }],
+      parts: [],
+      deps: [],
+    },
+
+    /* ---- Microkernel processes ------------------------------------------- */
+    {
+      id: "supervisor", label: "Supervisor (P0)", layer: "processes", status: "planned",
+      tags: ["M4"],
+      desc: "A minimal init-like process that spawns, monitors, and rate-limited-restarts the core and every server. Kept small enough to read in one sitting — small enough not to have bugs.",
+      files: ["crates/supervisor/"],
+      specs: [{ label: "CORE-BOUNDARY §6, §8", href: "docs/CORE-BOUNDARY.md" }],
+      parts: [],
+      deps: [],
+    },
+    {
+      id: "policyd", label: "Policy daemon (S1)", layer: "processes", status: "planned",
+      tags: ["M4"],
+      desc: "The reference window-management daemon: placement, focus rules, and minimal tiling, speaking only the declarative control plane. It decides what; the core executes how. Kill it and the core carries on with fallbacks, then it resyncs.",
+      files: ["crates/policyd/"],
+      specs: [{ label: "CORE-BOUNDARY §6 (S1)", href: "docs/CORE-BOUNDARY.md" }],
+      parts: [],
+      deps: ["control-plane"],
+    },
+    {
+      id: "shell", label: "Shell clients", layer: "processes", status: "planned",
+      tags: ["M4"],
+      desc: "Panel, launcher, wallpaper, notifications — ordinary layer-shell clients anyone can replace. Their crashes are cosmetic; the session survives.",
+      files: [],
+      specs: [{ label: "CORE-BOUNDARY §6 (S2)", href: "docs/CORE-BOUNDARY.md" }],
+      parts: [],
+      deps: ["policyd"],
+    },
+    {
+      id: "rayland-replay", label: "Rayland replay (R1)", layer: "processes", status: "planned",
+      tags: ["M6"],
+      desc: "The sandboxed replay service that turns a remote command stream into pixels: seccomp-confined, its own render node, VRAM and rate quotas, a GPU-reset watchdog. The core touches only the resulting token buffer and syncobj (I-8).",
+      files: [],
+      specs: [{ label: "CORE-BOUNDARY §6 (R1), I-8", href: "docs/CORE-BOUNDARY.md" }],
+      parts: [],
+      deps: ["texture-seam"],
+    },
+    {
+      id: "wasm-host", label: "WASM extension host (W1)", layer: "processes", status: "planned",
+      tags: ["M9"],
+      desc: "Third-party extensions as capability-scoped WASM components, preempted at their time budget — an extension that spins is suspended, not obeyed. Third-party code in the core process is structurally impossible.",
+      files: [],
+      specs: [{ label: "CORE-BOUNDARY §6 (W1)", href: "docs/CORE-BOUNDARY.md" }],
+      parts: [],
+      deps: ["control-plane"],
+    },
+
+    /* ---- Foundation ------------------------------------------------------ */
+    {
+      id: "harness", label: "Test harness", layer: "foundation", status: "done",
+      tags: ["M0"],
+      desc: "The golden-screenshot rig (render → compare bit-exactly against a committed PNG, fail with artifacts) and the protocol rig (drive a real ProtocolHost with a scripted client, assert on scene state). Ships a meta-test that proves the rig can fail.",
+      files: ["crates/harness/"],
+      specs: [{ label: "harness_design.md", href: "docs/harness_design.md" }],
+      parts: [
+        { label: "Golden rig", status: "done", desc: "Tolerance-0 PNG comparison + blessing workflow." },
+        { label: "Protocol rig", status: "done", desc: "Scripted in-process client → scene assertions." },
+        { label: "Scene-render goldens", status: "done", desc: "Stacking, clipping, snapshot isolation (M1 T1)." },
+      ],
+      deps: [],
+    },
+    {
+      id: "docs-memory", label: "Docs & decision log", layer: "foundation", status: "done",
+      tags: ["M0"],
+      desc: "The project's memory: a founding vision, the normative core-boundary spec with its numbered invariants, an append-only decision log, a running diary, and per-session summaries. Documents are authoritative; code is downstream.",
+      files: ["docs/"],
+      specs: [
+        { label: "VISION.md", href: "docs/VISION.md" },
+        { label: "decision log", href: "docs/parhelion_decision_log.md" },
+        { label: "project index", href: "docs/parhelion_project_index.md" },
+      ],
+      parts: [],
+      deps: [],
+    },
+    {
+      id: "spine-vendored", label: "SPINE core (vendored)", layer: "foundation", status: "seam",
+      tags: ["upstream"],
+      desc: "The pinned, read-only copy of ENO's SPINE language spec. ENO is upstream and evolves freely; core changes enter Parhelion only by deliberate, logged import. Shared language, separate runtimes.",
+      files: ["third_party/spine/"],
+      specs: [{ label: "dialect §0.1 (decoupling)", href: "docs/parhelion_desktop_dialect.md" }],
+      parts: [],
+      deps: [],
+    },
+  ],
+
+  // The milestone sequence (phases) plus the CI invariant suites that harden
+  // it (they enter at the milestone that makes them meaningful and never leave).
+  roadmap: [
+    { id: "m0", kind: "phase", label: "M0 · Skeleton & harness",     status: "done" },
+    { id: "m1", kind: "phase", label: "M1 · One window, honestly",   status: "active" },
+    { id: "m2", kind: "phase", label: "M2 · On the metal",           status: "planned" },
+    { id: "m3", kind: "phase", label: "M3 · Control plane",          status: "planned" },
+    { id: "m4", kind: "phase", label: "M4 · Microkernel for real",   status: "planned" },
+    { id: "m5", kind: "phase", label: "M5 · Efficiency",             status: "planned" },
+    { id: "m6", kind: "phase", label: "M6 · Rayland hosting",        status: "planned" },
+    { id: "m7", kind: "phase", label: "M7 · Shaped windows",         status: "planned" },
+    { id: "m8", kind: "phase", label: "M8 · The third dimension",    status: "planned" },
+    { id: "m9", kind: "phase", label: "M9 · Citizenship",            status: "planned" },
+
+    { id: "h-golden", kind: "harden", label: "Golden rig — proven able to fail", status: "done" },
+    { id: "h-damage", kind: "harden", label: "Damage counters (I-9 seed)",       status: "active" },
+    { id: "h-stall",  kind: "harden", label: "Stall test — hostile daemon (I-1)", status: "planned" },
+    { id: "h-crash",  kind: "harden", label: "Crash-only suite (I-5)",           status: "planned" },
+    { id: "h-regime", kind: "harden", label: "Regime collapse ≤2 frames (I-9)",  status: "planned" },
+  ],
+};

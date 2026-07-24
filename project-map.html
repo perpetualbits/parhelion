@@ -1,0 +1,649 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Project Map</title>
+<style>
+/* ==========================================================================
+ * project-map.html — a project-AGNOSTIC renderer for window.PROJECT_MAP.
+ * All styling lives here as CSS custom properties so light/dark swap in one
+ * place. The look is a technical control panel: monospace for every label and
+ * datum, a system sans for prose, and a status palette that doubles as a
+ * refracted spectrum (green → gold → blue → magenta).
+ * ========================================================================== */
+
+:root {
+  color-scheme: light;
+
+  /* Type */
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+
+  /* Surfaces & ink — light */
+  --page:    #e9ebf0;
+  --surface: #f7f8fa;
+  --panel:   #ffffff;
+  --ink:     #14161c;
+  --ink-2:   #4a4f5c;
+  --muted:   #767c8a;
+  --hair:    #d7dae2;
+  --hair-2:  #e6e8ee;
+  --shadow:  0 1px 2px rgba(20,22,28,.06), 0 8px 24px rgba(20,22,28,.06);
+
+  /* Status — light (CVD-validated: normal-vision ΔE floor cleared; each
+     status also carries a glyph, so meaning never rests on colour alone) */
+  --st-done:    #12a150;
+  --st-active:  #e8961e;
+  --st-planned: #3b82d9;
+  --st-seam:    #d6478f;
+
+  --spectrum: linear-gradient(90deg,
+    var(--st-done) 0%, var(--st-active) 34%, var(--st-planned) 67%, var(--st-seam) 100%);
+
+  --edge:     #b9bdc9;   /* resting dependency ray */
+  --edge-hot: var(--st-active);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page:    #0a0c11;
+    --surface: #12141a;
+    --panel:   #171a22;
+    --ink:     #eef0f4;
+    --ink-2:   #a3a9b6;
+    --muted:   #6d7484;
+    --hair:    #242834;
+    --hair-2:  #1d212b;
+    --shadow:  0 1px 2px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.35);
+    --st-done:    #2bbd6b;
+    --st-active:  #f2a83a;
+    --st-planned: #5b9bef;
+    --st-seam:    #ec74ad;
+    --edge:     #333846;
+    --edge-hot: var(--st-active);
+  }
+}
+/* Manual toggle wins over the OS setting, both directions. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page:    #0a0c11;
+  --surface: #12141a;
+  --panel:   #171a22;
+  --ink:     #eef0f4;
+  --ink-2:   #a3a9b6;
+  --muted:   #6d7484;
+  --hair:    #242834;
+  --hair-2:  #1d212b;
+  --shadow:  0 1px 2px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.35);
+  --st-done:    #2bbd6b;
+  --st-active:  #f2a83a;
+  --st-planned: #5b9bef;
+  --st-seam:    #ec74ad;
+  --edge:     #333846;
+  --edge-hot: var(--st-active);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap { max-width: 1320px; margin: 0 auto; padding: 22px clamp(14px, 3vw, 34px) 60px; }
+
+/* ---- Masthead -------------------------------------------------------- */
+.masthead {
+  position: relative;
+  border: 1px solid var(--hair);
+  background: var(--surface);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  padding: 22px 24px 0;
+  overflow: hidden;
+}
+.masthead::before {  /* the prismatic rule — the one bold accent */
+  content: "";
+  position: absolute; left: 0; top: 0; right: 0; height: 3px;
+  background: var(--spectrum);
+}
+.masthead-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+  gap: 20px 40px;
+  align-items: start;
+  padding-bottom: 22px;
+}
+@media (max-width: 820px) { .masthead-grid { grid-template-columns: 1fr; } }
+
+.brand h1 {
+  font-family: var(--mono);
+  font-size: clamp(26px, 4.4vw, 40px);
+  letter-spacing: .16em;
+  font-weight: 650;
+  margin: 6px 0 8px;
+  line-height: 1;
+}
+.brand .tagline { color: var(--ink-2); font-size: 14.5px; max-width: 54ch; margin: 0 0 12px; }
+.brand .meta { font-family: var(--mono); font-size: 12px; color: var(--muted); display: flex; gap: 14px; flex-wrap: wrap; }
+.brand .meta b { color: var(--ink-2); font-weight: 600; }
+.eyebrow {
+  font-family: var(--mono); font-size: 11px; letter-spacing: .28em;
+  text-transform: uppercase; color: var(--muted);
+}
+
+/* Telemetry */
+.telemetry { display: flex; flex-direction: column; gap: 14px; }
+.stat-row { display: flex; gap: 10px; }
+.stat {
+  flex: 1; border: 1px solid var(--hair); border-radius: 10px;
+  background: var(--panel); padding: 10px 12px;
+}
+.stat .num { font-family: var(--mono); font-size: 22px; font-weight: 650; letter-spacing: .01em; line-height: 1.1; }
+.stat .num small { color: var(--muted); font-size: 14px; font-weight: 500; }
+.stat .cap { font-family: var(--mono); font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin-top: 3px; }
+
+.bar { display: flex; height: 12px; border-radius: 6px; overflow: hidden; background: var(--hair-2); gap: 2px; }
+.bar > span { display: block; min-width: 2px; }
+.bar-key { display: flex; flex-wrap: wrap; gap: 4px 14px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); }
+.bar-key i { font-style: normal; display: inline-flex; align-items: center; gap: 5px; }
+.bar-key .g { font-size: 11px; }
+
+/* Theme toggle */
+.toggle {
+  position: absolute; top: 14px; right: 14px;
+  font-family: var(--mono); font-size: 12px; letter-spacing: .06em;
+  color: var(--ink-2); background: var(--panel);
+  border: 1px solid var(--hair); border-radius: 8px;
+  padding: 7px 11px; cursor: pointer; display: inline-flex; gap: 7px; align-items: center;
+}
+.toggle:hover { border-color: var(--muted); color: var(--ink); }
+.toggle:focus-visible { outline: 2px solid var(--st-planned); outline-offset: 2px; }
+
+/* ---- Legend ---------------------------------------------------------- */
+.legend { display: flex; flex-wrap: wrap; gap: 8px; margin: 18px 0 10px; }
+.legend .pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  border: 1px solid var(--hair); border-radius: 999px;
+  background: var(--surface); padding: 6px 13px 6px 10px;
+  font-family: var(--mono); font-size: 12px;
+}
+.legend .pill .glyph { font-size: 13px; line-height: 1; }
+.legend .pill .lh { color: var(--muted); font-size: 11px; }
+
+/* ---- Workspace: graph + details ------------------------------------- */
+.workspace { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; margin-top: 8px; align-items: start; }
+@media (max-width: 940px) { .workspace { grid-template-columns: 1fr; } }
+
+.graph {
+  position: relative;
+  border: 1px solid var(--hair); border-radius: 14px;
+  background: var(--surface); box-shadow: var(--shadow);
+  padding: 6px 16px 16px;
+  overflow: hidden;
+}
+.edges { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 1; }
+.edges path { fill: none; stroke: var(--edge); stroke-width: 1.4; opacity: .8; transition: stroke .18s, stroke-width .18s, opacity .18s; }
+.edges path.hot { stroke: var(--edge-hot); stroke-width: 2.2; opacity: 1; }
+
+.band { position: relative; z-index: 2; display: grid; grid-template-columns: 128px 1fr; gap: 14px; align-items: center; padding: 12px 0; border-top: 1px dashed var(--hair-2); }
+.band:first-of-type { border-top: 0; }
+.band-label { font-family: var(--mono); }
+.band-label .n { font-size: 12.5px; letter-spacing: .04em; color: var(--ink); font-weight: 600; }
+.band-label .h { font-size: 10.5px; color: var(--muted); line-height: 1.35; margin-top: 3px; }
+.band-nodes { display: flex; flex-wrap: wrap; gap: 9px; }
+@media (max-width: 560px) { .band { grid-template-columns: 1fr; gap: 8px; } }
+
+/* Node */
+.node {
+  --sc: var(--muted);
+  position: relative;
+  font-family: var(--mono); font-size: 12.5px; text-align: left;
+  color: var(--ink); background: var(--panel);
+  border: 1px solid var(--hair); border-left: 3px solid var(--sc);
+  border-radius: 8px; padding: 8px 11px 8px 10px; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 8px;
+  transition: transform .15s, box-shadow .15s, border-color .15s, opacity .18s;
+}
+.node .glyph { color: var(--sc); font-size: 12px; line-height: 1; }
+.node .nl { line-height: 1.15; }
+.node .tag { color: var(--muted); font-size: 10px; letter-spacing: .05em; margin-left: 2px; }
+.node[data-status="done"]    { --sc: var(--st-done); }
+.node[data-status="active"]  { --sc: var(--st-active); }
+.node[data-status="planned"] { --sc: var(--st-planned); }
+.node[data-status="seam"]    { --sc: var(--st-seam); }
+.node:hover, .node:focus-visible { transform: translateY(-1px); border-color: var(--sc); box-shadow: 0 0 0 1px var(--sc) inset, var(--shadow); outline: none; }
+.node.selected { box-shadow: 0 0 0 2px var(--sc) inset, var(--shadow); }
+
+/* Focus mode: dim everything not lit */
+.graph.focusing .node:not(.lit) { opacity: .3; }
+.graph.focusing .band-label { opacity: .5; }
+
+/* ---- Details panel --------------------------------------------------- */
+.details {
+  position: sticky; top: 14px;
+  border: 1px solid var(--hair); border-radius: 14px;
+  background: var(--surface); box-shadow: var(--shadow);
+  padding: 18px; min-height: 220px;
+}
+.details .empty { color: var(--muted); font-family: var(--mono); font-size: 12.5px; line-height: 1.6; }
+.d-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.d-head h2 { font-family: var(--mono); font-size: 16px; margin: 0; letter-spacing: .02em; }
+.d-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--mono); font-size: 11px; letter-spacing: .04em;
+  padding: 3px 9px; border-radius: 999px; border: 1px solid currentColor;
+}
+.d-pill[data-status="done"]    { color: var(--st-done); }
+.d-pill[data-status="active"]  { color: var(--st-active); }
+.d-pill[data-status="planned"] { color: var(--st-planned); }
+.d-pill[data-status="seam"]    { color: var(--st-seam); }
+.d-tags { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0 0; }
+.d-tags span { font-family: var(--mono); font-size: 10.5px; color: var(--ink-2); background: var(--hair-2); border-radius: 5px; padding: 2px 7px; }
+.d-desc { color: var(--ink-2); font-size: 14px; margin: 12px 0 0; }
+.d-sec { font-family: var(--mono); font-size: 10.5px; letter-spacing: .16em; text-transform: uppercase; color: var(--muted); margin: 16px 0 8px; }
+.d-parts { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 7px; }
+.d-parts li { display: grid; grid-template-columns: 14px 1fr; gap: 8px; }
+.d-parts .pg { font-size: 11px; line-height: 1.5; }
+.d-parts .pl { font-family: var(--mono); font-size: 12px; }
+.d-parts .pd { color: var(--muted); font-size: 12px; }
+.d-parts .pl[data-status="done"] { color: var(--st-done); }
+.d-parts .pl[data-status="active"] { color: var(--st-active); }
+.d-parts .pl[data-status="planned"] { color: var(--st-planned); }
+.d-parts .pl[data-status="seam"] { color: var(--st-seam); }
+.d-links { display: flex; flex-direction: column; gap: 5px; }
+.d-links a { font-family: var(--mono); font-size: 12px; color: var(--st-planned); text-decoration: none; word-break: break-all; display: inline-flex; gap: 7px; align-items: baseline; }
+.d-links a:hover { text-decoration: underline; }
+.d-links a .k { color: var(--muted); }
+
+/* ---- Roadmap --------------------------------------------------------- */
+.roadmap { margin-top: 26px; }
+.roadmap h3 { font-family: var(--mono); font-size: 12px; letter-spacing: .18em; text-transform: uppercase; color: var(--muted); margin: 0 0 12px; }
+.rail { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 8px; }
+.rk { flex: 0 0 auto; min-width: 150px; border: 1px solid var(--hair); border-top: 3px solid var(--sc, var(--muted)); border-radius: 0 0 9px 9px; background: var(--surface); padding: 10px 12px; }
+.rk[data-status="done"]    { --sc: var(--st-done); }
+.rk[data-status="active"]  { --sc: var(--st-active); }
+.rk[data-status="planned"] { --sc: var(--st-planned); }
+.rk .rl { font-family: var(--mono); font-size: 12px; color: var(--ink); }
+.rk .rs { font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--sc); margin-top: 6px; display: inline-flex; gap: 5px; align-items: center; }
+.harden .rk { border-radius: 9px 9px 9px 9px; border-top-width: 1px; border-left: 3px solid var(--sc); }
+
+.foot { margin-top: 30px; font-family: var(--mono); font-size: 11px; color: var(--muted); border-top: 1px solid var(--hair); padding-top: 14px; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+}
+</style>
+</head>
+<body>
+<!-- DATA first: a <script src> tag works over file:// where fetch() is blocked. -->
+<script src="project-map.js"></script>
+
+<div class="wrap" id="app"></div>
+
+<!-- RENDERER: builds the whole page from window.PROJECT_MAP. -->
+<script>
+(function () {
+  "use strict";
+  var M = window.PROJECT_MAP;
+  var app = document.getElementById("app");
+  if (!M) { app.innerHTML = '<p style="font-family:monospace">project-map.js did not define window.PROJECT_MAP.</p>'; return; }
+
+  var GLYPH = { done: "●", active: "◐", planned: "○", seam: "◈" }; // ● ◐ ○ ◈
+  var byId = {};
+  M.nodes.forEach(function (n) { byId[n.id] = n; });
+
+  function el(tag, cls, txt) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (txt != null) e.textContent = txt;
+    return e;
+  }
+  function statusLabel(s) { return (M.statuses[s] && M.statuses[s].label) || s; }
+
+  /* ---- Counts / telemetry ------------------------------------------- */
+  var order = ["done", "active", "seam", "planned"];
+  var counts = { done: 0, active: 0, seam: 0, planned: 0 };
+  M.nodes.forEach(function (n) { if (counts[n.status] != null) counts[n.status]++; });
+  var total = M.nodes.length;
+  var phases = M.roadmap.filter(function (r) { return r.kind === "phase"; });
+  var hardens = M.roadmap.filter(function (r) { return r.kind === "harden"; });
+  var phasesDone = phases.filter(function (r) { return r.status === "done"; }).length;
+  var hardenDone = hardens.filter(function (r) { return r.status === "done"; }).length;
+
+  /* ---- Masthead ------------------------------------------------------ */
+  var mast = el("header", "masthead");
+  var toggle = el("button", "toggle");
+  toggle.setAttribute("aria-label", "Toggle light or dark theme");
+  toggle.innerHTML = '<span class="tg-ico">◐</span><span class="tg-tx">Theme</span>';
+  toggle.addEventListener("click", function () {
+    var cur = document.documentElement.getAttribute("data-theme");
+    var next = cur === "dark" ? "light" : cur === "light" ? "dark" : (prefersDark() ? "light" : "dark");
+    document.documentElement.setAttribute("data-theme", next);
+    try { localStorage.setItem("pm-theme", next); } catch (e) {}
+    requestAnimationFrame(drawEdges);
+  });
+  mast.appendChild(toggle);
+
+  var grid = el("div", "masthead-grid");
+
+  var brand = el("div", "brand");
+  brand.appendChild(el("div", "eyebrow", "Project map"));
+  brand.appendChild(el("h1", null, M.project.name));
+  brand.appendChild(el("p", "tagline", M.project.tagline));
+  var meta = el("div", "meta");
+  var repo = el("span"); repo.innerHTML = '<b>repo</b> ' + esc(M.project.repo);
+  var upd = el("span"); upd.innerHTML = '<b>updated</b> ' + esc(M.project.updated);
+  meta.appendChild(repo); meta.appendChild(upd);
+  brand.appendChild(meta);
+  grid.appendChild(brand);
+
+  var tele = el("div", "telemetry");
+  var statRow = el("div", "stat-row");
+  statRow.appendChild(statTile(counts.done, total, "shipped"));
+  statRow.appendChild(statTile(phasesDone, phases.length, "phases done"));
+  statRow.appendChild(statTile(hardenDone, hardens.length, "hardening"));
+  tele.appendChild(statRow);
+
+  // Stacked status bar (2px surface gaps between fills, per mark specs).
+  var bar = el("div", "bar");
+  order.forEach(function (s) {
+    if (!counts[s]) return;
+    var seg = el("span");
+    seg.style.flex = counts[s] + " 0 0";
+    seg.style.background = "var(--st-" + s + ")";
+    seg.title = counts[s] + " " + statusLabel(s);
+    bar.appendChild(seg);
+  });
+  tele.appendChild(bar);
+  var key = el("div", "bar-key");
+  order.forEach(function (s) {
+    var i = el("i");
+    i.innerHTML = '<span class="g" style="color:var(--st-' + s + ')">' + GLYPH[s] + '</span> ' +
+      counts[s] + " " + esc(statusLabel(s).toLowerCase());
+    key.appendChild(i);
+  });
+  tele.appendChild(key);
+  grid.appendChild(tele);
+
+  mast.appendChild(grid);
+  app.appendChild(mast);
+
+  function statTile(n, d, cap) {
+    var t = el("div", "stat");
+    var num = el("div", "num");
+    num.innerHTML = n + '<small> / ' + d + "</small>";
+    t.appendChild(num);
+    t.appendChild(el("div", "cap", cap));
+    return t;
+  }
+
+  /* ---- Legend -------------------------------------------------------- */
+  var legend = el("div", "legend");
+  ["done", "active", "planned", "seam"].forEach(function (s) {
+    var st = M.statuses[s] || { label: s, hint: "" };
+    var p = el("div", "pill");
+    var g = el("span", "glyph", GLYPH[s]); g.style.color = "var(--st-" + s + ")";
+    p.appendChild(g);
+    p.appendChild(el("span", null, st.label));
+    if (st.hint) p.appendChild(el("span", "lh", "— " + st.hint));
+    legend.appendChild(p);
+  });
+  app.appendChild(legend);
+
+  /* ---- Workspace: graph + details ------------------------------------ */
+  var ws = el("div", "workspace");
+  var graph = el("div", "graph"); graph.id = "graph";
+
+  var svgNS = "http://www.w3.org/2000/svg";
+  var svg = document.createElementNS(svgNS, "svg");
+  svg.setAttribute("class", "edges");
+  graph.appendChild(svg);
+
+  var nodeEls = {};
+  M.layers.forEach(function (layer) {
+    var nodes = M.nodes.filter(function (n) { return n.layer === layer.id; });
+    if (!nodes.length) return;
+    var band = el("div", "band");
+    var bl = el("div", "band-label");
+    bl.appendChild(el("div", "n", layer.label));
+    if (layer.hint) bl.appendChild(el("div", "h", layer.hint));
+    band.appendChild(bl);
+    var bn = el("div", "band-nodes");
+    nodes.forEach(function (n) {
+      var b = el("button", "node");
+      b.type = "button";
+      b.setAttribute("data-status", n.status);
+      b.setAttribute("data-id", n.id);
+      b.setAttribute("aria-label", n.label + " — " + statusLabel(n.status));
+      var g = el("span", "glyph", GLYPH[n.status]);
+      var nl = el("span", "nl", n.label);
+      b.appendChild(g); b.appendChild(nl);
+      if (n.tags && n.tags.length) b.appendChild(el("span", "tag", n.tags[0]));
+      b.addEventListener("mouseenter", function () { focusNode(n.id); });
+      b.addEventListener("mouseleave", clearFocus);
+      b.addEventListener("focus", function () { focusNode(n.id); });
+      b.addEventListener("blur", clearFocus);
+      b.addEventListener("click", function () { selectNode(n.id); });
+      bn.appendChild(b);
+      nodeEls[n.id] = b;
+    });
+    band.appendChild(bn);
+    graph.appendChild(band);
+  });
+  ws.appendChild(graph);
+
+  var details = el("aside", "details"); details.id = "details";
+  details.appendChild(emptyDetails());
+  ws.appendChild(details);
+  app.appendChild(ws);
+
+  function emptyDetails() {
+    var e = el("div", "empty");
+    e.innerHTML = "Select a node to inspect it — status, what it does, its sub-parts, and links to the files and specs that define it.<br><br>Hover a node to trace its dependency rays.";
+    return e;
+  }
+
+  /* ---- Edges (light rays) -------------------------------------------- */
+  var edgePaths = []; // { path, a, b }
+  function buildEdges() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    edgePaths = [];
+    M.nodes.forEach(function (n) {
+      (n.deps || []).forEach(function (depId) {
+        if (!nodeEls[depId] || !nodeEls[n.id]) return;
+        var p = document.createElementNS(svgNS, "path");
+        p.setAttribute("data-a", n.id);
+        p.setAttribute("data-b", depId);
+        svg.appendChild(p);
+        edgePaths.push({ path: p, a: n.id, b: depId });
+      });
+    });
+  }
+  function drawEdges() {
+    var gr = graph.getBoundingClientRect();
+    svg.setAttribute("width", gr.width);
+    svg.setAttribute("height", gr.height);
+    svg.setAttribute("viewBox", "0 0 " + gr.width + " " + gr.height);
+    edgePaths.forEach(function (e) {
+      var a = center(nodeEls[e.a], gr), b = center(nodeEls[e.b], gr);
+      var dy = b.y - a.y;
+      var d;
+      if (Math.abs(dy) < 12) {
+        var bow = 34;
+        d = "M" + a.x + "," + a.y + " C " + a.x + "," + (a.y + bow) + " " + b.x + "," + (b.y + bow) + " " + b.x + "," + b.y;
+      } else {
+        var my = (a.y + b.y) / 2;
+        d = "M" + a.x + "," + a.y + " C " + a.x + "," + my + " " + b.x + "," + my + " " + b.x + "," + b.y;
+      }
+      e.path.setAttribute("d", d);
+    });
+  }
+  function center(node, gr) {
+    var r = node.getBoundingClientRect();
+    return { x: r.left - gr.left + r.width / 2, y: r.top - gr.top + r.height / 2 };
+  }
+
+  /* ---- Focus / select ------------------------------------------------ */
+  function focusNode(id) {
+    graph.classList.add("focusing");
+    var lit = {}; lit[id] = true;
+    edgePaths.forEach(function (e) {
+      var on = e.a === id || e.b === id;
+      e.path.classList.toggle("hot", on);
+      if (on) { lit[e.a] = true; lit[e.b] = true; }
+    });
+    Object.keys(nodeEls).forEach(function (k) {
+      nodeEls[k].classList.toggle("lit", !!lit[k]);
+    });
+  }
+  function clearFocus() {
+    graph.classList.remove("focusing");
+    edgePaths.forEach(function (e) { e.path.classList.remove("hot"); });
+    Object.keys(nodeEls).forEach(function (k) { nodeEls[k].classList.remove("lit"); });
+  }
+
+  var selected = null;
+  function selectNode(id) {
+    if (selected && nodeEls[selected]) nodeEls[selected].classList.remove("selected");
+    selected = id;
+    nodeEls[id].classList.add("selected");
+    renderDetails(byId[id]);
+  }
+
+  function renderDetails(n) {
+    var d = el("div");
+    var head = el("div", "d-head");
+    head.appendChild(el("h2", null, n.label));
+    var pill = el("span", "d-pill"); pill.setAttribute("data-status", n.status);
+    pill.innerHTML = '<span>' + GLYPH[n.status] + '</span>' + esc(statusLabel(n.status));
+    head.appendChild(pill);
+    d.appendChild(head);
+
+    if (n.tags && n.tags.length) {
+      var tg = el("div", "d-tags");
+      n.tags.forEach(function (t) { tg.appendChild(el("span", null, t)); });
+      d.appendChild(tg);
+    }
+
+    d.appendChild(el("p", "d-desc", n.desc));
+
+    if (n.deps && n.deps.length) {
+      d.appendChild(el("div", "d-sec", "Depends on"));
+      var dl = el("div", "d-tags");
+      n.deps.forEach(function (id2) {
+        var dep = byId[id2];
+        var s = el("span");
+        s.textContent = dep ? dep.label : id2;
+        if (dep) { s.style.cursor = "pointer"; s.addEventListener("click", function () { selectNode(id2); nodeEls[id2].focus(); }); }
+        dl.appendChild(s);
+      });
+      d.appendChild(dl);
+    }
+
+    if (n.parts && n.parts.length) {
+      d.appendChild(el("div", "d-sec", "Sub-parts"));
+      var ul = el("ul", "d-parts");
+      n.parts.forEach(function (p) {
+        var li = el("li");
+        var g = el("span", "pg"); g.textContent = GLYPH[p.status] || "•"; g.style.color = "var(--st-" + p.status + ")";
+        li.appendChild(g);
+        var body = el("div");
+        var pl = el("span", "pl"); pl.setAttribute("data-status", p.status); pl.textContent = p.label;
+        body.appendChild(pl);
+        if (p.desc) body.appendChild(el("div", "pd", p.desc));
+        li.appendChild(body);
+        ul.appendChild(li);
+      });
+      d.appendChild(ul);
+    }
+
+    if (n.files && n.files.length) {
+      d.appendChild(el("div", "d-sec", "Files"));
+      var fl = el("div", "d-links");
+      n.files.forEach(function (f) { fl.appendChild(link(f, f, "path")); });
+      d.appendChild(fl);
+    }
+    if (n.specs && n.specs.length) {
+      d.appendChild(el("div", "d-sec", "Specs"));
+      var sl = el("div", "d-links");
+      n.specs.forEach(function (s) { sl.appendChild(link(s.href, s.label, "doc")); });
+      d.appendChild(sl);
+    }
+
+    details.innerHTML = "";
+    details.appendChild(d);
+  }
+  function link(href, label, kind) {
+    var a = el("a"); a.href = href;
+    a.innerHTML = '<span class="k">' + kind + '</span> ' + esc(label);
+    return a;
+  }
+
+  /* ---- Roadmap ------------------------------------------------------- */
+  var road = el("section", "roadmap");
+  road.appendChild(el("h3", null, "Roadmap — milestones"));
+  var rail = el("div", "rail");
+  phases.forEach(function (r) {
+    var k = el("div", "rk"); k.setAttribute("data-status", normStatus(r.status));
+    k.appendChild(el("div", "rl", r.label));
+    var rs = el("div", "rs");
+    rs.innerHTML = '<span>' + (GLYPH[r.status] || "") + "</span>" + esc(statusLabel(r.status));
+    k.appendChild(rs);
+    rail.appendChild(k);
+  });
+  road.appendChild(rail);
+
+  road.appendChild(el("h3", null, "Hardening — CI invariant suites"));
+  var rail2 = el("div", "rail harden");
+  hardens.forEach(function (r) {
+    var k = el("div", "rk"); k.setAttribute("data-status", normStatus(r.status));
+    k.appendChild(el("div", "rl", r.label));
+    var rs = el("div", "rs");
+    rs.innerHTML = '<span>' + (GLYPH[r.status] || "") + "</span>" + esc(statusLabel(r.status));
+    k.appendChild(rs);
+    rail2.appendChild(k);
+  });
+  road.appendChild(rail2);
+  app.appendChild(road);
+
+  var foot = el("div", "foot");
+  foot.textContent = "Generated from project-map.js · " + total + " nodes across " + M.layers.length +
+    " layers · " + counts.done + " shipped, " + counts.active + " active, " + counts.seam +
+    " seams, " + counts.planned + " planned.";
+  app.appendChild(foot);
+
+  function normStatus(s) { return s === "seam" ? "planned" : s; } // roadmap cards use 3 states
+
+  /* ---- Init ---------------------------------------------------------- */
+  (function initTheme() {
+    var saved = null;
+    try { saved = localStorage.getItem("pm-theme"); } catch (e) {}
+    if (saved) document.documentElement.setAttribute("data-theme", saved);
+  })();
+  function prefersDark() { return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches; }
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+
+  buildEdges();
+  // Draw synchronously first — getBoundingClientRect forces layout, and with
+  // system fonts there is nothing async to wait for. This is what makes edges
+  // appear even in a background tab, where requestAnimationFrame is paused.
+  drawEdges();
+  // Then refine once layout has fully settled, and on full load, for safety.
+  requestAnimationFrame(function () { requestAnimationFrame(drawEdges); });
+  window.addEventListener("load", drawEdges);
+
+  var ro = window.ResizeObserver ? new ResizeObserver(function () { drawEdges(); }) : null;
+  if (ro) ro.observe(graph);
+  window.addEventListener("resize", drawEdges);
+})();
+</script>
+</body>
+</html>

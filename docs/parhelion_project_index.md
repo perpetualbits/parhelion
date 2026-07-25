@@ -77,6 +77,17 @@ T6.
 
 ## Current state
 
+- **M2 T7 — Subsurfaces v1, complete 2026-07-26** (pulled to the front of M2; see
+  `docs/plans/m2_tasks.md`'s reorder note). The scene grew a tree: parent links,
+  parent-relative transforms, sibling order carrying the parent's own slot,
+  transitive mapping, sync/desync commit semantics applied as **one atomic scene
+  message**, damage and input hit-testing through the tree. The snapshot flattens
+  it, so **the renderer did not change** — still a flat back-to-front list. The T0
+  conformance test that pinned the silent wrongness **inverted**; `foot` renders
+  with its decorations and the acceptance test asserts they composite. `make test`:
+  **124 tests green**, clippy clean, five new goldens (discrimination
+  re-demonstrated).
+
 - **Milestone: M2 (On the metal) — T0 complete 2026-07-25** (`docs/plans/m2_tasks.md`).
   M1's promissory notes paid or honestly reported. **Paid:** the dispatch-thread
   spin, via a client-intake restructure — one `calloop` source per client (its

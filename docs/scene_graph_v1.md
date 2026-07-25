@@ -734,35 +734,91 @@ context, no per-client grant, no smaller grant set for remote clients. Ordinary
 Wayland, correct for M1; C8's capability machinery (M4) is where it becomes a
 policy question.
 
-### 12.3 `wl_subcompositor`: advertised, used, and not composited
+### 12.3 Subsurfaces — the tree (M2 T7)
 
-The one place Parhelion advertises something it does not implement — and, after
-M2 T0, the one place where "refuse loudly instead" was tried and found impossible.
+The debt T7b measured wrongly, T0 measured correctly, and this section pays.
+`wl_subcompositor` is now honoured: a subsurface is a scene node with a parent,
+and its content composites.
 
-The scene composites only root surfaces; a subsurface's content is dropped. T0's
-plan was to make that refusal loud (decision log: *advertise-before-support
-requires loud refusal at point of use*). Both candidate refusal points were
-implemented and measured against `foot`:
+**Canonical for:** the tree fields on [`SceneNode`](../crates/core/src/scene/node.rs)
+(`parent`, `children`), the tree operations and flattening in
+[`state`](../crates/core/src/scene/state.rs), and the effective-commit walk in
+[`protocol`](../crates/core/src/protocol.rs).
 
-| Refuse at | Result |
-|---|---|
-| `get_subsurface` | foot dies at startup — it creates **nine** subsurfaces |
-| a subsurface committing a buffer | foot dies moments later — **eight** of the nine carry pixels |
+#### The shape
 
-They are foot's client-side decorations. **There is no refusal point that keeps an
-honest client alive**, so loud refusal and a working terminal are mutually
-exclusive until subsurfaces are real (**M2 T7**) — and the milestone's acceptance
-criterion *is* the terminal.
+A node gains a `parent` and an ordered `children` list. Two decisions carry the
+rest:
 
-The premise T0 was built on ("foot binds the global but never calls
-`get_subsurface`") was **my measurement error** — a `WAYLAND_DEBUG` grep matching
-`@` where the format uses `#` — and the correction is recorded in the decision log.
+- **A child's `transform` is parent-relative.** Absolute position is the
+  accumulated offset down the chain, computed where it is needed. This is why
+  moving a parent carries its whole subtree for free: no child's stored state
+  changes at all.
+- **The children list contains the parent's own id** as the marker for where the
+  parent sits among its children. That is not cleverness borrowed from Smithay —
+  it is the only representation that can express `place_below`, which puts a child
+  *beneath* its parent. "Above the parent" and "below the parent" are positions in
+  one list, not two lists.
 
-**Consequence, stated plainly:** foot renders **without its decorations** today.
-That is exactly the silent wrongness the principle forbids; it stands, visibly,
-until T7 pays it. The conformance suite pins the behaviour
-(`a_subsurface_is_accepted_and_its_content_is_silently_not_composited`) so that
-test inverts the day subsurfaces land.
+Nesting is arbitrary; every walk is bounded by `MAX_SUBSURFACE_DEPTH` (16) as a
+cycle guard, because these walks run on the scene thread and an unbounded
+recursion there takes the compositor with it.
+
+#### The mapping law, extended
+
+> A node composites iff it has a display-worthy role, a source, a non-empty size —
+> **and every ancestor does too.**
+
+`SceneNode::is_visible` answers for the node alone; `Scene::is_mapped` walks the
+chain. A subsurface of an unmapped window is not "hidden", it is *not mapped*, and
+the T5 rule follows it down the tree: what cannot be seen cannot be clicked. foot's
+pixel-less border subsurface is the case nature provided — role assigned, position
+set, no buffer ever — and it composites nothing and takes no input.
+
+#### Sync and desync
+
+A **synchronized** subsurface (the protocol's default) caches its commits; they
+become current at the nearest desynchronized ancestor's commit. A **desynchronized**
+one applies its own. Smithay owns the caching, which means our job is *not acting
+early*: `commit` returns immediately for a sync subsurface, and the effective
+commit walks the whole subtree.
+
+**Atomicity is the semantic heart**, and it is structural here: one effective
+commit produces **one** `SurfaceUpdate` list and **one** scene message, so no
+snapshot can land between a parent's new content and its children's. A client that
+moves a window and repositions its decorations in a single commit is never
+rendered half-moved. The golden pair
+(`subsurface_sync_before_parent_commit` / `..._after_parent_commit`) pins both
+frames, because "nothing appeared yet" is a claim about pixels.
+
+#### Damage through the tree
+
+Structural changes damage the **subtree's** old ∪ new rects: a parent's move takes
+its children's pixels with it, and a restack changes what is visible inside pixels
+nobody moved. One subtlety earned by measurement: a subsurface's position is
+re-stated on every effective parent commit (that is how the protocol defers it),
+so `set_subsurface_position` **must** be a no-op when the position is unchanged.
+Without that check the acceptance run damaged 76% of the output per keystroke
+instead of 0.6% — correct output, ruinous cost, and exactly the kind of thing the
+counters exist to catch.
+
+The equivalence oracle grew a tree sequence (map child, map grandchild, move
+parent, move child, restack below parent, atomic batch, unmap parent) because
+trees are where incremental rendering goes wrong.
+
+#### Flattening, and why the renderer did not change
+
+The snapshot is still a flat back-to-front list. Roots are ordered by `z` (ties by
+`SurfaceId`); each root's tree is flattened in composition order with offsets
+accumulated; the renderer consumes exactly what it always did and knows nothing
+about trees. **The scene owns tree semantics; the renderer owns pixels.**
+
+Input uses the same ordering, rebuilt on the dispatch side from Smithay's tree so
+routing never waits on the scene (I-2, T6's discipline). Two rules ride along:
+subsurfaces are hit-testable but never keyboard-focusable (the protocol gives them
+pointer input only), and the routing table is sorted by `SurfaceId` — an
+unsorted walk over a `HashMap` made "topmost" depend on hash iteration, which is a
+bug this document would rather record than repeat.
 
 ### 12.4 Graceful shutdown
 

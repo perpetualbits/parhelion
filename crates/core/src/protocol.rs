@@ -129,8 +129,9 @@ use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Sub
 use smithay::utils::{Logical, Point, Serial, SERIAL_COUNTER};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
-    with_states, BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
-    Damage, SurfaceAttributes,
+    get_role, is_sync_subsurface, with_states, with_surface_tree_upward, BufferAssignment,
+    CompositorClientState, CompositorHandler, CompositorState, Damage, SubsurfaceCachedState,
+    SurfaceAttributes, TraversalAction, SUBSURFACE_ROLE,
 };
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::selection::data_device::{
@@ -147,7 +148,7 @@ use smithay::wayland::shm::{with_buffer_contents, BufferAccessError, ShmHandler,
 use crate::input::{FocusMap, InputEvent};
 use crate::scene::{
     ClientKey, ContentDamage, NodeRole, PixelBuffer, ProtocolEvent, Rect, SceneHandle, SurfaceId,
-    TextureSource, ToplevelRole, Transform,
+    SurfaceUpdate, TextureSource, ToplevelRole, MAX_SUBSURFACE_DEPTH,
 };
 
 /// Per-client cap on **pending** (committed but not-yet-fired) `wl_surface.frame`
@@ -635,6 +636,152 @@ impl State {
         })
     }
 
+    /// Walk the surfaces whose state just became effective — this surface and its
+    /// subsurface tree — collecting their changes (M2 T7).
+    ///
+    /// The traversal is Smithay's tree, read faithfully rather than re-derived:
+    /// child order comes from [`ordered_children`], which returns the parent's
+    /// children *with the parent's own slot in place*, because `place_below` makes
+    /// "beneath the parent" a real position.
+    fn collect_tree(&mut self, surface: &WlSurface, updates: &mut Vec<SurfaceUpdate>, depth: usize) {
+        if depth > MAX_SUBSURFACE_DEPTH {
+            return;
+        }
+        self.collect_surface(surface, updates);
+
+        let ordered = ordered_children(surface);
+        // A surface with no subsurfaces is the whole tree; nothing to order.
+        if ordered.len() <= 1 {
+            return;
+        }
+        if let Some(&parent_id) = self.obj_to_surface.get(&surface.id()) {
+            let order: Vec<SurfaceId> = ordered
+                .iter()
+                .filter_map(|s| self.obj_to_surface.get(&s.id()).copied())
+                .collect();
+            updates.push(SurfaceUpdate::Order {
+                parent: parent_id,
+                order,
+            });
+        }
+        for child in ordered {
+            if child.id() != surface.id() {
+                self.collect_tree(&child, updates, depth + 1);
+            }
+        }
+    }
+
+    /// Collect one surface's effective state: its subsurface position, and the
+    /// content it just committed (if any).
+    fn collect_surface(&mut self, surface: &WlSurface, updates: &mut Vec<SurfaceUpdate>) {
+        let obj = surface.id();
+        let Some(&sid) = self.obj_to_surface.get(&obj) else {
+            return;
+        };
+
+        // A subsurface's position is double-buffered and applies with the parent's
+        // commit in both sync and desync mode — reading the *current* state here
+        // is exactly that rule, because "current" is what the commit just made.
+        if get_role(surface) == Some(SUBSURFACE_ROLE) {
+            let location = with_states(surface, |states| {
+                states
+                    .cached_state
+                    .get::<SubsurfaceCachedState>()
+                    .current()
+                    .location
+            });
+            updates.push(SurfaceUpdate::Position {
+                surface: sid,
+                offset: (location.x, location.y),
+            });
+        }
+
+        let (assignment, raw_damage) = with_states(surface, |states| {
+            let mut guard = states.cached_state.get::<SurfaceAttributes>();
+            let current = guard.current();
+            (current.buffer.take(), std::mem::take(&mut current.damage))
+        });
+
+        match assignment {
+            Some(BufferAssignment::NewBuffer(buffer)) => {
+                // Buffer==surface coordinates in M1 (no scale/transform yet); this
+                // is the marked site where the two are merged (M2+ generalizes it).
+                let damage_rects = damage_to_rects(&raw_damage);
+                let prev = self.surface_pixels.get(&obj).cloned();
+                match build_pixel_block(&buffer, prev, &damage_rects) {
+                    Ok(Some((block, opaque, content_damage, bytes))) => {
+                        self.counters.bytes_copied.fetch_add(bytes, Ordering::Relaxed);
+                        self.surface_pixels.insert(obj.clone(), block.clone());
+                        let size = (block.width, block.height);
+
+                        // The mapping commit of a *toplevel* also carries its C10
+                        // placement; later commits must not touch geometry, or
+                        // every frame would damage the whole extent. Subsurfaces
+                        // are placed by their parent-relative position instead.
+                        if let Some(entry) = self.toplevels.get_mut(&obj)
+                            && !entry.mapped
+                        {
+                            entry.mapped = true;
+                            updates.push(SurfaceUpdate::Geometry {
+                                surface: sid,
+                                offset: entry.placement,
+                                size,
+                            });
+                        }
+                        updates.push(SurfaceUpdate::Content {
+                            surface: sid,
+                            size,
+                            source: TextureSource::Shm(block),
+                            opaque,
+                            damage: content_damage,
+                        });
+                    }
+                    // Non-shm buffer or zero-size: nothing to show (no dmabuf in M1).
+                    Ok(None) => {}
+                    // Access error: Smithay already posted the protocol error /
+                    // killed the client; nothing more to do.
+                    Err(_) => {}
+                }
+                buffer.release();
+            }
+            // Null attach: unmap — the node loses its source; drop the retained block.
+            Some(BufferAssignment::Removed) => {
+                self.surface_pixels.remove(&obj);
+                updates.push(SurfaceUpdate::Unmap { surface: sid });
+            }
+            // No buffer change this commit: the node keeps its current pixels.
+            None => {}
+        }
+    }
+
+    /// The per-surface consequences of a commit that the *tree* does not share:
+    /// input routing, focus, and the toplevel's unmap bookkeeping. Returns whether
+    /// this commit unmapped the surface.
+    fn post_commit_bookkeeping(&mut self, obj: &ObjectId) -> bool {
+        let Some(&sid) = self.obj_to_surface.get(obj) else {
+            return false;
+        };
+        let mapped_now = self.surface_pixels.contains_key(obj);
+
+        if let Some(entry) = self.toplevels.get_mut(obj) {
+            if !mapped_now && entry.mapped {
+                entry.mapped = false;
+                self.leave_output(obj);
+                self.focus_map.unmap(sid);
+                self.refocus_keyboard();
+                return true;
+            }
+            if mapped_now {
+                self.enter_output(obj);
+            }
+        }
+        // Routing first, then focus: `refocus_keyboard` reads the table this
+        // rebuilds, so the order is the dependency.
+        self.refresh_input_routing();
+        self.refocus_keyboard();
+        false
+    }
+
     /// Unmap a toplevel's node: it loses its source (and so its visibility) with
     /// the structural damage `clear_source` raises, and it leaves the focus
     /// routing table — what cannot be seen cannot be clicked or focused. Used by
@@ -650,6 +797,136 @@ impl State {
             self.scene.mutate(move |s| s.clear_source(sid));
             self.focus_map.unmap(sid);
             self.refocus_keyboard();
+        }
+    }
+
+    /// Tell the output a surface is on it (idempotent).
+    fn enter_output(&self, obj: &ObjectId) {
+        if let Some(surface) = self.surfaces.get(obj) {
+            self.output.enter(surface);
+        }
+    }
+
+    /// Tell the output a surface has left it (idempotent).
+    fn leave_output(&self, obj: &ObjectId) {
+        if let Some(surface) = self.surfaces.get(obj) {
+            self.output.leave(surface);
+        }
+    }
+
+    /// Rebuild the input routing table from the surface trees (M2 T7).
+    ///
+    /// Subsurfaces are hit-testable, so the table can no longer be a flat list of
+    /// toplevel rects. It is rebuilt from the same walk the scene flattens with —
+    /// each mapped toplevel's tree in composition order — and `z` is simply the
+    /// index in that order, so "topmost" means the same thing to input as it does
+    /// to the compositor.
+    ///
+    /// It is rebuilt wholesale rather than patched because the inputs are cheap
+    /// (a handful of surfaces), and because a patch would be a second
+    /// implementation of the ordering rules with its own chance to disagree —
+    /// the exact bug class the shared walk exists to prevent.
+    ///
+    /// Runs on the dispatch thread from its own state: no scene round-trip, so
+    /// input routing never waits on the scene (the I-2 discipline from T6).
+    fn refresh_input_routing(&mut self) {
+        self.focus_map.clear();
+        let mut z = 0i32;
+
+        // Toplevels are the roots; their cascade placement is their origin.
+        //
+        // **Sorted by `SurfaceId`, and that is load-bearing.** `toplevels` is a
+        // HashMap, so iterating it gives an arbitrary order — and since `z` here is
+        // the index in composition order, an unsorted walk would make "topmost"
+        // (and therefore keyboard focus) depend on hash iteration. All toplevels
+        // share z = 0 in the scene, whose tiebreak is ascending `SurfaceId`: the
+        // most recently mapped window is on top. This reproduces exactly that, so
+        // input and pixels agree.
+        let mut roots: Vec<(SurfaceId, ObjectId, (i32, i32))> = self
+            .toplevels
+            .iter()
+            .filter(|(_, e)| e.mapped)
+            .filter_map(|(obj, e)| {
+                self.obj_to_surface
+                    .get(obj)
+                    .map(|sid| (*sid, obj.clone(), e.placement))
+            })
+            .collect();
+        roots.sort_by_key(|(sid, _, _)| *sid);
+        let roots: Vec<(ObjectId, (i32, i32))> = roots
+            .into_iter()
+            .map(|(_, obj, placement)| (obj, placement))
+            .collect();
+
+        for (root_obj, origin) in roots {
+            let Some(root) = self.surfaces.get(&root_obj).cloned() else {
+                continue;
+            };
+            for (obj, offset) in self.flatten_for_input(&root, origin) {
+                let Some(&sid) = self.obj_to_surface.get(&obj) else {
+                    continue;
+                };
+                let Some(block) = self.surface_pixels.get(&obj) else {
+                    // No pixels, no input: the T5 rule, applied through the tree.
+                    // foot's border subsurface lives here — role, position, no
+                    // buffer, and so click-transparent.
+                    continue;
+                };
+                let rect = Rect::new(
+                    offset.0,
+                    offset.1,
+                    block.width as i32,
+                    block.height as i32,
+                );
+                let focusable = self.toplevels.contains_key(&obj);
+                self.focus_map.map(sid, rect, z, focusable);
+                z += 1;
+            }
+        }
+    }
+
+    /// Flatten one surface tree into `(object, absolute offset)` pairs in
+    /// composition order — the input-side twin of the scene's flattening.
+    fn flatten_for_input(
+        &self,
+        surface: &WlSurface,
+        origin: (i32, i32),
+    ) -> Vec<(ObjectId, (i32, i32))> {
+        let mut out = Vec::new();
+        self.flatten_for_input_inner(surface, origin, &mut out, 0);
+        out
+    }
+
+    /// Depth-bounded recursion behind [`flatten_for_input`].
+    fn flatten_for_input_inner(
+        &self,
+        surface: &WlSurface,
+        offset: (i32, i32),
+        out: &mut Vec<(ObjectId, (i32, i32))>,
+        depth: usize,
+    ) {
+        if depth > MAX_SUBSURFACE_DEPTH {
+            return;
+        }
+        let ordered = ordered_children(surface);
+        if ordered.len() <= 1 {
+            out.push((surface.id(), offset));
+            return;
+        }
+        for child in ordered {
+            if child.id() == surface.id() {
+                out.push((surface.id(), offset));
+                continue;
+            }
+            let location = with_states(&child, |states| {
+                states
+                    .cached_state
+                    .get::<SubsurfaceCachedState>()
+                    .current()
+                    .location
+            });
+            let child_offset = (offset.0 + location.x, offset.1 + location.y);
+            self.flatten_for_input_inner(&child, child_offset, out, depth + 1);
         }
     }
 
@@ -1033,6 +1310,23 @@ impl CompositorHandler for State {
         });
     }
 
+    /// A surface became a subsurface of `parent` (M2 T7).
+    ///
+    /// The role and the parent link go to the scene immediately — they are
+    /// canonical state (I-5) — but the child stays unmapped until it commits
+    /// content *and* its parent chain is mapped. New subsurfaces are placed above
+    /// their parent, which is what the protocol specifies.
+    fn new_subsurface(&mut self, surface: &WlSurface, parent: &WlSurface) {
+        let (Some(&child_id), Some(&parent_id)) = (
+            self.obj_to_surface.get(&surface.id()),
+            self.obj_to_surface.get(&parent.id()),
+        ) else {
+            return;
+        };
+        self.scene
+            .mutate(move |s| s.attach_subsurface(child_id, parent_id));
+    }
+
     /// A surface committed: publish `SurfaceCommitted`, and apply the
     /// double-buffered buffer state (attach) if this commit carried one.
     ///
@@ -1057,122 +1351,53 @@ impl CompositorHandler for State {
         };
         self.scene.emit(ProtocolEvent::SurfaceCommitted { surface: sid });
 
-        // Take the just-committed buffer assignment *and* the accumulated damage
-        // out of the surface's *current* state, so each is processed once. We own
-        // the buffer release (Smithay would otherwise release the previous buffer
-        // only on the next attach — too late for single-buffer clients).
-        let obj = surface.id();
-        let (assignment, raw_damage) = with_states(surface, |states| {
-            let mut guard = states.cached_state.get::<SurfaceAttributes>();
-            let current = guard.current();
-            (
-                current.buffer.take(),
-                std::mem::take(&mut current.damage),
-            )
-        });
+        // **A synchronized subsurface's commit is not effective yet** (M2 T7).
+        // Its state is cached and becomes current when its nearest desynchronized
+        // ancestor commits — that is the whole point of sync mode, and it is why
+        // a client can update a window and its decorations without the compositor
+        // ever showing half of it. Smithay owns the caching; we own not acting
+        // early.
+        if is_sync_subsurface(surface) {
+            return;
+        }
 
         // The xdg gate: a toplevel may not commit a buffer before acking its
-        // initial configure. `ensure_configured` posts the protocol error and
-        // returns false, in which case this commit maps nothing — the client is
-        // being disconnected anyway. (Smithay posts `xdg_surface.not_constructed`
-        // where the spec's dedicated code is `unconfigured_buffer`; the
-        // `xdg_surface` object is not reachable through Smithay's public API, so
-        // we take its code. Documented in `docs/scene_graph_v1.md` §10.)
-        if matches!(assignment, Some(BufferAssignment::NewBuffer(_)))
-            && let Some(entry) = self.toplevels.get(&obj)
+        // initial configure. Peeked rather than taken, because the buffer is
+        // consumed below by the tree walk.
+        let has_buffer = with_states(surface, |states| {
+            states
+                .cached_state
+                .get::<SurfaceAttributes>()
+                .current()
+                .buffer
+                .is_some()
+        });
+        if has_buffer
+            && let Some(entry) = self.toplevels.get(&surface.id())
             && !entry.toplevel.ensure_configured()
         {
             return;
         }
 
-        // Set by the null-attach arm; consumed after the configure check below.
-        let mut unmapped = false;
-
-        match assignment {
-            Some(BufferAssignment::NewBuffer(buffer)) => {
-                // Buffer==surface coordinates in M1 (no scale/transform yet); this
-                // is the marked site where the two are merged (M2+ generalizes it).
-                let damage_rects = damage_to_rects(&raw_damage);
-                let prev = self.surface_pixels.get(&obj).cloned();
-                match build_pixel_block(&buffer, prev, &damage_rects) {
-                    Ok(Some((block, opaque, content_damage, bytes))) => {
-                        self.counters.bytes_copied.fetch_add(bytes, Ordering::Relaxed);
-                        self.surface_pixels.insert(obj.clone(), block.clone());
-                        let size = (block.width, block.height);
-                        let source = TextureSource::Shm(block);
-                        // The mapping commit (first content on a toplevel) also
-                        // carries the C10 placement; later commits must not touch
-                        // geometry, or every frame would damage the whole extent.
-                        let placement = match self.toplevels.get_mut(&obj) {
-                            Some(entry) if !entry.mapped => {
-                                entry.mapped = true;
-                                Some(entry.placement)
-                            }
-                            _ => None,
-                        };
-                        // Buffer defines pixel size. Only owned `Send` data
-                        // crosses to the scene, which computes the frame damage.
-                        self.scene.mutate(move |s| {
-                            if let Some((dx, dy)) = placement {
-                                // Set while the node is still invisible (no source
-                                // yet) so this raises no damage of its own; the
-                                // attach below damages the mapped extent.
-                                s.set_geometry(sid, Transform::Translate { dx, dy }, size);
-                            }
-                            s.attach_content(sid, size, source, opaque, content_damage);
-                        });
-
-                        // Mirror the same fact into the input routing table (T6).
-                        // A toplevel's extent is its placement plus the buffer's
-                        // size, so this re-runs on every content commit — a client
-                        // that commits a differently-sized buffer resizes its
-                        // input region with its pixels, in one place, from the
-                        // same values the scene was just told about. Non-toplevel
-                        // surfaces never enter the table: no role, no pixels, no
-                        // input (the T5 rule, extended).
-                        if let Some(entry) = self.toplevels.get(&obj) {
-                            // The window is on screen now, so it is on the output
-                            // (T7). `enter` is idempotent per surface, so a
-                            // content commit on an already-mapped window sends
-                            // nothing further.
-                            self.output.enter(surface);
-                            let (dx, dy) = entry.placement;
-                            let rect = Rect::new(dx, dy, size.0 as i32, size.1 as i32);
-                            // z is 0 for every toplevel in M1 (stacking policy is
-                            // S1's, M4); ties break by SurfaceId in both the
-                            // snapshot and the routing table, so input and pixels
-                            // agree on who is on top.
-                            self.focus_map.map(sid, rect, 0);
-                            self.refocus_keyboard();
-                        }
-                    }
-                    // Non-shm buffer or zero-size: nothing to show (no dmabuf in M1).
-                    Ok(None) => {}
-                    // Access error: Smithay already posted the protocol error /
-                    // killed the client; nothing more to do.
-                    Err(_) => {}
-                }
-                buffer.release();
-            }
-            // Null attach (`wl_surface.attach(null)`): unmap — the node loses its
-            // source and becomes invisible; drop the retained block.
-            Some(BufferAssignment::Removed) => {
-                self.unmap_surface(&obj);
-                if let Some(entry) = self.toplevels.get_mut(&obj) {
-                    entry.mapped = false;
-                    unmapped = true;
-                }
-            }
-            // No buffer change this commit: the node keeps its current pixels.
-            // Damage without a new buffer is a no-op — the content did not change,
-            // so there is nothing to repaint.
-            None => {}
+        // Collect this surface and every subsurface whose state just became
+        // effective, then apply the lot in **one** scene message. The atomicity is
+        // the semantic heart of sync mode; splitting it into a message per surface
+        // would let a snapshot land in the middle.
+        let mut updates = Vec::new();
+        self.collect_tree(surface, &mut updates, 0);
+        if !updates.is_empty() {
+            self.scene.mutate(move |s| s.apply_commit(updates));
         }
+
+        // Unmap bookkeeping and the xdg dance are per-surface concerns of the
+        // committed surface itself, not of its tree.
+        let obj = surface.id();
+        let unmapped = self.post_commit_bookkeeping(&obj);
 
         // The initial configure, sent in response to the client's buffer-less
         // "here I am" commit. Size 0×0 and no states means "you choose" — the core
         // has no size policy to impose (§4 rule 4); the placement it does own is
-        // C10's cascade above.
+        // C10's cascade.
         if let Some(entry) = self.toplevels.get(&obj)
             && !entry.toplevel.is_initial_configure_sent()
         {
@@ -1183,11 +1408,6 @@ impl CompositorHandler for State {
         // earns no configure: per xdg-shell an unmapped surface must perform the
         // initial commit/configure sequence again, and the configure belongs to
         // that future commit, not to this one.
-        //
-        // Smithay would do this re-arming in its own commit hook, but that hook
-        // detects unmap through surface state its renderer helpers populate — and
-        // we use none of them (we supply our own renderer; that is the seam) — so
-        // it is inert for us and the core does it. See `docs/scene_graph_v1.md` §10.
         if unmapped
             && let Some(entry) = self.toplevels.get(&obj)
         {
@@ -1385,6 +1605,35 @@ smithay::delegate_xdg_shell!(State);
 // pools/buffers) and the `ShmHandler`/`BufferHandler` impls above. This is the
 // entire seam: `smithay::wayland::shm`; Smithay's renderer layer is untouched.
 smithay::delegate_shm!(State);
+
+/// A surface's immediate children **in composition order, with the surface's own
+/// slot included** (M2 T7).
+///
+/// Smithay's `get_children` filters the parent's self-marker out of the list,
+/// which loses exactly the information `place_below` creates: whether a child is
+/// beneath or above its parent. This walks one level of the tree instead —
+/// `SkipChildren` stops the traversal descending, while still visiting each child
+/// — and the parent appears at its own position, which is the ordering the scene
+/// stores.
+fn ordered_children(parent: &WlSurface) -> Vec<WlSurface> {
+    let mut out = Vec::new();
+    with_surface_tree_upward(
+        parent,
+        (),
+        |surface, _, _| {
+            if surface == parent {
+                TraversalAction::DoChildren(())
+            } else {
+                // Visit this child, but do not descend into its own subtree: one
+                // level is what "immediate children" means.
+                TraversalAction::SkipChildren
+            }
+        },
+        |surface, _, _| out.push(surface.clone()),
+        |_, _, _| true,
+    );
+    out
+}
 
 /// Convert Smithay's accumulated surface damage into our surface-coordinate
 /// rects. **The marked buffer==surface site (constraint 2):** with no buffer

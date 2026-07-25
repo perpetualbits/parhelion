@@ -11,6 +11,16 @@ arrives T4–T6 behind a spike, because renderer API choice is a
 decision, not a default. Debt tasks bracket the milestone: T0 pays
 M1's promissory notes; T7 retires the subcompositor tripwire.
 
+**Reorder (2026-07-25): T7 executes second, after T0 and before T1.**
+Three reasons. (a) T0's correction showed the subsurface gap is *live*,
+not dormant: foot renders undecorated, and that silent wrongness has
+been shipping since M1. (b) The work needs no DRM or GPU, and it is far
+easier to get right against tolerance-0 CPU goldens and the
+incremental-equals-scratch oracle than after T5 loosens both. (c) The
+conformance test that currently pins the wrong behaviour inverts sooner,
+so the tree stops asserting something we do not want to be true. The
+milestone's shape is otherwise unchanged; T1 follows T7.
+
 ---
 
 ## T0 — Debt & honesty *(prompt 12)*

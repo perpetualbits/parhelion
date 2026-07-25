@@ -19,7 +19,7 @@ use parhelion_core::protocol::ProtocolHost;
 use parhelion_core::render::{Compositor, RenderLoop};
 use parhelion_core::scene::{
     ClientKey, ContentDamage, NodeRole, PixelBuffer, ProtocolEvent, Rect, SceneHandle, SceneThread,
-    Snapshot, SnapshotDamage, SurfaceId, TextureSource, ToplevelRole, Transform,
+    Snapshot, SnapshotDamage, SurfaceId, SurfaceUpdate, TextureSource, ToplevelRole, Transform,
 };
 use parhelion_harness::protocol_rig::{ScriptedClient, ShmFormat};
 
@@ -132,6 +132,7 @@ fn assert_equiv(h: &SceneHandle, inc: &mut CpuCompositor, label: &str) {
 
 const A: SurfaceId = SurfaceId(1);
 const B: SurfaceId = SurfaceId(2);
+const C: SurfaceId = SurfaceId(3);
 const CK: ClientKey = ClientKey(1);
 
 /// Incremental rendering matches from-scratch across an awkward sequence of
@@ -199,6 +200,111 @@ fn incremental_equals_from_scratch() {
     // Step 8: explicit full redraw (the conservative fallback).
     h.mutate(|s| s.damage_full());
     assert_equiv(&h, &mut inc, "full redraw");
+}
+
+/// The oracle, extended through the **subsurface tree** (M2 T7).
+///
+/// Trees are where incremental rendering goes wrong: a parent's move must carry
+/// its children, a restack changes what is visible inside pixels nobody touched,
+/// and a synchronized batch must land as one frame rather than as a sequence of
+/// half-states. Each of those is a chance to under-report damage, and
+/// under-reported damage is precisely what this oracle catches — incremental must
+/// be byte-identical to compositing from nothing, at every step.
+#[test]
+fn incremental_equals_from_scratch_through_a_subsurface_tree() {
+    let scene = SceneThread::spawn();
+    let h = scene.handle();
+    let mut inc = CpuCompositor::new(W, H, CLEAR);
+
+    // A parent window with a child and a grandchild — depth 2, so accumulated
+    // offsets are exercised rather than assumed away.
+    let parent = solid(20, 20, RED);
+    map_node(&h, A, CK, Transform::Identity, (20, 20), parent, true);
+    assert_equiv(&h, &mut inc, "map parent");
+
+    let child_block = solid(8, 8, BLUE);
+    h.emit(ProtocolEvent::SurfaceCreated {
+        surface: B,
+        client: CK,
+    });
+    h.mutate(move |s| {
+        s.attach_subsurface(B, A);
+        s.apply_commit(vec![
+            SurfaceUpdate::Position {
+                surface: B,
+                offset: (4, 4),
+            },
+            SurfaceUpdate::Content {
+                surface: B,
+                size: (8, 8),
+                source: TextureSource::Shm(Arc::new(child_block)),
+                opaque: true,
+                damage: ContentDamage::Full,
+            },
+        ]);
+    });
+    assert_equiv(&h, &mut inc, "map child above parent");
+
+    let grand = solid(4, 4, GREEN);
+    h.emit(ProtocolEvent::SurfaceCreated {
+        surface: C,
+        client: CK,
+    });
+    h.mutate(move |s| {
+        s.attach_subsurface(C, B);
+        s.apply_commit(vec![
+            SurfaceUpdate::Position {
+                surface: C,
+                offset: (2, 2),
+            },
+            SurfaceUpdate::Content {
+                surface: C,
+                size: (4, 4),
+                source: TextureSource::Shm(Arc::new(grand)),
+                opaque: true,
+                damage: ContentDamage::Full,
+            },
+        ]);
+    });
+    assert_equiv(&h, &mut inc, "map grandchild");
+
+    // Move the parent: the whole subtree must move with it, and both the vacated
+    // and the newly covered pixels must be damaged.
+    h.mutate(|s| s.set_geometry(A, Transform::Translate { dx: 9, dy: 5 }, (20, 20)));
+    assert_equiv(&h, &mut inc, "move parent (subtree follows)");
+
+    // Move the child: its own grandchild follows it, the parent does not.
+    h.mutate(|s| s.set_subsurface_position(B, 10, 2));
+    assert_equiv(&h, &mut inc, "move child within parent");
+
+    // Restack: put the child *below* its parent. Nothing moved, but what is
+    // visible inside those pixels changed — the classic missed-damage case.
+    h.mutate(|s| s.set_child_order(A, vec![B, A]));
+    assert_equiv(&h, &mut inc, "restack child below parent");
+
+    // A synchronized batch: parent content and child position in one commit.
+    let parent2 = solid(20, 20, MAGENTA);
+    h.mutate(move |s| {
+        s.apply_commit(vec![
+            SurfaceUpdate::Content {
+                surface: A,
+                size: (20, 20),
+                source: TextureSource::Shm(Arc::new(parent2)),
+                opaque: true,
+                damage: ContentDamage::Full,
+            },
+            SurfaceUpdate::Position {
+                surface: B,
+                offset: (1, 12),
+            },
+        ]);
+    });
+    assert_equiv(&h, &mut inc, "atomic batch: parent content + child move");
+
+    // Unmap the parent: the entire tree vanishes, and every pixel it covered is
+    // damaged — children included, which a parent-only damage calculation misses.
+    h.mutate(|s| s.clear_source(A));
+    assert_equiv(&h, &mut inc, "unmap parent (whole tree vanishes)");
 }
 
 /// A small-damage content update on a large surface redraws pixels proportional

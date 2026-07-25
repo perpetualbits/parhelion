@@ -478,3 +478,173 @@ fn axis_events_reach_the_window_under_the_cursor() {
         "a vertical scroll arrives with its value intact"
     );
 }
+
+// ==========================================================================
+// Input through the subsurface tree (M2 T7).
+// ==========================================================================
+
+/// A click over a subsurface lands **on the subsurface**, with coordinates local
+/// to it — not to the window it decorates. Getting this wrong is how a toolkit's
+/// buttons end up offset by the border width.
+#[test]
+fn a_click_over_a_subsurface_lands_on_the_child_with_child_local_coordinates() {
+    let (_scene, host, mut client) = fixture();
+
+    let win = client.map_toplevel(40, 40, ShmFormat::Xrgb8888, &vec![255u8; 40 * 40 * 4]);
+    let child = client.create_surface();
+    let sub = client.get_subsurface(&child, &win.surface);
+    client.set_subsurface_position(&sub, 10, 10);
+    client.draw(&child, 12, 12, &vec![128u8; 12 * 12 * 4]);
+    client.commit(&win.surface);
+    // Round-trip before injecting input: `commit` only queues the request, and a
+    // motion event that overtakes it would be routed against the old tree.
+    client.roundtrip();
+    client.pump_until_input_events(1);
+    let child_id = client.surface_id(&child);
+    let parent_id = client.surface_id(&win.surface);
+    client.clear_input_events();
+
+    // Point at (13,13) in output space: 3 px inside the child, which sits at
+    // (10,10) — so the child sees (3,3).
+    host.input(InputEvent::PointerMotion {
+        x: 13.0,
+        y: 13.0,
+        time_ms: 10,
+    });
+    client.pump_until_input_events(1);
+    assert_eq!(
+        client.input_events()[0],
+        SeatEvent::PointerEnter {
+            surface: child_id,
+            x: 3.0,
+            y: 3.0
+        },
+        "the pointer entered the child, at coordinates local to the child"
+    );
+    client.clear_input_events();
+
+    // A click goes to the child too.
+    host.input(InputEvent::PointerButton {
+        button: BTN_LEFT,
+        pressed: true,
+        time_ms: 20,
+    });
+    client.pump_until_input_events(1);
+    assert!(
+        matches!(
+            client.input_events()[0],
+            SeatEvent::PointerButton { pressed: true, .. }
+        ),
+        "the click was delivered: {:?}",
+        client.input_events()
+    );
+
+    // Release the button before moving: while one is held the pointer is in an
+    // implicit grab and focus stays with the surface that was pressed — which is
+    // correct, and would otherwise make the crossing below never happen.
+    host.input(InputEvent::PointerButton {
+        button: BTN_LEFT,
+        pressed: false,
+        time_ms: 25,
+    });
+    client.roundtrip();
+
+    // And moving off the child, but still over the window, crosses to the parent.
+    client.clear_input_events();
+    host.input(InputEvent::PointerMotion {
+        x: 2.0,
+        y: 2.0,
+        time_ms: 30,
+    });
+    client.pump_until_input_events(2);
+    assert_eq!(
+        client.input_events(),
+        &[
+            SeatEvent::PointerLeave { surface: child_id },
+            SeatEvent::PointerEnter {
+                surface: parent_id,
+                x: 2.0,
+                y: 2.0
+            },
+        ],
+        "leaving the child enters the parent underneath it"
+    );
+}
+
+/// Keyboard focus belongs to the **window**, never to its subsurfaces — the
+/// protocol gives subsurfaces pointer input only. A decoration must not steal the
+/// keyboard from the terminal it frames.
+#[test]
+fn a_subsurface_never_takes_keyboard_focus() {
+    let (_scene, host, mut client) = fixture();
+
+    let win = client.map_toplevel(40, 40, ShmFormat::Xrgb8888, &vec![255u8; 40 * 40 * 4]);
+    let child = client.create_surface();
+    let sub = client.get_subsurface(&child, &win.surface);
+    client.set_subsurface_position(&sub, 0, 0);
+    // A child covering the whole window — the worst case for focus confusion.
+    client.draw(&child, 40, 40, &vec![128u8; 40 * 40 * 4]);
+    client.commit(&win.surface);
+    client.roundtrip();
+    client.pump_until_input_events(1);
+
+    let parent_id = client.surface_id(&win.surface);
+    assert_eq!(
+        focus_events(&client),
+        vec![SeatEvent::KeyboardEnter { surface: parent_id }],
+        "focus went to the window, not to the subsurface covering it"
+    );
+
+    // And typed keys arrive there.
+    client.clear_input_events();
+    host.input(InputEvent::Key {
+        code: KEY_A,
+        pressed: true,
+        time_ms: 10,
+    });
+    client.pump_until_input_events(1);
+    assert!(
+        client
+            .input_events()
+            .iter()
+            .any(|e| matches!(e, SeatEvent::Key { key, .. } if *key == KEY_A)),
+        "the key reached the focused window: {:?}",
+        client.input_events()
+    );
+}
+
+/// A subsurface with no content is **click-transparent**: the T5 rule ("what
+/// cannot be seen cannot be clicked") followed down the tree. This is foot's
+/// border surface, which exists only to carry an input region we do not implement
+/// — so a click over it must reach the window beneath.
+#[test]
+fn a_pixel_less_subsurface_is_click_transparent() {
+    let (_scene, host, mut client) = fixture();
+
+    let win = client.map_toplevel(40, 40, ShmFormat::Xrgb8888, &vec![255u8; 40 * 40 * 4]);
+    let child = client.create_surface();
+    let sub = client.get_subsurface(&child, &win.surface);
+    client.set_subsurface_position(&sub, 0, 0);
+    client.commit(&child); // no buffer, ever
+    client.commit(&win.surface);
+    client.roundtrip();
+    client.pump_until_input_events(1);
+    let parent_id = client.surface_id(&win.surface);
+    client.clear_input_events();
+
+    host.input(InputEvent::PointerMotion {
+        x: 5.0,
+        y: 5.0,
+        time_ms: 10,
+    });
+    client.pump_until_input_events(1);
+    assert_eq!(
+        client.input_events()[0],
+        SeatEvent::PointerEnter {
+            surface: parent_id,
+            x: 5.0,
+            y: 5.0
+        },
+        "the pointer went through the empty subsurface to the window"
+    );
+}

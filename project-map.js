@@ -22,7 +22,7 @@ window.PROJECT_MAP = {
     tagline:
       "A Wayland compositor built as a 3D-native scene-graph engine with microkernel discipline — a small realtime core ringed by isolated, restartable, capability-scoped processes.",
     repo: "github.com/perpetualbits/parhelion",
-    updated: "2026-07-25",
+    updated: "2026-07-26",
   },
 
   // Four reserved states. Each ships with a glyph + label so meaning never
@@ -138,15 +138,17 @@ window.PROJECT_MAP = {
       deps: ["protocol-host", "seat-input"],
     },
     {
-      id: "subsurfaces", label: "Subsurfaces", layer: "protocol", status: "seam",
-      tags: ["M1", "debt"],
-      desc: "wl_subcompositor is ADVERTISED and USED by real clients, and their content is silently dropped: the scene composites only root surfaces. foot creates NINE subsurfaces and puts pixels in EIGHT — its decorations — so it currently renders undecorated under Parhelion. M2 T0 tried to make the gap refuse loudly at both candidate points (creating a subsurface; committing content to one) and both kill foot, which is the milestone's own acceptance criterion. There is no containment, only payment: M2 T7. (An earlier claim that foot never calls get_subsurface was a measurement error, corrected in the decision log.)",
+      id: "subsurfaces", label: "Subsurfaces", layer: "protocol", status: "done",
+      tags: ["M2", "T7"],
+      desc: "wl_subcompositor honoured: subsurfaces are scene nodes with a parent, a parent-relative position, and a place in their sibling order (the children list carries the parent's own slot, because place_below puts a child BENEATH its parent). Mapping is transitive — a subsurface composites only while its whole ancestor chain does — and synchronized commits land as one atomic scene message, so a window and its decorations are never seen half-updated. The snapshot flattens the tree, so the renderer is unchanged: still a flat back-to-front list. foot has its decorations back; the debt T7b mis-measured and T0 pinned is discharged.",
       files: ["crates/core/src/protocol.rs"],
       specs: [{ label: "scene_graph_v1.md §12.3", href: "docs/scene_graph_v1.md" }],
       parts: [
-        { label: "Global advertised", status: "done", desc: "Clients that probe for it start; withdrawing it breaks them." },
-        { label: "Loud refusal", status: "planned", desc: "Impossible while unimplemented — every refusal point kills foot. The conformance test pins the wrong behaviour and inverts at T7." },
-        { label: "Scene composition", status: "planned", desc: "Subsurface tree, parent-relative placement, sync/desync commit, input hit-testing (M2 T7)." },
+        { label: "Scene tree", status: "done", desc: "Parent links, parent-relative transforms, sibling order with the parent's own slot, arbitrary nesting (depth-guarded)." },
+        { label: "Sync / desync", status: "done", desc: "One effective commit → one atomic scene message; the golden pair pins both frames." },
+        { label: "Damage through the tree", status: "done", desc: "Subtree old ∪ new on moves and restacks; the equivalence oracle covers the tree steps." },
+        { label: "Input hit-testing", status: "done", desc: "Child-local coordinates; subsurfaces take pointer but never keyboard focus; pixel-less children are click-transparent." },
+        { label: "Viewporter / scale", status: "planned", desc: "Buffer scale and viewport on subsurfaces (M2+)." },
       ],
       deps: ["scene-graph"],
     },

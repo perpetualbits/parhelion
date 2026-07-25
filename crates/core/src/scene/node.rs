@@ -146,6 +146,21 @@ pub struct ToplevelRole {
     pub app_id: Option<String>,
 }
 
+/// The metadata a subsurface role carries (M2 T7).
+///
+/// A subsurface is a child of another surface: it has no independent placement,
+/// no keyboard focus, and no life of its own — it is mapped only while its parent
+/// is, and it moves when its parent moves. What it *does* have is a position
+/// relative to that parent and a place in its sibling order, and both live on the
+/// node itself ([`SceneNode::transform`] and the parent's [`SceneNode::children`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubsurfaceRole {
+    /// Whether this subsurface is in **synchronized** mode (the protocol's
+    /// default). Recorded for inspection and diagnostics; the *timing* it implies
+    /// is enforced on the protocol side, which is where the cached state lives.
+    pub sync: bool,
+}
+
 /// What a node *is* — and therefore whether it may be displayed at all (T5).
 ///
 /// # The mapping rule (the T5 migration)
@@ -170,6 +185,9 @@ pub enum NodeRole {
     None,
     /// An xdg-shell toplevel (T5). Displayed once it has a committed source.
     Toplevel(ToplevelRole),
+    /// A subsurface (M2 T7): a child of another surface, displayed once it has a
+    /// committed source **and** its whole parent chain is mapped.
+    Subsurface(SubsurfaceRole),
     /// Core-injected content that bypasses the protocol entirely: C10 fallbacks
     /// and harness fixtures. Always displayable (no client role to wait for).
     CoreOwned,
@@ -187,6 +205,14 @@ impl NodeRole {
     pub fn toplevel(&self) -> Option<&ToplevelRole> {
         match self {
             NodeRole::Toplevel(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// The subsurface metadata, if this is a subsurface role.
+    pub fn subsurface(&self) -> Option<&SubsurfaceRole> {
+        match self {
+            NodeRole::Subsurface(sub) => Some(sub),
             _ => None,
         }
     }
@@ -231,6 +257,24 @@ pub struct SceneNode {
     /// occlusion work (damage is T4); in M1 it only informs the compositor's
     /// blend (opaque = overwrite).
     pub opaque: bool,
+    /// This node's parent, if it is a subsurface (M2 T7). `None` for roots.
+    ///
+    /// A child's [`transform`](Self::transform) is **relative to this parent**;
+    /// its position in the output is the accumulated offset down the chain.
+    pub parent: Option<SurfaceId>,
+    /// This node's subsurface children **in composition order, bottom to top**,
+    /// with the node's *own* [`SurfaceId`] present as the marker for where the
+    /// parent itself sits in that order.
+    ///
+    /// The self-marker is not a trick borrowed for cleverness — it is the only
+    /// way to express what the protocol allows: `place_below` can put a child
+    /// beneath its parent, so "the parent's own slot" is a real position in a
+    /// list, not an implicit top or bottom. Smithay's tree uses the same
+    /// representation, which makes the mapping from its ordering to ours exact.
+    ///
+    /// Empty for a node with no subsurfaces (the overwhelmingly common case), so
+    /// the tree costs nothing until someone builds one.
+    pub children: Vec<SurfaceId>,
 }
 
 impl SceneNode {
@@ -247,6 +291,8 @@ impl SceneNode {
             z: 0,
             source: None,
             opaque: false,
+            parent: None,
+            children: Vec::new(),
         }
     }
 
@@ -257,6 +303,12 @@ impl SceneNode {
     /// For a toplevel, role + source *is* the definition of "mapped": the role
     /// arrives with `xdg_surface.get_toplevel` and the source with the first
     /// buffer commit, and unmap clears the source again.
+    ///
+    /// **Subsurfaces need more than this** (M2 T7): they are mapped only while
+    /// their whole parent chain is, which no single node can answer. This method
+    /// reports what the node itself can offer — "I have content worth showing" —
+    /// and [`Scene::is_mapped`](crate::scene::Scene::is_mapped) walks the chain.
+    /// The snapshot builder uses the latter.
     pub fn is_visible(&self) -> bool {
         self.role.displays() && self.source.is_some() && self.size.0 > 0 && self.size.1 > 0
     }

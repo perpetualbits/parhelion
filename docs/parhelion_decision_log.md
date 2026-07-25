@@ -598,13 +598,54 @@ below, reasoning now living in the dialect spec and VISION.md.)
   the interactive smoke will show an undecorated terminal; that is this debt, not
   a new bug.
 
+## 2026-07-26 — Subsurfaces v1: the debt discharged (M2 T7)
+
+### The scene owns a tree; the renderer stays a flat list
+
+- **Source:** M2 T7 (prompt 13, pulled to the front of M2);
+  `docs/scene_graph_v1.md` §12.3.
+- **Affects:** `crates/core/src/scene/node.rs` (`parent`, `children`,
+  `NodeRole::Subsurface`), `scene/state.rs` (tree ops, `is_mapped`,
+  `apply_commit`, flattening), `crates/core/src/protocol.rs` (effective-commit
+  walk, input routing through the tree), the T0 conformance test (**inverted**).
+- **Decision:** Subsurfaces are scene nodes with a parent and an ordered child
+  list that includes the parent's own slot; a child's transform is
+  parent-relative; the snapshot flattens the tree to composition order. Mapping is
+  transitive (a subsurface is mapped iff its whole ancestor chain is). One
+  effective commit produces **one** scene message, so a synchronized batch is
+  atomic by construction. **No renderer change** — it still consumes a flat
+  back-to-front list.
+- **Reasoning:** The scene is canonical state (I-5), so tree semantics belong
+  there rather than in a pre-flattened message from the protocol side: damage,
+  hit-testing, and the mapping law are all tree questions, and answering them in
+  one place is what keeps input and pixels agreeing about who is on top. Keeping
+  the renderer flat means the whole feature cost the compositor nothing
+  structurally — the seam held.
+- **Measured consequence worth recording:** a subsurface's position is re-stated
+  on every effective parent commit, so damaging unconditionally on `set_position`
+  repainted 76% of the output per keystroke in the acceptance run. The no-op check
+  is not an optimisation; it is the difference between damage tracking working and
+  not.
+
+### Closing coda on the advertise-before-support chain
+
+- **The arc:** T7b measured `foot` as binding `wl_subcompositor` without using it,
+  and proposed withdrawing the global. T0 found that measurement was wrong (nine
+  subsurfaces, eight with buffers), that **no** refusal point could keep an honest
+  client alive, and pinned the silent wrongness in a test rather than papering
+  over it. T7 implements the feature, and that test **inverts**: the same
+  assertion, opposite direction.
+- **What the chain is worth keeping for:** the principle survives its own failed
+  application. "Advertise-before-support requires loud refusal at point of use"
+  still governs any future global — it simply had no instance it could be applied
+  to, because its one candidate was a global clients both require *and* use. The
+  real answer to an unimplementable refusal was never a cleverer refusal; it was
+  implementing the thing.
+- **Effect:** foot renders **with its decorations**, and the acceptance test
+  asserts they composite. The Pending item for subsurfaces is struck.
+
 ## Pending
 
-- **Subsurfaces (re-raised 2026-07-25, M2 T0).** `wl_subcompositor` is advertised
-  and used by real clients, and their content is silently dropped — foot loses its
-  decorations. No loud-refusal point exists that keeps foot alive (see the
-  correction above), so the debt cannot be contained; it can only be paid.
-  Scheduled: **M2 T7**. If it should move earlier, that is Roland's call.
 - Lock-screen fail-locked design (`CORE-BOUNDARY.md` §6 note).
 - Adoption of ENO's project-index + sessions/ + diary structure:
   agreed in principle; instantiate at repo creation.

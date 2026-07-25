@@ -716,3 +716,60 @@ guards. This closes M0.
   spike asked for an interface where growing to N shards is an implementation
   change; this restructure moved toward it without being asked to. `make test`:
   110 tests green. `#core`
+
+## M2 T7 — the tree, and the debt that took three sessions to pay
+
+- **Three sessions to fix one wrong grep.** T7b measured foot as binding
+  `wl_subcompositor` without using it, and built a whole design on that number.
+  T0 discovered the number was wrong and could only pin the wrongness in a test.
+  T7 implements the feature and inverts that test. The arc is worth remembering
+  precisely because the intermediate step — "I cannot fix this, here is the
+  measurement, here is the test that will notice when someone can" — is the one
+  that felt like failure and turned out to be the load-bearing one. `#milestone`
+  `#scene`
+
+- **The children list contains the parent.** That looked like a trick I was
+  copying from Smithay until I tried to express `place_below` without it. A child
+  can sit *beneath* its parent, so "where the parent is" has to be a position in
+  the same list as the children — not an implicit top, not two lists. Smithay
+  represents it exactly this way, which made mapping its ordering into ours a
+  transcription rather than an interpretation. Borrowing a representation because
+  the domain forces it is different from borrowing one because it was there.
+  `#scene` `#design-decision`
+
+- **Parent-relative transforms buy the whole moving story.** A child's transform
+  is relative to its parent, so moving a window carries its decorations without a
+  single child's state changing. Absolute position is computed where it is
+  needed — a walk of a chain three deep. I nearly stored absolutes and updated
+  them on every parent move; the relative form is smaller, and it makes "the
+  parent moved" a one-node change instead of a subtree rewrite. `#scene`
+
+- **76% of the output, from one missing equality check.** Subsurface positions are
+  double-buffered and therefore *re-stated on every effective parent commit*. My
+  first version damaged old ∪ new unconditionally, which meant every keystroke in
+  foot repainted every decoration — 365 354 pixels instead of 2 964. Output
+  correct, cost ruinous, and completely invisible without the counters. The
+  acceptance test's damage assertion caught it within a minute of subsurfaces
+  first working. That number is the whole argument for asserting on counters
+  rather than only on pixels. `#core` `#discovery`
+
+- **A HashMap made focus non-deterministic and a clipboard test found it.** Input
+  routing now walks trees, and I assigned each surface's stacking index while
+  iterating `toplevels` — a HashMap. So which window counted as "topmost" (and
+  therefore held keyboard focus) depended on hash order, and one clipboard test
+  that maps two windows started failing about half the time. The scene has always
+  broken z-ties by `SurfaceId`; the routing table has to do the same, or input and
+  pixels quietly disagree about which window you are typing into. `#bug`
+
+- **Two of my own tests were wrong in instructive ways.** One injected pointer
+  motion after `commit()` without a round-trip — `commit` only queues, so the
+  motion overtook the tree it was meant to be routed against. The other held a
+  mouse button down and expected the pointer to cross to another surface; the
+  implicit grab is *correct* and my expectation wasn't. Both failures were the
+  compositor behaving properly and the test asking the wrong question. `#harness`
+
+- **The renderer did not change.** Not one line. The scene flattens the tree to
+  the same back-to-front list it always produced, and the compositor never learns
+  that trees exist. That seam was drawn in T1 for a feature nobody had specified
+  yet, and it held. `make test`: 124 tests green. foot has decorations.
+  `#scene` `#milestone`

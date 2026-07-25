@@ -234,6 +234,51 @@ fn a_real_terminal_runs_and_typing_redraws_a_region_not_a_frame() {
         "the terminal committed real shm pixels"
     );
 
+    // ---- 1b. Its decorations composite (M2 T7) ---------------------------
+    // foot draws its title bar, borders and corners into subsurfaces. Until
+    // subsurfaces landed we dropped them on the floor and rendered an undecorated
+    // terminal — silently, which is what made it a debt rather than a bug report.
+    // The scene tree is the evidence they are back.
+    //
+    // Waited for, not sampled: foot maps its root toplevel first and its
+    // decorations a beat later, so checking the instant the window appears is a
+    // race — one this test lost once under load before the loop was added.
+    let count_subsurfaces = |h: &SceneHandle| {
+        h.query(|s| {
+            (0..32)
+                .map(parhelion_core::scene::SurfaceId)
+                .filter(|id| s.get(*id).is_some_and(|n| n.role.subsurface().is_some()))
+                .filter(|id| s.is_mapped(*id))
+                .count()
+        })
+    };
+    let deadline = Instant::now() + BUDGET;
+    let mut subsurfaces = count_subsurfaces(&h);
+    while subsurfaces == 0 {
+        clock += TICK_MS;
+        tick(&h, &mut comp, &presenter, clock);
+        subsurfaces = count_subsurfaces(&h);
+        if Instant::now() > deadline {
+            kill_child(&mut foot);
+            panic!(
+                "foot's decorations never composited: no mapped subsurface in the \
+                 scene. Subsurface support is M2 T7; if this fails, it regressed."
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // And they are really on screen: the decoration pixels sit outside the
+    // terminal's own content area, so the frame must differ from a frame drawn
+    // from the root surface alone. Counters and pixels, not goldens — fonts and
+    // themes are the client's business, not ours.
+    let with_decorations = h.snapshot();
+    assert!(
+        with_decorations.len() > 1,
+        "the snapshot carries the window *and* its decorations ({} nodes)",
+        with_decorations.len()
+    );
+
     // ---- 2. Settle ------------------------------------------------------
     // Wait for the terminal to go quiet — shell started, prompt drawn, nothing
     // moving. Two reasons this matters: the "before" frame must be a still one

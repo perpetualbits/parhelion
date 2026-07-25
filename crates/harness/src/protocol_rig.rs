@@ -780,6 +780,9 @@ pub struct ScriptedClient {
     /// The clipboard contents this client has published, answered when the
     /// compositor forwards a `send` request from whoever is pasting.
     pending_clipboard: Option<(WlDataSource, Vec<u8>)>,
+    /// Pools kept alive for buffers handed out by [`draw`](Self::draw): the
+    /// compositor mmaps them, so they must outlive the buffers that name them.
+    pools: Vec<ShmPool>,
     /// The bound `wl_data_device_manager` and this client's device on the seat
     /// (T7b) — how the clipboard reaches a client.
     data_device_manager: WlDataDeviceManager,
@@ -855,6 +858,7 @@ impl ScriptedClient {
             data_device_manager,
             data_device,
             pending_clipboard: None,
+            pools: Vec::new(),
             seat,
             keyboard,
             pointer,
@@ -1028,6 +1032,49 @@ impl ScriptedClient {
             .bind(&qh, 1..=1, ())
             .expect("wl_subcompositor global advertised");
         subcompositor.get_subsurface(surface, parent, &qh, ())
+    }
+
+    /// Position a subsurface relative to its parent (`wl_subsurface.set_position`).
+    /// Double-buffered: takes effect on the **parent's** next commit, in both sync
+    /// and desync mode.
+    pub fn set_subsurface_position(&self, subsurface: &WlSubsurface, x: i32, y: i32) {
+        subsurface.set_position(x, y);
+    }
+
+    /// Put a subsurface above a sibling (or above its parent, if `sibling` is the
+    /// parent surface) — `wl_subsurface.place_above`.
+    pub fn place_above(&self, subsurface: &WlSubsurface, sibling: &WlSurface) {
+        subsurface.place_above(sibling);
+    }
+
+    /// Put a subsurface below a sibling or its parent — `wl_subsurface.place_below`.
+    pub fn place_below(&self, subsurface: &WlSubsurface, sibling: &WlSurface) {
+        subsurface.place_below(sibling);
+    }
+
+    /// Switch a subsurface to desynchronized mode: its commits take effect
+    /// immediately rather than waiting for the parent.
+    pub fn set_desync(&self, subsurface: &WlSubsurface) {
+        subsurface.set_desync();
+    }
+
+    /// Switch a subsurface (back) to synchronized mode — the protocol default.
+    pub fn set_sync(&self, subsurface: &WlSubsurface) {
+        subsurface.set_sync();
+    }
+
+    /// Attach `pixels` to `surface` and commit it, in one step — the shape most
+    /// subsurface tests want for "give this child some content".
+    pub fn draw(&mut self, surface: &WlSurface, width: i32, height: i32, pixels: &[u8]) -> WlBuffer {
+        let mut pool = self.create_pool((width * height * 4) as usize);
+        pool.write(pixels);
+        let buffer = self.create_buffer(&pool, width, height, ShmFormat::Xrgb8888);
+        self.attach(surface, &buffer);
+        self.commit(surface);
+        // The pool must outlive the buffer; the client keeps both alive by holding
+        // them in this list rather than making every caller thread them through.
+        self.pools.push(pool);
+        buffer
     }
 
     /// Create an `xdg_positioner` (`xdg_wm_base.create_positioner`). Needed only

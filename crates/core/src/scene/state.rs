@@ -13,24 +13,29 @@
 
 use std::collections::HashMap;
 
-use crate::scene::node::{ClientKey, NodeRole, SceneNode, SurfaceId, TextureSource, Transform};
+use crate::scene::node::{
+    ClientKey, NodeRole, SceneNode, SubsurfaceRole, SurfaceId, TextureSource, Transform,
+};
 use crate::scene::region::{Rect, Region};
 use crate::scene::snapshot::{Snapshot, SnapshotDamage, SnapshotNode};
 
-/// The output-space rectangle a node covers, or an empty rect if it is not
-/// visible (no source or zero area — it contributes no pixels, hence no damage).
-/// Placement is `Transform` (identity/translate only in M1); the rect's origin is
-/// the node's output offset, which is also the surface→output translation used to
-/// map client damage.
-fn node_output_rect(node: &SceneNode) -> Rect {
-    if !node.is_visible() {
-        return Rect::new(0, 0, 0, 0);
-    }
-    let (ox, oy) = match node.transform {
+/// How deep a subsurface tree may nest before the scene stops walking.
+///
+/// Not a protocol limit — the protocol has none, and Smithay's tree happily
+/// nests. It is a **cycle and runaway guard** on canonical state that the scene
+/// thread walks on every snapshot, every damage calculation, and every hit test:
+/// a corrupted parent link must not turn into an unbounded recursion on the one
+/// thread that owns the compositor's truth. Sixteen is far past any real toolkit
+/// (GTK's deepest decoration nesting is three) and far short of a stack problem.
+pub const MAX_SUBSURFACE_DEPTH: usize = 16;
+
+/// A node's own offset, before its parent chain is taken into account.
+/// Identity/translate only in M1 (`Transform`).
+fn own_offset(node: &SceneNode) -> (i32, i32) {
+    match node.transform {
         Transform::Identity => (0, 0),
         Transform::Translate { dx, dy } => (dx, dy),
-    };
-    Rect::new(ox, oy, node.size.0 as i32, node.size.1 as i32)
+    }
 }
 
 /// The damage a content commit carries, in **surface** coordinates (which equal
@@ -81,6 +86,59 @@ pub enum ProtocolEvent {
     },
 }
 
+/// One surface's share of an **effective commit** (M2 T7).
+///
+/// A commit that becomes effective on a surface with synchronized children makes
+/// *all* of their states current at the same instant — that atomicity is
+/// user-visible (a window and its decorations must never be seen half-updated).
+/// So the protocol side collects the whole subtree's changes into a list of these
+/// and sends them as **one** scene message, applied in order by
+/// [`Scene::apply_commit`]. One message, one frame's worth of truth.
+#[derive(Debug, Clone)]
+pub enum SurfaceUpdate {
+    /// Place a root's node (output-space) — the C10 cascade at map time.
+    Geometry {
+        /// The surface being placed.
+        surface: SurfaceId,
+        /// Output-space offset.
+        offset: (i32, i32),
+        /// Size in pixels.
+        size: (u32, u32),
+    },
+    /// Position a subsurface relative to its parent.
+    Position {
+        /// The subsurface.
+        surface: SurfaceId,
+        /// Parent-relative offset.
+        offset: (i32, i32),
+    },
+    /// A parent's child stacking order, including the parent's own marker.
+    Order {
+        /// The parent whose order this is.
+        parent: SurfaceId,
+        /// Children bottom-to-top, with `parent` itself at its slot.
+        order: Vec<SurfaceId>,
+    },
+    /// New content for a surface.
+    Content {
+        /// The surface.
+        surface: SurfaceId,
+        /// Its new size.
+        size: (u32, u32),
+        /// Its new pixels.
+        source: TextureSource,
+        /// Whether they are fully opaque.
+        opaque: bool,
+        /// What changed, in surface coordinates.
+        damage: ContentDamage,
+    },
+    /// A surface lost its content (null attach).
+    Unmap {
+        /// The surface.
+        surface: SurfaceId,
+    },
+}
+
 /// The canonical scene: every live surface's [`SceneNode`], keyed by [`SurfaceId`].
 ///
 /// Rebuilt purely from [`ProtocolEvent`]s (lifecycle) and the setters below
@@ -119,6 +177,232 @@ impl Scene {
         Scene::default()
     }
 
+    // ---- The subsurface tree (M2 T7) ---------------------------------------
+
+    /// A node's offset in **output** coordinates: its own offset plus every
+    /// ancestor's, walked to the root.
+    ///
+    /// A subsurface's `transform` is parent-relative, which is what makes a parent
+    /// move carry its whole subtree for free — the children's stored offsets never
+    /// change. The walk is bounded by nesting depth, which is a handful even for
+    /// toolkits that nest enthusiastically.
+    pub fn absolute_offset(&self, surface: SurfaceId) -> (i32, i32) {
+        let mut offset = (0, 0);
+        let mut current = Some(surface);
+        // `seen` guards against a cycle. The protocol cannot create one (a
+        // surface may not be its own ancestor), but this walk runs on canonical
+        // state that a future bug could corrupt, and an infinite loop in the
+        // scene thread would take the compositor with it.
+        let mut seen = 0usize;
+        while let Some(id) = current {
+            let Some(node) = self.nodes.get(&id) else { break };
+            let (dx, dy) = own_offset(node);
+            offset = (offset.0 + dx, offset.1 + dy);
+            current = node.parent;
+            seen += 1;
+            if seen > MAX_SUBSURFACE_DEPTH {
+                break;
+            }
+        }
+        offset
+    }
+
+    /// The output-space rectangle a node covers, or an empty rect if it is not
+    /// mapped (contributes no pixels, hence no damage).
+    pub fn node_rect(&self, surface: SurfaceId) -> Rect {
+        if !self.is_mapped(surface) {
+            return Rect::new(0, 0, 0, 0);
+        }
+        let Some(node) = self.nodes.get(&surface) else {
+            return Rect::new(0, 0, 0, 0);
+        };
+        let (ox, oy) = self.absolute_offset(surface);
+        Rect::new(ox, oy, node.size.0 as i32, node.size.1 as i32)
+    }
+
+    /// **The mapping law, extended through the tree (M2 T7).**
+    ///
+    /// A node contributes pixels when it has content of its own
+    /// ([`SceneNode::is_visible`]) *and* every ancestor does too. A subsurface of
+    /// an unmapped window is not "a window that happens to be hidden" — per
+    /// protocol it is simply not mapped, and the T5 rule follows it down the tree:
+    /// what cannot be seen cannot be clicked.
+    pub fn is_mapped(&self, surface: SurfaceId) -> bool {
+        let mut current = Some(surface);
+        let mut depth = 0usize;
+        while let Some(id) = current {
+            let Some(node) = self.nodes.get(&id) else {
+                return false;
+            };
+            if !node.is_visible() {
+                return false;
+            }
+            current = node.parent;
+            depth += 1;
+            if depth > MAX_SUBSURFACE_DEPTH {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Make `child` a subsurface of `parent`, placed **above** the parent (the
+    /// protocol's default for a new subsurface). Idempotent: re-parenting to the
+    /// same parent leaves the existing order alone.
+    pub fn attach_subsurface(&mut self, child: SurfaceId, parent: SurfaceId) {
+        if !self.nodes.contains_key(&child) || !self.nodes.contains_key(&parent) {
+            return;
+        }
+        self.damage_subtree(child);
+        if let Some(node) = self.nodes.get_mut(&child) {
+            node.parent = Some(parent);
+            node.role = NodeRole::Subsurface(SubsurfaceRole::default());
+        }
+        if let Some(p) = self.nodes.get_mut(&parent) {
+            // The parent's own marker goes in first if the list is empty, so that
+            // "above the parent" has something to be above.
+            if p.children.is_empty() {
+                p.children.push(parent);
+            }
+            if !p.children.contains(&child) {
+                p.children.push(child);
+            }
+        }
+        self.damage_subtree(child);
+    }
+
+    /// Replace a parent's child ordering wholesale — the ordered list **including
+    /// the parent's own id** as the marker for its place in the stack.
+    ///
+    /// Taking the whole order rather than diffing `place_above`/`place_below` is
+    /// deliberate: the protocol side already holds the authoritative order (it is
+    /// Smithay's tree), and re-deriving it here would be a second implementation
+    /// of the same list with its own opportunities to disagree. A restack damages
+    /// the subtree, since what is visible within those pixels has changed.
+    pub fn set_child_order(&mut self, parent: SurfaceId, order: Vec<SurfaceId>) {
+        if !self.nodes.contains_key(&parent) {
+            return;
+        }
+        let changed = self
+            .nodes
+            .get(&parent)
+            .map(|p| p.children != order)
+            .unwrap_or(false);
+        if !changed {
+            return;
+        }
+        self.damage_subtree(parent);
+        if let Some(p) = self.nodes.get_mut(&parent) {
+            p.children = order;
+        }
+        self.damage_subtree(parent);
+    }
+
+    /// Set a subsurface's position **relative to its parent**. Damages the
+    /// subtree's old and new extents (a move takes its own children with it).
+    pub fn set_subsurface_position(&mut self, surface: SurfaceId, x: i32, y: i32) {
+        // A position that has not changed damages nothing. This matters more than
+        // it looks: a subsurface's position is re-stated on **every** effective
+        // commit of its parent (that is how the protocol defers it), so damaging
+        // unconditionally would repaint every decoration on every keystroke — 76%
+        // of the output in the acceptance run, measured, before this check.
+        if self
+            .nodes
+            .get(&surface)
+            .map(|n| own_offset(n) == (x, y))
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let before: Vec<Rect> = self.subtree_rects(surface);
+        if let Some(node) = self.nodes.get_mut(&surface) {
+            node.transform = Transform::Translate { dx: x, dy: y };
+        }
+        let after: Vec<Rect> = self.subtree_rects(surface);
+        for r in before.into_iter().chain(after) {
+            self.damage_rect(r);
+        }
+    }
+
+    /// Detach a subsurface from its parent — the role object was destroyed while
+    /// the `wl_surface` lives on. It becomes a roleless orphan: never displayed.
+    pub fn detach_subsurface(&mut self, surface: SurfaceId) {
+        self.damage_subtree(surface);
+        let parent = self.nodes.get(&surface).and_then(|n| n.parent);
+        if let Some(parent) = parent
+            && let Some(p) = self.nodes.get_mut(&parent)
+        {
+            p.children.retain(|id| *id != surface);
+        }
+        if let Some(node) = self.nodes.get_mut(&surface) {
+            node.parent = None;
+            node.role = NodeRole::None;
+        }
+    }
+
+    /// Every rect a subtree currently occupies, root first.
+    fn subtree_rects(&self, surface: SurfaceId) -> Vec<Rect> {
+        let mut rects = Vec::new();
+        self.for_each_in_subtree(surface, &mut |scene, id| {
+            rects.push(scene.node_rect(id));
+        });
+        rects
+    }
+
+    /// Damage everything a subtree currently covers.
+    fn damage_subtree(&mut self, surface: SurfaceId) {
+        for r in self.subtree_rects(surface) {
+            self.damage_rect(r);
+        }
+    }
+
+    /// Walk a subtree (the node and every descendant), depth-first.
+    fn for_each_in_subtree(&self, surface: SurfaceId, f: &mut impl FnMut(&Scene, SurfaceId)) {
+        self.walk_subtree(surface, 0, f);
+    }
+
+    /// Depth-bounded recursion behind [`for_each_in_subtree`].
+    fn walk_subtree(&self, surface: SurfaceId, depth: usize, f: &mut impl FnMut(&Scene, SurfaceId)) {
+        if depth > MAX_SUBSURFACE_DEPTH {
+            return;
+        }
+        f(self, surface);
+        let Some(node) = self.nodes.get(&surface) else {
+            return;
+        };
+        for child in node.children.clone() {
+            if child != surface {
+                self.walk_subtree(child, depth + 1, f);
+            }
+        }
+    }
+
+    /// Flatten a subtree into composition order, bottom to top, accumulating
+    /// offsets — the operation the snapshot is built from.
+    ///
+    /// The order comes from each node's `children` list, whose self-marker says
+    /// where the parent sits among its children. A node with no children is just
+    /// itself, which is every surface in the tree until a client builds one.
+    fn flatten_subtree(&self, surface: SurfaceId, out: &mut Vec<SurfaceId>, depth: usize) {
+        if depth > MAX_SUBSURFACE_DEPTH {
+            return;
+        }
+        let Some(node) = self.nodes.get(&surface) else {
+            return;
+        };
+        if node.children.is_empty() {
+            out.push(surface);
+            return;
+        }
+        for child in &node.children {
+            if *child == surface {
+                out.push(surface);
+            } else {
+                self.flatten_subtree(*child, out, depth + 1);
+            }
+        }
+    }
+
     // ---- Damage bookkeeping -------------------------------------------------
 
     /// Add an output-space rect to the pending frame damage (empty rects ignored).
@@ -126,19 +410,16 @@ impl Scene {
         self.pending_damage.add(rect);
     }
 
-    /// Damage a node's current visible extent (no-op if absent/invisible).
+    /// Damage a node's current visible extent **and its subtree's** (no-op if
+    /// absent or unmapped). A parent's pixels and its children's are one region
+    /// as far as the output is concerned.
     fn damage_node(&mut self, surface: SurfaceId) {
-        if let Some(node) = self.nodes.get(&surface) {
-            self.pending_damage.add(node_output_rect(node));
-        }
+        self.damage_subtree(surface);
     }
 
-    /// This node's visible output rect right now (empty if absent/invisible).
+    /// This node's visible output rect right now (empty if absent/unmapped).
     fn extent_of(&self, surface: SurfaceId) -> Rect {
-        self.nodes
-            .get(&surface)
-            .map(node_output_rect)
-            .unwrap_or(Rect::new(0, 0, 0, 0))
+        self.node_rect(surface)
     }
 
     /// Force the next snapshot to full-output damage — the conservative fallback
@@ -167,16 +448,21 @@ impl Scene {
             }
             ProtocolEvent::ClientGone { client } => {
                 // Damage every removed node's extent before dropping them.
-                let gone: Vec<Rect> = self
+                let gone: Vec<SurfaceId> = self
                     .nodes
-                    .values()
-                    .filter(|n| n.client == client)
-                    .map(node_output_rect)
+                    .iter()
+                    .filter(|(_, n)| n.client == client)
+                    .map(|(id, _)| *id)
                     .collect();
-                for r in gone {
+                for id in &gone {
+                    let r = self.node_rect(*id);
                     self.damage_rect(r);
                 }
                 self.nodes.retain(|_, node| node.client != client);
+                // Drop dangling child references to the departed surfaces.
+                for node in self.nodes.values_mut() {
+                    node.children.retain(|id| !gone.contains(id));
+                }
             }
         }
     }
@@ -244,7 +530,7 @@ impl Scene {
         node.size = size;
         node.source = Some(source);
         node.opaque = opaque;
-        let new = node_output_rect(node);
+        let new = self.extent_of(surface);
 
         if old != new {
             // Map / move / resize: the extent itself changed — repaint both.
@@ -261,6 +547,43 @@ impl Scene {
                         self.damage_rect(out);
                     }
                 }
+            }
+        }
+    }
+
+    /// Apply one effective commit's worth of updates **atomically** (M2 T7).
+    ///
+    /// Atomic in the sense that matters: this runs as a single message on the
+    /// scene thread, so no snapshot can be taken between a parent's new content
+    /// and its children's. A client that moves a window and repositions its
+    /// decorations in one commit is never rendered half-moved.
+    pub fn apply_commit(&mut self, updates: Vec<SurfaceUpdate>) {
+        for update in updates {
+            match update {
+                SurfaceUpdate::Geometry {
+                    surface,
+                    offset,
+                    size,
+                } => self.set_geometry(
+                    surface,
+                    Transform::Translate {
+                        dx: offset.0,
+                        dy: offset.1,
+                    },
+                    size,
+                ),
+                SurfaceUpdate::Position { surface, offset } => {
+                    self.set_subsurface_position(surface, offset.0, offset.1)
+                }
+                SurfaceUpdate::Order { parent, order } => self.set_child_order(parent, order),
+                SurfaceUpdate::Content {
+                    surface,
+                    size,
+                    source,
+                    opaque,
+                    damage,
+                } => self.attach_content(surface, size, source, opaque, damage),
+                SurfaceUpdate::Unmap { surface } => self.clear_source(surface),
             }
         }
     }
@@ -352,26 +675,48 @@ impl Scene {
     /// out it must be reset. (The first snapshot, and any `damage_full`, report
     /// [`SnapshotDamage::Full`].)
     pub fn snapshot(&mut self) -> Snapshot {
-        // Collect (SurfaceId, node) for the visible nodes so ties can break by id.
-        let mut visible: Vec<(SurfaceId, &SceneNode)> = self
+        // Roots only: a subsurface is composited as part of its parent's tree, in
+        // the order that tree dictates, not as an independent node in the z list.
+        let mut roots: Vec<(SurfaceId, i32)> = self
             .nodes
             .iter()
-            .filter(|(_, n)| n.is_visible())
-            .map(|(id, n)| (*id, n))
+            .filter(|(_, n)| n.parent.is_none())
+            .map(|(id, n)| (*id, n.z))
             .collect();
         // Back-to-front: ascending z, then ascending SurfaceId as the tiebreak.
-        visible.sort_by(|(ida, a), (idb, b)| a.z.cmp(&b.z).then(ida.cmp(idb)));
+        roots.sort_by(|(ida, za), (idb, zb)| za.cmp(zb).then(ida.cmp(idb)));
 
-        let nodes = visible
-            .into_iter()
-            .map(|(_, n)| SnapshotNode {
-                transform: n.transform,
-                size: n.size,
-                // is_visible guarantees Some; clone is cheap (Arc bump for shm).
-                source: n.source.clone().expect("visible node has a source"),
-                opaque: n.opaque,
-            })
-            .collect();
+        // Flatten each root's tree into composition order and keep the nodes that
+        // are actually mapped. Order within a tree comes from the children lists;
+        // order between trees comes from z — so a subsurface never escapes its
+        // parent's place in the stack, which is what the protocol promises.
+        let mut nodes = Vec::new();
+        for (root, _) in roots {
+            let mut flat = Vec::new();
+            self.flatten_subtree(root, &mut flat, 0);
+            for id in flat {
+                if !self.is_mapped(id) {
+                    continue;
+                }
+                let Some(node) = self.nodes.get(&id) else { continue };
+                let (dx, dy) = self.absolute_offset(id);
+                nodes.push(SnapshotNode {
+                    // The snapshot carries **absolute** placement: the renderer
+                    // consumes a flat back-to-front list and knows nothing about
+                    // trees, exactly as before this task. All the tree semantics
+                    // are resolved here, on the scene thread that owns them.
+                    transform: if (dx, dy) == (0, 0) {
+                        Transform::Identity
+                    } else {
+                        Transform::Translate { dx, dy }
+                    },
+                    size: node.size,
+                    // is_mapped guarantees Some; clone is cheap (Arc bump for shm).
+                    source: node.source.clone().expect("mapped node has a source"),
+                    opaque: node.opaque,
+                });
+            }
+        }
 
         // Drain damage: full for the first frame / fallback, else the accumulated
         // region. Reset so the next snapshot reports only its own changes.
@@ -384,6 +729,29 @@ impl Scene {
         self.pending_damage = Region::new();
 
         Snapshot { nodes, damage }
+    }
+
+    /// Every mapped surface in composition order, bottom to top — the same order
+    /// the snapshot uses, exposed for the input path's hit-testing replica.
+    ///
+    /// Input and pixels must agree about who is on top; sharing one ordering
+    /// function is how that stays true rather than being asserted.
+    pub fn composition_order(&self) -> Vec<SurfaceId> {
+        let mut roots: Vec<(SurfaceId, i32)> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.parent.is_none())
+            .map(|(id, n)| (*id, n.z))
+            .collect();
+        roots.sort_by(|(ida, za), (idb, zb)| za.cmp(zb).then(ida.cmp(idb)));
+
+        let mut order = Vec::new();
+        for (root, _) in roots {
+            let mut flat = Vec::new();
+            self.flatten_subtree(root, &mut flat, 0);
+            order.extend(flat.into_iter().filter(|id| self.is_mapped(*id)));
+        }
+        order
     }
 }
 

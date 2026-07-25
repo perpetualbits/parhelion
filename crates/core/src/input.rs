@@ -121,8 +121,15 @@ pub struct Hit {
 struct FocusEntry {
     /// The surface's extent in output coordinates.
     rect: Rect,
-    /// Stacking order — higher is nearer the viewer.
+    /// Stacking order — higher is nearer the viewer. With subsurfaces (M2 T7) this
+    /// is the surface's index in composition order, so the routing table and the
+    /// snapshot agree on "topmost" by construction.
     z: i32,
+    /// Whether this surface may take **keyboard** focus. Subsurfaces may not — the
+    /// protocol gives them pointer input only, and focus belongs to the window
+    /// they are part of. They are still hit-testable, which is why this is a flag
+    /// rather than an omission.
+    focusable: bool,
 }
 
 /// The focus routing table: **a read-mostly replica**, owned by the dispatch
@@ -160,8 +167,19 @@ impl FocusMap {
     }
 
     /// Record (or update) a mapped surface's extent and stacking order.
-    pub fn map(&mut self, surface: SurfaceId, rect: Rect, z: i32) {
-        self.entries.insert(surface, FocusEntry { rect, z });
+    ///
+    /// `focusable` is false for subsurfaces: they receive pointer events but never
+    /// keyboard focus (the protocol is explicit), so they participate in
+    /// [`at`](Self::at) and not in [`topmost`](Self::topmost).
+    pub fn map(&mut self, surface: SurfaceId, rect: Rect, z: i32, focusable: bool) {
+        self.entries.insert(
+            surface,
+            FocusEntry {
+                rect,
+                z,
+                focusable,
+            },
+        );
     }
 
     /// Forget a surface — unmapped, destroyed, or its client gone. Idempotent.
@@ -188,6 +206,7 @@ impl FocusMap {
     pub fn topmost(&self) -> Option<SurfaceId> {
         self.entries
             .iter()
+            .filter(|(_, e)| e.focusable)
             .max_by_key(|(id, e)| (e.z, **id))
             .map(|(id, _)| *id)
     }
@@ -237,7 +256,7 @@ mod tests {
     #[test]
     fn hit_reports_surface_local_coordinates() {
         let mut m = FocusMap::new();
-        m.map(A, Rect::new(10, 20, 30, 40), 0);
+        m.map(A, Rect::new(10, 20, 30, 40), 0, true);
         let hit = m.at(15.0, 25.0).expect("inside the surface");
         assert_eq!(hit.surface, A);
         assert_eq!(hit.local, (5.0, 5.0), "point within the surface");
@@ -251,7 +270,7 @@ mod tests {
     #[test]
     fn far_edges_are_exclusive() {
         let mut m = FocusMap::new();
-        m.map(A, Rect::new(0, 0, 10, 10), 0);
+        m.map(A, Rect::new(0, 0, 10, 10), 0, true);
         assert!(m.at(0.0, 0.0).is_some(), "near edge is inclusive");
         assert_eq!(m.at(10.0, 5.0), None, "far x edge is exclusive");
         assert_eq!(m.at(5.0, 10.0), None, "far y edge is exclusive");
@@ -263,14 +282,35 @@ mod tests {
     #[test]
     fn overlap_resolves_to_the_topmost_and_matches_draw_order() {
         let mut m = FocusMap::new();
-        m.map(A, Rect::new(0, 0, 20, 20), 0);
-        m.map(B, Rect::new(10, 10, 20, 20), 0); // same z: higher id is on top
+        m.map(A, Rect::new(0, 0, 20, 20), 0, true);
+        m.map(B, Rect::new(10, 10, 20, 20), 0, true); // same z: higher id is on top
         assert_eq!(m.at(15.0, 15.0).map(|h| h.surface), Some(B), "tie → higher id");
         assert_eq!(m.at(5.0, 5.0).map(|h| h.surface), Some(A), "outside B");
 
-        m.map(A, Rect::new(0, 0, 20, 20), 5); // now A is explicitly above B
+        m.map(A, Rect::new(0, 0, 20, 20), 5, true); // now A is explicitly above B
         assert_eq!(m.at(15.0, 15.0).map(|h| h.surface), Some(A), "higher z wins");
         assert_eq!(m.topmost(), Some(A));
+    }
+
+    /// A subsurface is hit-testable but never keyboard-focusable: the protocol
+    /// gives focus to the window, and pointer events to whatever is under the
+    /// cursor.
+    #[test]
+    fn subsurfaces_take_pointer_input_but_not_keyboard_focus() {
+        let mut m = FocusMap::new();
+        m.map(A, Rect::new(0, 0, 20, 20), 0, true); // the window
+        m.map(B, Rect::new(0, 0, 10, 10), 1, false); // its decoration, on top
+
+        assert_eq!(
+            m.at(5.0, 5.0).map(|h| h.surface),
+            Some(B),
+            "the pointer lands on the subsurface it is over"
+        );
+        assert_eq!(
+            m.topmost(),
+            Some(A),
+            "but keyboard focus stays with the window, not its decoration"
+        );
     }
 
     /// Unmapping removes a surface from routing entirely — what cannot be seen
@@ -278,8 +318,8 @@ mod tests {
     #[test]
     fn unmapped_surfaces_are_unroutable() {
         let mut m = FocusMap::new();
-        m.map(A, Rect::new(0, 0, 20, 20), 0);
-        m.map(B, Rect::new(0, 0, 20, 20), 1);
+        m.map(A, Rect::new(0, 0, 20, 20), 0, true);
+        m.map(B, Rect::new(0, 0, 20, 20), 1, true);
         assert_eq!(m.topmost(), Some(B));
 
         m.unmap(B);

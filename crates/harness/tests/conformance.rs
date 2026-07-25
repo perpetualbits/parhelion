@@ -14,7 +14,7 @@
 use std::os::unix::net::UnixStream;
 
 use parhelion_core::protocol::{ProtocolHost, DEFAULT_OUTPUT_SIZE};
-use parhelion_core::scene::SceneThread;
+use parhelion_core::scene::{SceneThread, Transform};
 use parhelion_harness::protocol_rig::{ScriptedClient, ShmFormat};
 
 fn fixture() -> (SceneThread, ProtocolHost, ScriptedClient) {
@@ -126,50 +126,186 @@ fn the_registry_advertises_exactly_the_expected_globals() {
     );
 }
 
-/// **Subsurfaces: what a client can do, and what silently does not happen.**
+/// **The inversion (M2 T7).** This test used to pin the wrong behaviour: a
+/// subsurface's content accepted and silently dropped. It now asserts what a
+/// client is entitled to — the content **composites**.
 ///
-/// This test pins the *current, unhappy* truth rather than a wish. Parhelion
-/// advertises `wl_subcompositor` and lets clients build subsurfaces — and then
-/// does not composite them, because the scene draws only root surfaces until
-/// M2 T7.
-///
-/// M2 T0 tried to make that refusal loud at both candidate points (creating a
-/// subsurface; committing content to one) and **both kill `foot`**: it creates
-/// nine subsurfaces at startup and puts real pixels in eight of them (its
-/// client-side decorations). Loud refusal and a working terminal are mutually
-/// exclusive until subsurfaces exist. The evidence is in the T0 session summary;
-/// the decision log carries the correction that overturned T0's premise.
-///
-/// **This test inverts at M2 T7**, when the content below actually appears.
+/// The comment is kept because the history is the point. T7b measured
+/// `wl_subcompositor` as "advertised but unused" and proposed withdrawing it; T0
+/// found that measurement was wrong (foot creates nine subsurfaces and fills
+/// eight), that no refusal point could keep an honest client alive, and pinned the
+/// silent wrongness here so it could not be forgotten. This is that debt
+/// discharged: same test, opposite assertion.
 #[test]
-fn a_subsurface_is_accepted_and_its_content_is_silently_not_composited() {
+fn a_subsurface_composites_its_content() {
     let (scene, _host, mut client) = fixture();
 
-    let parent = client.create_surface();
+    // A mapped toplevel to be the parent — a subsurface of an unmapped surface is
+    // not mapped either, so the tree needs a root that is really on screen.
+    let win = client.map_toplevel(32, 32, ShmFormat::Xrgb8888, &vec![255u8; 32 * 32 * 4]);
     let child = client.create_surface();
-    let _subsurface = client.get_subsurface(&child, &parent);
-
-    let mut pool = client.create_pool(8 * 8 * 4);
-    pool.write(&[255u8; 8 * 8 * 4]);
-    let buffer = client.create_buffer(&pool, 8, 8, ShmFormat::Xrgb8888);
-    client.attach(&child, &buffer);
-    client.commit(&child);
-    client.commit(&parent); // sync subsurface: content lands with the parent
+    let sub = client.get_subsurface(&child, &win.surface);
+    client.set_subsurface_position(&sub, 4, 4);
+    client.draw(&child, 8, 8, &vec![128u8; 8 * 8 * 4]);
+    // Synchronized by default: the child's content lands with the parent's commit.
+    client.commit(&win.surface);
     client.roundtrip();
 
-    assert!(
-        client.protocol_error().is_none(),
-        "the client is not refused — it cannot be, and foot is the proof"
+    let snapshot = scene.handle().snapshot();
+    assert_eq!(
+        snapshot.len(),
+        2,
+        "the window and its subsurface both composite"
     );
-    assert!(
-        scene.handle().snapshot().is_empty(),
-        "and its content is not composited: nothing reached the scene. This is the \
-         debt M2 T7 pays; if this assertion starts failing, T7 has landed and this \
-         test should invert."
+    // Composition order is bottom-to-top: parent first, then the child above it.
+    assert_eq!(
+        snapshot.nodes[1].size,
+        (8, 8),
+        "the child is the upper node"
+    );
+    assert_eq!(
+        snapshot.nodes[1].transform,
+        Transform::Translate { dx: 4, dy: 4 },
+        "positioned relative to its parent, resolved to output coordinates"
     );
 }
 
-/// `xdg_output` reports the output's **logical** geometry, and at scale 1 that is
+/// A **synchronized** subsurface's commit does not take effect until its parent
+/// commits — the protocol's atomicity guarantee, and the reason a client can
+/// update a window and its decorations without either being seen half-updated.
+#[test]
+fn a_sync_subsurfaces_commit_waits_for_its_parent() {
+    let (scene, _host, mut client) = fixture();
+    let h = scene.handle();
+
+    let win = client.map_toplevel(32, 32, ShmFormat::Xrgb8888, &vec![255u8; 32 * 32 * 4]);
+    let child = client.create_surface();
+    let sub = client.get_subsurface(&child, &win.surface);
+    client.set_subsurface_position(&sub, 2, 2);
+    client.roundtrip();
+
+    // The child commits content. Nothing may appear yet.
+    client.draw(&child, 8, 8, &vec![64u8; 8 * 8 * 4]);
+    client.roundtrip();
+    assert_eq!(
+        h.snapshot().len(),
+        1,
+        "the child's commit is cached: only the window composites so far"
+    );
+
+    // The parent commits: now the child's state becomes current, atomically.
+    client.commit(&win.surface);
+    client.roundtrip();
+    assert_eq!(
+        h.snapshot().len(),
+        2,
+        "the parent's commit is what makes the child's content current"
+    );
+}
+
+/// A **desynchronized** subsurface applies its own commits immediately — the
+/// other half of the mode, and what a client uses for content that must not wait
+/// on its parent (video, say).
+#[test]
+fn a_desync_subsurface_applies_its_own_commit() {
+    let (scene, _host, mut client) = fixture();
+    let h = scene.handle();
+
+    let win = client.map_toplevel(32, 32, ShmFormat::Xrgb8888, &vec![255u8; 32 * 32 * 4]);
+    let child = client.create_surface();
+    let sub = client.get_subsurface(&child, &win.surface);
+    client.set_desync(&sub);
+    // set_desync is itself double-buffered on the parent, so the parent commits
+    // once to make the mode current.
+    client.commit(&win.surface);
+    client.roundtrip();
+
+    client.draw(&child, 8, 8, &vec![64u8; 8 * 8 * 4]);
+    client.roundtrip();
+    assert_eq!(
+        h.snapshot().len(),
+        2,
+        "a desync child does not wait for its parent"
+    );
+}
+
+/// `place_below` puts a child **beneath** its parent — which is why the scene
+/// stores the parent's own slot in its child order rather than assuming children
+/// are always on top.
+#[test]
+fn place_below_puts_a_child_under_its_parent() {
+    let (scene, _host, mut client) = fixture();
+
+    let win = client.map_toplevel(32, 32, ShmFormat::Xrgb8888, &vec![255u8; 32 * 32 * 4]);
+    let child = client.create_surface();
+    let sub = client.get_subsurface(&child, &win.surface);
+    client.draw(&child, 8, 8, &vec![64u8; 8 * 8 * 4]);
+    client.commit(&win.surface);
+    client.roundtrip();
+
+    let above = scene.handle().snapshot();
+    assert_eq!(above.nodes[1].size, (8, 8), "by default the child is above");
+
+    client.place_below(&sub, &win.surface);
+    client.commit(&win.surface);
+    client.roundtrip();
+
+    let below = scene.handle().snapshot();
+    assert_eq!(
+        below.nodes[0].size,
+        (8, 8),
+        "after place_below the child composites first — beneath the window"
+    );
+    assert_eq!(below.nodes[1].size, (32, 32), "and the window is on top");
+}
+
+/// The mapping law through the tree: a subsurface of an **unmapped** parent is
+/// not mapped either, and mapping the parent brings the whole tree with it.
+#[test]
+fn a_subsurface_is_mapped_only_while_its_parent_chain_is() {
+    let (scene, _host, mut client) = fixture();
+    let h = scene.handle();
+
+    // A parent that is a plain (roleless, unmapped) surface.
+    let parent = client.create_surface();
+    let child = client.create_surface();
+    let sub = client.get_subsurface(&child, &parent);
+    client.set_subsurface_position(&sub, 1, 1);
+    client.draw(&child, 8, 8, &vec![64u8; 8 * 8 * 4]);
+    client.commit(&parent);
+    client.roundtrip();
+
+    assert!(
+        h.snapshot().is_empty(),
+        "a child of an unmapped surface composites nothing, however much content \
+         it has"
+    );
+}
+
+/// The pixel-less subsurface — foot's case, the one nature provided. Role
+/// assigned, position set, no buffer ever attached: it never composites and never
+/// takes input, and it must not disturb anything that does.
+#[test]
+fn a_subsurface_without_content_never_composites() {
+    let (scene, _host, mut client) = fixture();
+
+    let win = client.map_toplevel(32, 32, ShmFormat::Xrgb8888, &vec![255u8; 32 * 32 * 4]);
+    let child = client.create_surface();
+    let sub = client.get_subsurface(&child, &win.surface);
+    client.set_subsurface_position(&sub, 4, 4);
+    client.commit(&child); // committed, but with no buffer — foot's border surface
+    client.commit(&win.surface);
+    client.roundtrip();
+
+    let snapshot = scene.handle().snapshot();
+    assert_eq!(
+        snapshot.len(),
+        1,
+        "only the window composites; the empty subsurface contributes nothing"
+    );
+}
+
+/// `xdg_output` reports the output's **logical** geometry,/// `xdg_output` reports the output's **logical** geometry, and at scale 1 that is
 /// its mode. Advertised alongside `wl_output`, so it is tested alongside it
 /// rather than left as untested surface area.
 #[test]

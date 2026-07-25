@@ -251,6 +251,64 @@ below, reasoning now living in the dialect spec and VISION.md.)
 - **Decision:** The scene accumulates output-space damage as it mutates and drains it at snapshot. A content commit damages only the client's rects when the extent is unchanged, but old ∪ new extent on a structural change (map/move/resize). The compositor retains its frame and recomputes only within damage. At commit, only the damaged buffer region is copied into the surface's pixel block, via `Arc::make_mut` (copy-on-write) so an in-flight snapshot's shared pixels are never mutated; full copy is the fallback (no prior block / dims changed / covers-all). `Snapshot::snapshot` becomes `&mut self` to drain damage. `TextureSource` etc. lost `Copy` in T3, so snapshots already share pixels by `Arc`.
 - **Reasoning:** Damage changes cost, never output. The split is what makes a small commit cheap while keeping structural changes correct. CoW extends snapshot isolation to the pixel level without ever copying more than needed. Counters (`pixels_redrawn`, `damage_rects`, `full_damage_frames`, `bytes_copied`) make the savings measurable and are asserted — an unasserted counter drifts into a lie.
 
+## 2026-07-25 — xdg-shell minimal, and the mapping-semantics migration (M1 T5)
+
+### Only mapped toplevels (and core-injected content) are displayed; a roleless surface never composites
+
+- **Source:** M1 T5 (prompt 08); `docs/scene_graph_v1.md` §10.
+- **Affects:** `crates/core/src/scene/node.rs` (`NodeRole`, `ToplevelRole`,
+  `SceneNode::role`, `is_visible`), `scene/state.rs` (`set_role`/`set_title`/
+  `set_app_id`), `scene/thread.rs` (`place_solid`), `crates/core/src/protocol.rs`
+  (the xdg lifecycle), every client-driven test in the harness; invariant I-5
+  (role and title/app_id are now canonical state).
+- **Decision:** A scene node is visible only if it has a **display-worthy role**,
+  a source, and a non-empty size. `NodeRole` has three members: `None` (a bare
+  `wl_surface` — never displayed, per Wayland), `Toplevel(ToplevelRole)` (xdg-shell;
+  displayed once it has committed content), and `CoreOwned` (content the core
+  places itself — the C10 fallback family and the harness's scene-injected
+  fixtures — which travels through no protocol and so can carry no client role).
+  "Mapped" gets **no separate flag**: role + source is the definition, and unmap
+  already clears the source. Client-driven tests migrate to a harness helper that
+  performs the full dance; scene-injected tests are untouched.
+- **Reasoning:** Compositing any committed surface was convenient and
+  non-conformant, and it changes what "in the scene" means — which is why this is
+  a logged migration rather than a feature. A separate `mapped` bool would be a
+  second source of truth able to disagree with the first. `CoreOwned` is not a
+  test hatch: C10 content must be displayable precisely in the case where every
+  server is dead and no client role exists to grant it.
+
+### Default placement is a deterministic C10 cascade until S1 (M4)
+
+- **Source:** M1 T5; `docs/scene_graph_v1.md` §10.4; `CORE-BOUNDARY.md` C10, §4 rule 4.
+- **Affects:** `crates/core/src/protocol.rs` (`CASCADE_ORIGIN_X/Y`,
+  `CASCADE_STEP_X/Y = 32`, `CASCADE_WRAP = 8`), the `xdg_cascade` golden.
+- **Decision:** A toplevel's placement is a pure function of its creation index —
+  origin (0, 0), one 32×32 step per subsequent toplevel, wrapping after 8 — assigned
+  once when the role is created (so unmap/remap returns to the same spot). No
+  clock, no randomness, no dependence on the rest of the scene.
+- **Reasoning:** Placement is policy and the policy daemon is M4; until then C10
+  requires *some* answer, and the only property that must hold today is
+  determinism, because goldens depend on it. The wrap exists because the core does
+  not know the output size until the DRM backend (M2), so the cascade cannot clamp
+  to a screen. Origin (0, 0) also kept the T3 shm goldens byte-identical across
+  the migration — the first toplevel lands where the raw-commit path put content.
+
+### Protocol errors are asserted by code; the rig gains that capability once
+
+- **Source:** M1 T5; `crates/harness/src/protocol_rig.rs`
+  (`RigProtocolError`, `expect_protocol_error`).
+- **Affects:** the harness rig; all future conformance work.
+- **Decision:** The rig observes the server's protocol error (code, interface,
+  message) through the client connection's error state, and conformance tests
+  assert the **specific code**, never merely "the client was disconnected".
+  Recorded deviation: for a buffer committed before `ack_configure`, Smithay's
+  `ensure_configured` posts `xdg_surface.not_constructed` (1) where the spec has a
+  dedicated `unconfigured_buffer` (3); the `xdg_surface` object is not reachable
+  through Smithay's public API, so we send Smithay's code and the test pins it.
+- **Reasoning:** A compositor that kills a client for the wrong reason is still
+  broken, so disconnection alone proves nothing. Building the capability once, at
+  the rig level, is what makes every later conformance test cheap.
+
 ## Pending
 
 - Lock-screen fail-locked design (`CORE-BOUNDARY.md` §6 note).

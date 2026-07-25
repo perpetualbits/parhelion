@@ -32,7 +32,20 @@
 //! observes them without any sleep. Disconnect (no round-trip to sync on) uses
 //! [`SceneHandle::wait_until`](parhelion_core::scene::SceneHandle::wait_until)
 //! instead.
+//!
+//! # Windows, not surfaces (T5)
+//!
+//! A bare `wl_surface` is never displayed, so a test that wants *visible content*
+//! asks for a window: [`ScriptedClient::map_toplevel`] performs the entire
+//! xdg-shell dance — create surface → `xdg_surface` → `xdg_toplevel` → initial
+//! commit → configure → ack → draw → commit → mapped — in one call, and
+//! [`ScriptedClient::map_toplevel_with`] lets the test paint between the
+//! configure and the mapping commit. The individual steps stay exposed so the
+//! conformance tests can break the dance deliberately, and
+//! [`ScriptedClient::expect_protocol_error`] asserts on the *specific* error the
+//! server posts.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
@@ -47,10 +60,16 @@ use wayland_client::protocol::wl_shm::{self, Format, WlShm};
 use wayland_client::protocol::wl_shm_pool::WlShmPool;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
+use wayland_protocols::xdg::shell::client::xdg_popup::{self, XdgPopup};
+use wayland_protocols::xdg::shell::client::xdg_positioner::XdgPositioner;
+use wayland_protocols::xdg::shell::client::xdg_surface::{self, XdgSurface};
+use wayland_protocols::xdg::shell::client::xdg_toplevel::{self, XdgToplevel};
+use wayland_protocols::xdg::shell::client::xdg_wm_base::{self, XdgWmBase};
 
-/// Client-side dispatch state. The rig's client sends requests and, for T2, must
-/// observe one kind of event: `wl_callback.done` from `wl_surface.frame`
-/// callbacks. Every other global's handler stays empty.
+/// Client-side dispatch state: everything the scripted client *observes*. It
+/// sends requests directly, but the events it must see — frame callbacks (T2),
+/// buffer releases (T3), and the xdg configure/ping traffic (T5) — land here for
+/// tests to assert on.
 #[derive(Default)]
 struct App {
     /// Timestamps carried by every `wl_callback.done` received, in arrival order
@@ -60,6 +79,17 @@ struct App {
     /// compositor copied-and-released immediately (single-buffer clients rely on
     /// this to reuse the buffer).
     buffer_releases: u32,
+    /// `xdg_surface.configure` serials received and not yet consumed by
+    /// [`ScriptedClient::wait_for_configure`]. A queue, not a latest-value slot,
+    /// so a test that expects exactly one configure can prove exactly one arrived.
+    xdg_configures: VecDeque<u32>,
+    /// Sizes carried by `xdg_toplevel.configure`, in arrival order. `(0, 0)` is
+    /// the compositor saying "you choose" — what Parhelion's C10 fallback sends.
+    toplevel_configures: Vec<(i32, i32)>,
+    /// Count of `xdg_wm_base.ping` events received. The rig answers each one with
+    /// `pong` immediately (a well-behaved client), so this is the client-side half
+    /// of the liveness handshake.
+    pings: u32,
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for App {
@@ -158,6 +188,118 @@ impl Dispatch<WlBuffer, ()> for App {
     }
 }
 
+impl Dispatch<XdgWmBase, ()> for App {
+    /// Answer `ping` with `pong` at once — the rig models a responsive client —
+    /// and count it so a test can assert the ping actually arrived.
+    fn event(
+        state: &mut Self,
+        wm_base: &XdgWmBase,
+        event: xdg_wm_base::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_wm_base::Event::Ping { serial } = event {
+            state.pings += 1;
+            wm_base.pong(serial);
+        }
+    }
+}
+
+impl Dispatch<XdgSurface, ()> for App {
+    /// Queue each `configure` serial. The client must `ack_configure` one of
+    /// these before it may commit a buffer — the rig never acks automatically,
+    /// because *when* it acks is exactly what the conformance tests vary.
+    fn event(
+        state: &mut Self,
+        _: &XdgSurface,
+        event: xdg_surface::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_surface::Event::Configure { serial } = event {
+            state.xdg_configures.push_back(serial);
+        }
+    }
+}
+
+impl Dispatch<XdgToplevel, ()> for App {
+    /// Record the suggested size from each `configure`. `close` needs no handling
+    /// in M1 (nothing asks a window to close yet).
+    fn event(
+        state: &mut Self,
+        _: &XdgToplevel,
+        event: xdg_toplevel::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_toplevel::Event::Configure { width, height, .. } = event {
+            state.toplevel_configures.push((width, height));
+        }
+    }
+}
+
+impl Dispatch<XdgPositioner, ()> for App {
+    /// `xdg_positioner` is write-only — it emits no events. The rig creates one
+    /// solely to reach `xdg_surface.get_popup` in the double-role error test.
+    fn event(
+        _: &mut Self,
+        _: &XdgPositioner,
+        _: <XdgPositioner as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<XdgPopup, ()> for App {
+    /// Popups are out of scope for M1 — Parhelion dismisses them on creation.
+    /// The rig only creates one to provoke the second-role protocol error, and
+    /// that error arrives before any popup event could.
+    fn event(
+        _: &mut Self,
+        _: &XdgPopup,
+        _: xdg_popup::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+/// A protocol error the server sent this client, flattened so tests need not
+/// depend on `wayland-client`'s types. Asserting on [`code`](Self::code) — not
+/// merely "the client got disconnected" — is what makes an error test mean
+/// something: the wrong error for the right reason is still a bug.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RigProtocolError {
+    /// The error code, interpreted against `interface`'s `error` enum.
+    pub code: u32,
+    /// The interface of the object the error was posted on.
+    pub interface: String,
+    /// The server's human-readable message (diagnostics only; never asserted on).
+    pub message: String,
+}
+
+/// A mapped xdg toplevel and the objects behind it, as returned by
+/// [`ScriptedClient::map_toplevel`]. Keeping the pool and buffer alive here is
+/// what lets a test re-draw and re-commit the same window afterwards.
+pub struct Toplevel {
+    /// The underlying `wl_surface`.
+    pub surface: WlSurface,
+    /// Its `xdg_surface` (the role-agnostic half: geometry, `ack_configure`).
+    pub xdg_surface: XdgSurface,
+    /// Its `xdg_toplevel` (title, app_id, destroy).
+    pub toplevel: XdgToplevel,
+    /// The `wl_shm` buffer holding the window's pixels.
+    pub buffer: WlBuffer,
+    /// The pool backing that buffer, writable for a re-draw.
+    pub pool: ShmPool,
+}
+
 /// A scripted Wayland client on an in-process connection to a [`ProtocolHost`].
 ///
 /// [`ProtocolHost`]: parhelion_core::protocol::ProtocolHost
@@ -174,6 +316,8 @@ pub struct ScriptedClient {
     compositor: WlCompositor,
     /// The bound `wl_shm`, present iff the global was advertised (T3).
     shm: WlShm,
+    /// The bound `xdg_wm_base`, present iff the global was advertised (T5).
+    wm_base: XdgWmBase,
 }
 
 impl ScriptedClient {
@@ -195,12 +339,18 @@ impl ScriptedClient {
         let shm: WlShm = globals
             .bind(&qh, 1..=1, ())
             .expect("wl_shm global advertised");
+        // Bind xdg_wm_base (T5). Version 1 is all the rig needs; the server
+        // advertises 6.
+        let wm_base: XdgWmBase = globals
+            .bind(&qh, 1..=6, ())
+            .expect("xdg_wm_base global advertised");
         ScriptedClient {
             conn,
             queue,
             app: App::default(),
             compositor,
             shm,
+            wm_base,
         }
     }
 
@@ -299,6 +449,189 @@ impl ScriptedClient {
     /// the client says changed, applied at the next commit.
     pub fn damage(&self, surface: &WlSurface, x: i32, y: i32, w: i32, h: i32) {
         surface.damage(x, y, w, h);
+    }
+
+    // ----- xdg-shell (T5) ---------------------------------------------------
+    //
+    // The pieces of the toplevel dance, exposed individually *and* as the
+    // `map_toplevel` helper below. Individually, because the conformance tests
+    // exist to break the dance in specific ways (commit a buffer before acking,
+    // ack a serial that was never sent, take a second role); as a helper, because
+    // every other test just wants a mapped window and should read that way.
+
+    /// Give `surface` an `xdg_surface` (`xdg_wm_base.get_xdg_surface`).
+    pub fn create_xdg_surface(&mut self, surface: &WlSurface) -> XdgSurface {
+        let qh = self.queue.handle();
+        self.wm_base.get_xdg_surface(surface, &qh, ())
+    }
+
+    /// Give an `xdg_surface` the toplevel role (`xdg_surface.get_toplevel`).
+    /// Calling this twice on one surface is the double-role protocol error the
+    /// conformance test provokes.
+    pub fn get_toplevel(&mut self, xdg_surface: &XdgSurface) -> XdgToplevel {
+        let qh = self.queue.handle();
+        xdg_surface.get_toplevel(&qh, ())
+    }
+
+    /// Create an `xdg_positioner` (`xdg_wm_base.create_positioner`). Needed only
+    /// to reach `get_popup`; the rig never configures it, because the one test
+    /// that uses it errors on the role before the positioner is ever read.
+    pub fn create_positioner(&mut self) -> XdgPositioner {
+        let qh = self.queue.handle();
+        self.wm_base.create_positioner(&qh, ())
+    }
+
+    /// Give an `xdg_surface` the **popup** role (`xdg_surface.get_popup`). Used to
+    /// ask a surface that is already a toplevel for a second, different role —
+    /// the protocol error the conformance test pins. (Popups themselves are out
+    /// of scope for M1; Parhelion dismisses any it is asked for.)
+    pub fn get_popup(
+        &mut self,
+        xdg_surface: &XdgSurface,
+        parent: &XdgSurface,
+        positioner: &XdgPositioner,
+    ) -> XdgPopup {
+        let qh = self.queue.handle();
+        xdg_surface.get_popup(Some(parent), positioner, &qh, ())
+    }
+
+    /// Acknowledge a configure serial (`xdg_surface.ack_configure`). A serial the
+    /// compositor never sent is a protocol error — deliberately reachable, since
+    /// that is one of the cases under test.
+    pub fn ack_configure(&self, xdg_surface: &XdgSurface, serial: u32) {
+        xdg_surface.ack_configure(serial);
+    }
+
+    /// Block (by round-tripping) until an unconsumed `xdg_surface.configure`
+    /// arrives, then take its serial. Deterministic: it waits on a definite
+    /// condition — the configure the compositor owes the initial commit — with a
+    /// generous round-trip budget as a loud-failure net, never a sleep.
+    pub fn wait_for_configure(&mut self) -> u32 {
+        for _ in 0..1000 {
+            if let Some(serial) = self.app.xdg_configures.pop_front() {
+                return serial;
+            }
+            self.roundtrip();
+        }
+        panic!("no xdg_surface.configure within the round-trip budget");
+    }
+
+    /// Set a toplevel's title (`xdg_toplevel.set_title`).
+    pub fn set_title(&self, toplevel: &XdgToplevel, title: &str) {
+        toplevel.set_title(title.to_string());
+    }
+
+    /// Set a toplevel's app id (`xdg_toplevel.set_app_id`).
+    pub fn set_app_id(&self, toplevel: &XdgToplevel, app_id: &str) {
+        toplevel.set_app_id(app_id.to_string());
+    }
+
+    /// Perform the **whole** toplevel mapping dance and return the mapped window:
+    ///
+    /// ```text
+    /// create surface → get_xdg_surface → get_toplevel
+    ///   → commit (no buffer: the initial commit)
+    ///   → receive configure → ack_configure
+    ///   → draw → attach → commit          ← this commit maps it
+    /// ```
+    ///
+    /// `draw` runs between the configure and the mapping commit, which is exactly
+    /// where a real client paints: it now knows what the compositor suggested. The
+    /// pool it receives is `width * height * 4` bytes.
+    pub fn map_toplevel_with(
+        &mut self,
+        width: i32,
+        height: i32,
+        format: ShmFormat,
+        draw: impl FnOnce(&mut ShmPool),
+    ) -> Toplevel {
+        let surface = self.create_surface();
+        let xdg_surface = self.create_xdg_surface(&surface);
+        let toplevel = self.get_toplevel(&xdg_surface);
+
+        // The initial commit carries no buffer; the compositor answers with a
+        // configure, which the client must ack before any buffer may follow.
+        self.commit(&surface);
+        let serial = self.wait_for_configure();
+        self.ack_configure(&xdg_surface, serial);
+
+        let mut pool = self.create_pool((width * height * 4) as usize);
+        draw(&mut pool);
+        let buffer = self.create_buffer(&pool, width, height, format);
+        self.attach(&surface, &buffer);
+        self.commit(&surface);
+        self.roundtrip();
+
+        Toplevel {
+            surface,
+            xdg_surface,
+            toplevel,
+            buffer,
+            pool,
+        }
+    }
+
+    /// [`map_toplevel_with`](Self::map_toplevel_with) with the buffer contents
+    /// given up front — the common case.
+    pub fn map_toplevel(
+        &mut self,
+        width: i32,
+        height: i32,
+        format: ShmFormat,
+        pixels: &[u8],
+    ) -> Toplevel {
+        self.map_toplevel_with(width, height, format, |pool| pool.write(pixels))
+    }
+
+    /// Sizes carried by the `xdg_toplevel.configure` events received so far.
+    /// Parhelion's C10 fallback sends `(0, 0)` — "you choose".
+    pub fn toplevel_configures(&self) -> &[(i32, i32)] {
+        &self.app.toplevel_configures
+    }
+
+    /// Number of `xdg_wm_base.ping` events received (each answered with `pong`).
+    pub fn pings_received(&self) -> u32 {
+        self.app.pings
+    }
+
+    // ----- Protocol-error observation (T5) ----------------------------------
+
+    /// The protocol error the server posted to this client, if any — pumping
+    /// round-trips until one arrives or the budget runs out.
+    ///
+    /// A protocol error puts the connection permanently in an error state and the
+    /// server drops the client, so the *first* failing round-trip is where it
+    /// surfaces; after that the error is readable from the connection forever.
+    /// That makes this deterministic: no sleeps, and no ambiguity between "not
+    /// yet" and "never".
+    pub fn protocol_error(&mut self) -> Option<RigProtocolError> {
+        for _ in 0..1000 {
+            if let Some(err) = self.conn.protocol_error() {
+                return Some(RigProtocolError {
+                    code: err.code,
+                    interface: err.object_interface,
+                    message: err.message,
+                });
+            }
+            // Once the connection is in an error state every dispatch fails; stop
+            // pumping and read the error out below.
+            if self.queue.roundtrip(&mut self.app).is_err() {
+                break;
+            }
+        }
+        self.conn.protocol_error().map(|err| RigProtocolError {
+            code: err.code,
+            interface: err.object_interface,
+            message: err.message,
+        })
+    }
+
+    /// Like [`protocol_error`](Self::protocol_error) but fails the test if the
+    /// server did *not* post an error — the assertion form, so a silently-accepted
+    /// violation shows up as a failure rather than a skipped check.
+    pub fn expect_protocol_error(&mut self) -> RigProtocolError {
+        self.protocol_error()
+            .expect("expected the server to post a protocol error, but the client is still healthy")
     }
 }
 

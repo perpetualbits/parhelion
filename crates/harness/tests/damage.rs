@@ -18,8 +18,8 @@ use parhelion_backend_headless::composite::CpuCompositor;
 use parhelion_core::protocol::ProtocolHost;
 use parhelion_core::render::{Compositor, RenderLoop};
 use parhelion_core::scene::{
-    ClientKey, ContentDamage, PixelBuffer, ProtocolEvent, Rect, SceneHandle, SceneThread, Snapshot,
-    SnapshotDamage, SurfaceId, TextureSource, Transform,
+    ClientKey, ContentDamage, NodeRole, PixelBuffer, ProtocolEvent, Rect, SceneHandle, SceneThread,
+    Snapshot, SnapshotDamage, SurfaceId, TextureSource, ToplevelRole, Transform,
 };
 use parhelion_harness::protocol_rig::{ScriptedClient, ShmFormat};
 
@@ -78,6 +78,10 @@ fn map_node(
         client,
     });
     h.mutate(move |s| {
+        // These nodes model mapped client windows, so they take the toplevel role
+        // — without one they would be roleless and never displayed (T5's mapping
+        // rule), and there would be nothing to damage-track.
+        s.set_role(sid, NodeRole::Toplevel(ToplevelRole::default()));
         // Position while invisible (no damage), then map (damages the new extent).
         s.set_geometry(sid, transform, size);
         s.attach_content(sid, size, TextureSource::Shm(Arc::new(block)), opaque, ContentDamage::Full);
@@ -265,14 +269,8 @@ fn partial_copy_does_not_mutate_in_flight_snapshot() {
     host.add_client(server_end);
     let mut client = ScriptedClient::connect(client_end);
 
-    // Map an 8×8 all-white buffer.
-    let surface = client.create_surface();
-    let mut pool = client.create_pool(8 * 8 * 4);
-    pool.write(&vec![255u8; 8 * 8 * 4]); // xrgb: [B,G,R,X] all 255 → white
-    let buffer = client.create_buffer(&pool, 8, 8, ShmFormat::Xrgb8888);
-    client.attach(&surface, &buffer);
-    client.commit(&surface);
-    client.roundtrip();
+    // Map an 8×8 all-white window (xrgb: [B,G,R,X] all 255 → white).
+    let mut win = client.map_toplevel(8, 8, ShmFormat::Xrgb8888, &vec![255u8; 8 * 8 * 4]);
 
     let h = scene.handle();
     // Capture a snapshot that shares the surface's pixel block by Arc.
@@ -290,10 +288,10 @@ fn partial_copy_does_not_mutate_in_flight_snapshot() {
             px[i..i + 4].copy_from_slice(&[0, 0, 255, 255]); // xrgb [B,G,R,X] → red
         }
     }
-    pool.write(&px);
-    client.damage(&surface, 0, 0, 4, 4);
-    client.attach(&surface, &buffer);
-    client.commit(&surface);
+    win.pool.write(&px);
+    client.damage(&win.surface, 0, 0, 4, 4);
+    client.attach(&win.surface, &win.buffer);
+    client.commit(&win.surface);
     client.roundtrip();
 
     // The captured snapshot, recomposited, is unchanged — its Arc was not mutated.

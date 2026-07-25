@@ -15,7 +15,7 @@
 //! - T-render pulls an immutable [`Snapshot`] with [`SceneHandle::snapshot`] —
 //!   the scene→render edge; the snapshot is an owned value, so no lock is shared
 //!   with the frame path (I-1);
-//! - tests (standing in for T3/T5) build visual state with
+//! - the dispatch thread's xdg-shell path (T5) and tests build visual state with
 //!   [`SceneHandle::place_solid`]/[`SceneHandle::mutate`] and read it back with
 //!   [`SceneHandle::query`]/[`SceneHandle::wait_until`].
 //!
@@ -31,7 +31,7 @@ use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::scene::node::{ClientKey, SurfaceId, TextureSource, Transform};
+use crate::scene::node::{ClientKey, NodeRole, SurfaceId, TextureSource, Transform};
 use crate::scene::snapshot::Snapshot;
 use crate::scene::state::{ProtocolEvent, Scene};
 
@@ -99,8 +99,14 @@ impl SceneHandle {
     }
 
     /// Convenience for tests: create a fully-configured, committed, visible solid
-    /// node in one message. Stands in for the T3/T5 path that will build such a
-    /// node from a real client's buffer and xdg-shell state.
+    /// node in one message — the **scene-injected** path that bypasses the
+    /// protocol entirely.
+    ///
+    /// The node is given [`NodeRole::CoreOwned`], which is what makes it
+    /// displayable without a client role (T5's mapping rule): this stands in for
+    /// the C10 fallback family the core will place itself (solid decorations, the
+    /// "server crashed" surface). Client content now arrives the honest way —
+    /// through xdg-shell — so this is no longer a stand-in for that path.
     #[allow(clippy::too_many_arguments)] // a test convenience; the fields are the node's, not an abstraction to factor.
     pub fn place_solid(
         &self,
@@ -115,6 +121,7 @@ impl SceneHandle {
         self.mutate(move |s| {
             s.apply(ProtocolEvent::SurfaceCreated { surface, client });
             s.apply(ProtocolEvent::SurfaceCommitted { surface });
+            s.set_role(surface, NodeRole::CoreOwned);
             s.set_geometry(surface, transform, size);
             s.set_source(surface, TextureSource::Solid(color), opaque);
             s.set_z(surface, z);

@@ -403,3 +403,70 @@ guards. This closes M0.
   damage call → the equivalence test failed precisely at the restack step, then
   reverted. A green equivalence test that never fails proves nothing. `make test`:
   56 tests green (+9), clippy clean. `#core` `#harness`
+
+## M1 T5 — xdg-shell, and the day surfaces stopped being windows
+
+- **The migration was the task; xdg-shell was the excuse.** Until today the scene
+  composited anything that had committed pixels. That was convenient for four
+  tasks' worth of tests and it was simply wrong: Wayland says a surface without a
+  role is never displayed. T5 makes the role gate visibility, and the honest way
+  to read the change is that "in the scene" now means something narrower than it
+  did yesterday — which is why it got a decision-log entry rather than a bullet in
+  a feature list. `#design-decision` `#core`
+
+- **"Mapped" wanted to be a bool and shouldn't be.** My first instinct was a
+  `mapped` flag on the node, set by the protocol path. Then: mapped means "has a
+  role and has committed content", and both of those are already stored. A flag
+  would be a second source of truth able to drift from the first — and the drift
+  would show up as a window that is invisible-but-mapped, the worst kind of bug to
+  chase. So the definition *is* the check. `#core`
+
+- **`CoreOwned` is not a test hatch.** The awkward member of `NodeRole` is the one
+  for content the core places itself. It looks like an escape valve for the
+  harness's `place_solid`, and I nearly named it that way — but C10 exists
+  precisely for the case where every server is dead, and a "server crashed"
+  surface has no client to grant it a role. The harness riding the same door is a
+  consequence, not the purpose. `#design-decision`
+
+- **Choosing cascade origin (0, 0) cost nothing and saved every T3 golden.** A
+  realistic first-window offset (32, 32) would have moved the shm content in four
+  goldens and forced a re-bless — re-blessing that would have been legitimate but
+  unnecessary. Placing the first toplevel at the origin means the migrated tests
+  produce byte-identical frames, so the goldens keep testing what they always
+  tested, and the only new golden is the one that exists to show the cascade.
+  Re-blessed nothing; that felt like the right kind of boring. `#harness`
+
+- **Two Smithay findings, neither a stop-and-report.** (1) Its toplevel commit
+  hook detects unmap through surface state only its *renderer helpers* populate —
+  and we use none of them, by design — so that bookkeeping is silently inert for
+  us and the core re-arms the initial-configure dance itself on unmap. (2) The
+  buffer-before-ack error comes out as `xdg_surface.not_constructed` where the
+  spec has a dedicated `unconfigured_buffer`, and the `xdg_surface` object never
+  reaches us, so we can't post our own. Both are consequences of the
+  frontend/renderer split we deliberately bought; the test pins the code we
+  actually send, because pinning the code you *wish* you sent is how a conformance
+  test becomes a lie. `#discovery` `#tradeoff`
+
+- **The double-role test almost tested nothing.** I first provoked it with two
+  `get_toplevel` calls on one `xdg_surface` — and it passed clean, because
+  Smithay's role bookkeeping treats re-assigning the *same* role as idempotent. A
+  test that green-lights the violation it is named after is worse than no test. The
+  real provocation is a *different* role: one `wl_surface`, two `xdg_surface`s,
+  toplevel on one and popup on the other → `xdg_wm_base.error.role`. That is also
+  the only reason the rig learned about popups, which we otherwise dismiss on
+  sight. `#bug` `#harness`
+
+- **`delegate_xdg_shell!` smuggles in a piece of T6.** Its popup dispatch is
+  bounded on `SeatHandler`, so the core now carries an empty `SeatState` and a
+  behaviourless trait impl. No `wl_seat` global is advertised (that needs
+  `Seat::new`, which is T6's), so nothing about input exists — but it is worth
+  saying out loud that the type system pulled a later task's shape forward rather
+  than pretending the line stayed clean. `#tradeoff`
+
+- **The rig can now assert *which* error.** Disconnection proves nothing: a
+  compositor that kills a client for the wrong reason is still broken. The rig
+  reads the connection's protocol-error state (code, interface, message) and every
+  error test asserts the code. Built once, reusable forever — the same bet as the
+  golden rig. `make test`: 69 tests green (+13), clippy clean; goldens re-blessed:
+  none. New golden `xdg_cascade`, verified to reject a one-pixel placement drift.
+  `#harness` `#core`

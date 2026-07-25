@@ -44,7 +44,9 @@ pub mod snapshot;
 pub mod state;
 pub mod thread;
 
-pub use node::{ClientKey, PixelBuffer, SceneNode, SurfaceId, TextureSource, Transform};
+pub use node::{
+    ClientKey, NodeRole, PixelBuffer, SceneNode, SurfaceId, TextureSource, ToplevelRole, Transform,
+};
 pub use region::{Rect, Region, MAX_DAMAGE_RECTS};
 pub use snapshot::{Snapshot, SnapshotDamage, SnapshotNode};
 pub use state::{ContentDamage, ProtocolEvent, Scene};

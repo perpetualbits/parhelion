@@ -3,7 +3,7 @@
 > **Re-entrancy header.**
 > **Status:** Draft v0.1 · **Date:** 2026-07-24 · **Kind:** subsystem design (the scene graph, render loop, and snapshot mechanism).
 > **Upstream:** `VISION.md` Theses 1 & 3; `CORE-BOUNDARY.md` §3 (C4 scene graph, C5 render loop), §7 (threading), §10.3 (snapshot representation — open); `docs/plans/m1_tasks.md` T1.
-> **Downstream:** T2 (frame callbacks / flush ownership / backpressure — landed, §8), T3 (wl_shm → real `Shm` source — landed, §3.1), T4 (damage tracking — landed, §9), T5 (xdg-shell geometry), T6 (input/winit).
+> **Downstream:** T2 (frame callbacks / flush ownership / backpressure — landed, §8), T3 (wl_shm → real `Shm` source — landed, §3.1), T4 (damage tracking — landed, §9), T5 (xdg-shell, roles, and the mapping-semantics migration — landed, §10), T6 (input/winit).
 > **Canonical for:** `crates/core/src/scene/`, `crates/core/src/render.rs`, and the CPU compositor in `crates/backend-headless/src/composite.rs`.
 > **Change control:** this document is the single canonical scene-graph doc (CLAUDE.md: one doc per subsystem). It supersedes the M0 ledger's role; the ledger is gone.
 
@@ -28,6 +28,7 @@ A [`SceneNode`](../crates/core/src/scene/node.rs) is one surface's canonical sta
 | `z` | stacking order (higher = on top) | live |
 | `source` | pixel source — `Option<TextureSource>` | `Solid` + `Shm` (real, T3) |
 | `opaque` | fully-opaque hint (blend + future occlusion) | live |
+| `role` | what the surface *is* — and whether it may be displayed at all | `None` / `Toplevel` / `CoreOwned` (T5, §10) |
 
 **The narrow line (Thesis 1 vs Thesis 3).** The `transform` slot and the `source` binding exist because a conventional window is the *degenerate case* of a 3D-textured object, not the only case (Thesis 1). But in M1 **only the axis-aligned integer-translation path is implemented, composited, or tested** (Thesis 3, "the cheap regime is sacred"):
 
@@ -37,7 +38,7 @@ enum Transform { Identity, Translate { dx: i32, dy: i32 } }   // + future: Affin
 
 The enum is *extensible* (adding a real 3D transform is a new variant plus its composited path), but no transform math beyond integer translation is reachable today — there is no half-working rotation or perspective. Building 3D now would be scope creep; building a type that *forbids* 3D would be a Thesis-1 violation. The enum threads that needle: open vocabulary, narrow implementation. When a real transform lands it brings its own composited, golden-tested arm; until then the compositor's `match` is exhaustive over `Identity`/`Translate`.
 
-A node is **visible** — and so contributes a snapshot node — only once it has a `source` and a non-empty `size`. A freshly-created surface is live but silent until it "attaches", exactly like a real client's surface before its first buffer.
+A node is **visible** — and so contributes a snapshot node — only once it has a display-worthy `role`, a `source`, and a non-empty `size` (**§10**: the role gate is T5's mapping-semantics migration; before it, any committed surface composited). A freshly-created surface is live but silent until it takes a role and "attaches", exactly like a real client's surface before it becomes a window.
 
 ## 3. The texture-source seam (the Rayland seam)
 
@@ -350,11 +351,146 @@ These are asserted in tests — a counter nobody asserts on drifts into a lie. T
 proportionality test shows a small-damage commit on a large surface redraws
 pixels within a generous bound of the damage area, not the whole frame.
 
-## 10. What later tasks add here
+## 10. Mapping semantics and roles (T5)
+
+Until T5 the scene composited **any** surface that had committed pixels. That was
+convenient for tests and **non-conformant**: Wayland is explicit that a
+`wl_surface` without a role is never displayed. T5 ends it, and because this
+changes what "in the scene" *means*, it is a migration with its own decision-log
+entry, not a feature.
+
+**Canonical for:** [`NodeRole`](../crates/core/src/scene/node.rs), the role gate in
+`SceneNode::is_visible`, the role/title setters in
+[`state`](../crates/core/src/scene/state.rs), and the xdg-shell half of
+[`protocol`](../crates/core/src/protocol.rs).
+
+### 10.1 The rule
+
+A node contributes pixels only if **all** of these hold: it has a display-worthy
+role, it has a source, and its size is non-empty.
+
+```
+enum NodeRole {
+    None,                    // a bare wl_surface — never displayed
+    Toplevel(ToplevelRole),  // xdg-shell toplevel: displayed once it has content
+    CoreOwned,               // core-injected content (C10 fallbacks, harness fixtures)
+}
+```
+
+`CoreOwned` is the deliberate exception and it is not a test hatch: the C10
+fallback family (solid decorations, the "server crashed" surface) is content the
+core places itself, travels through no protocol, and can carry no client role —
+yet must be displayable, since it exists precisely for the case where everything
+else is dead. The harness's scene-injected fixtures ride the same door.
+
+**"Mapped" needs no flag.** A toplevel is mapped exactly when it has the role
+*and* a committed source — which is what unmap already clears. Adding a separate
+`mapped` bool would create a second source of truth that could disagree with the
+first.
+
+### 10.2 The lifecycle, strictly
+
+1. **Initial commit, no buffer** → the compositor sends `configure` (0×0, no
+   states: *you* choose your size — the core has no size policy to impose).
+2. **`ack_configure`, then a buffer** → the buffer commit maps the toplevel: it
+   takes its C10 placement (§10.4) and becomes visible scene content.
+3. **A buffer before the ack** → protocol error, and nothing maps.
+4. **Null attach, or `xdg_toplevel.destroy`** → unmap. The node loses its source
+   (and on destroy its role, since the `wl_surface` may outlive its role object)
+   with the structural damage T4's `clear_source`/`set_role` raise. After an
+   unmap the initial commit/configure sequence must be run **again** before the
+   surface may map — the protocol says so, and §10.3 explains why we rearm it
+   ourselves.
+5. **`xdg_wm_base` ping/pong** is implemented as a mechanism (`ProtocolHost::ping_clients`,
+   `pongs_received`). There is no ping *scheduler* and no unresponsive-client
+   handling: when to ping and what to do about silence is policy, and policy is
+   S1's (M4).
+
+Title and `app_id` are captured into canonical state (I-5) and **nothing branches
+on them** in M1. They exist because the core is where the truth about a window
+lives; the policy daemon and debug inspectors read them later.
+
+### 10.3 Two honest notes about the Smithay seam
+
+The seam held — `smithay::wayland::shell::xdg` reaches everything we need with no
+renderer type, and the workspace grep stays clean — with two things worth
+recording rather than discovering twice:
+
+- **Smithay's unmap bookkeeping is inert for us.** Its toplevel commit hook
+  detects unmap through surface state that only its *renderer helpers* populate,
+  and we use none of them (we supply our own renderer — that is the whole point
+  of the seam). So the hook silently does nothing, and the core re-arms the
+  initial-configure dance itself on unmap. This is a consequence of the
+  frontend/renderer split we chose, not a defect in it.
+- **The buffer-before-ack error code differs from the spec's.** Smithay's
+  `ensure_configured` posts `xdg_surface.not_constructed` (1) where the spec has a
+  dedicated `unconfigured_buffer` (3). The `xdg_surface` object is never handed to
+  the compositor through Smithay's public API, so posting our own is not
+  reachable without forking that layer. We take Smithay's code, and the
+  conformance test pins the code we actually send — pinning what *is* sent is
+  what makes the test worth having.
+
+`delegate_xdg_shell!` also drags in one piece of T6 machinery: its `xdg_popup`
+dispatch is bounded on `SeatHandler`, so the core carries an **empty** `SeatState`
+and a trait impl with no behaviour. No `wl_seat` global is created (that needs
+`Seat::new`, which is T6), so nothing about input exists yet.
+
+### 10.4 C10 placement — loudly temporary
+
+Placement is a policy decision, and policy does not live in the core (§4 rule 4).
+Until the reference policy daemon S1 arrives in **M4**, `CORE-BOUNDARY.md` C10's
+"default window placement" fallback stands in, as a deterministic cascade of named
+constants in `protocol.rs`:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `CASCADE_ORIGIN_X` / `_Y` | 0, 0 | where the first toplevel's top-left corner goes |
+| `CASCADE_STEP_X` / `_Y` | 32, 32 | offset added per subsequent toplevel |
+| `CASCADE_WRAP` | 8 | steps before returning to the origin |
+
+The placement is a pure function of the toplevel's creation index — no clock, no
+randomness, no dependence on what else is on screen — because **goldens depend on
+it**. The wrap exists because the core does not know the output size (outputs
+arrive with the DRM backend in M2), so the cascade cannot clamp to a screen; it
+must not walk off into an unbounded plane instead.
+
+The origin being (0, 0) is also why the T3 shm goldens survived this migration
+byte-for-byte: the first toplevel lands exactly where the old raw-commit path put
+its content.
+
+### 10.5 What T5 explicitly did **not** change
+
+- **Frame-callback semantics (§8.3) are untouched.** Every tick still fires all
+  committed callbacks on every surface, *not* gated on visibility — so the
+  reverse-direction proof test, which commits a frame request on an attach-less
+  (and now roleless, and now definitively invisible) surface, keeps its meaning
+  and passed unmodified. Occlusion/visibility-aware throttling remains M2.
+- **Snapshot semantics are untouched.** The role gate lives in `is_visible`, which
+  the snapshot builder already consulted.
+- **Damage classes are untouched.** Map and unmap were already structural changes
+  through `attach_content` / `clear_source`; role changes damage old ∪ new extent
+  for the same reason.
+
+### 10.6 T5 tests
+
+- **`harness/tests/xdg.rs`** — the dance (one configure at 0×0, ack, map);
+  `roleless_surface_is_never_displayed` (the migration's headline, from the wire);
+  title/app_id into canonical state; ping→pong; the three protocol errors, each
+  asserting the **specific code**, not merely a disconnect; unmap-on-destroy and
+  unmap-on-null-attach with the damage read off the render counters, the latter
+  proving the re-map needs a fresh configure; and the cascade's determinism.
+- **`harness/tests/xdg_render.rs`** — `xdg_cascade`: two clients, two toplevels,
+  one cascade step apart, golden-compared. Discrimination demonstrated: changing
+  `CASCADE_STEP_Y` by one pixel is rejected with `actual`/`golden`/`diff`
+  artifacts.
+- **Migrated** to `map_toplevel`: the T3 shm goldens, T4's copy-on-write isolation
+  test, and the null-attach rig test. Scene-injected (`place_solid`) tests are
+  untouched by design.
+
+## 11. What later tasks add here
 
 | Task | Adds to the scene graph |
 |------|-------------------------|
-| **T5** | xdg-shell: roles, configure/ack, map/unmap, title/app_id into scene state; default placement from C10. |
 | **T6** | Seat/input; focus = topmost mapped toplevel (temporary C10 policy); the winit nested backend presenting these frames. |
 
 Anything requiring 3D transform math, `presentation-time`, opaque-region occlusion

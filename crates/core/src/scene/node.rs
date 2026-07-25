@@ -131,15 +131,77 @@ pub enum TextureSource {
     //   RaylandToken(..)  — token-buffer S-side source (CORE-BOUNDARY C9)
 }
 
+/// The xdg-shell toplevel role's metadata (T5): what the client calls itself.
+///
+/// Captured into canonical state (I-5) because it is the core's truth about the
+/// window, and the future policy daemon (S1, M4) and debug inspectors read it
+/// over the control plane. **No behaviour hangs off these in M1** — they are
+/// recorded and inspectable, nothing more; placement, focus, and matching rules
+/// that would consume them are policy, and policy is not in the core (§4 rule 4).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToplevelRole {
+    /// `xdg_toplevel.set_title`, if the client has set one.
+    pub title: Option<String>,
+    /// `xdg_toplevel.set_app_id`, if the client has set one.
+    pub app_id: Option<String>,
+}
+
+/// What a node *is* — and therefore whether it may be displayed at all (T5).
+///
+/// # The mapping rule (the T5 migration)
+///
+/// Wayland is explicit: **a `wl_surface` without a role is never displayed.**
+/// Until T5 the scene composited any surface that had committed pixels, which
+/// was convenient for tests and non-conformant; from T5 the role gates
+/// visibility ([`SceneNode::is_visible`]), and "mapped" needs no separate flag —
+/// a toplevel is mapped exactly when it carries the role *and* has a committed
+/// source, which is precisely what unmap (null attach) and destroy clear.
+///
+/// [`CoreOwned`](NodeRole::CoreOwned) is the deliberate exception: content the
+/// core itself puts in the scene (the C10 fallback family — solid decorations,
+/// the "server crashed" surface — and the harness's scene-injected fixtures)
+/// never travels through the protocol and so can carry no client role, yet must
+/// still be displayable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum NodeRole {
+    /// No role: a bare `wl_surface`. Live in the scene, never displayed. This is
+    /// the state every surface starts in.
+    #[default]
+    None,
+    /// An xdg-shell toplevel (T5). Displayed once it has a committed source.
+    Toplevel(ToplevelRole),
+    /// Core-injected content that bypasses the protocol entirely: C10 fallbacks
+    /// and harness fixtures. Always displayable (no client role to wait for).
+    CoreOwned,
+}
+
+impl NodeRole {
+    /// Whether a node carrying this role may contribute pixels *at all* — the
+    /// role half of [`SceneNode::is_visible`]. A roleless surface never can.
+    pub fn displays(&self) -> bool {
+        !matches!(self, NodeRole::None)
+    }
+
+    /// The toplevel metadata, if this is a toplevel role. Read by the rig (and,
+    /// later, by the control plane) — nothing in the core branches on it.
+    pub fn toplevel(&self) -> Option<&ToplevelRole> {
+        match self {
+            NodeRole::Toplevel(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
 /// One surface's canonical scene state.
 ///
 /// Holds both the lifecycle facts absorbed from the M0 ledger (owning
 /// [`ClientKey`], whether it has committed) and the visual state the scene graph
-/// adds in M1 (placement, size, source, opacity). A node is *visible* — and so
-/// appears in a [`Snapshot`](crate::scene::Snapshot) — only once it has a source
-/// and a non-empty size; a freshly-created surface with neither is live in the
-/// scene but contributes no pixels, exactly as a real client's surface is silent
-/// until it attaches a buffer.
+/// adds in M1 (role, placement, size, source, opacity). A node is *visible* — and
+/// so appears in a [`Snapshot`](crate::scene::Snapshot) — only once it has a
+/// display-worthy [`NodeRole`], a source, and a non-empty size; a freshly-created
+/// surface has none of those and is live in the scene but contributes no pixels,
+/// exactly as a real client's surface is silent until it takes a role and
+/// attaches a buffer.
 ///
 /// No longer `Copy`: a node's [`TextureSource`] may hold an `Arc<PixelBuffer>`
 /// (shm), so the node is `Clone` (a cheap ref-count bump for the pixels) but not
@@ -150,6 +212,10 @@ pub struct SceneNode {
     pub client: ClientKey,
     /// Whether the surface has committed at least once (absorbed ledger fact).
     pub committed: bool,
+    /// The surface's role, which gates whether it is ever displayed (T5). A
+    /// freshly-created surface has [`NodeRole::None`] and stays invisible no
+    /// matter what it commits.
+    pub role: NodeRole,
     /// Placement in the output. Identity/translation only in M1 (see [`Transform`]).
     pub transform: Transform,
     /// Node size in pixels, `(width, height)`. `(0, 0)` until geometry is set —
@@ -168,12 +234,14 @@ pub struct SceneNode {
 }
 
 impl SceneNode {
-    /// A freshly-created surface: owned by `client`, not yet committed, at the
-    /// origin, zero-size, no source. Invisible until geometry and a source land.
+    /// A freshly-created surface: owned by `client`, not yet committed, roleless,
+    /// at the origin, zero-size, no source. Invisible until it takes a role and a
+    /// source lands.
     pub fn new(client: ClientKey) -> Self {
         SceneNode {
             client,
             committed: false,
+            role: NodeRole::None,
             transform: Transform::default(),
             size: (0, 0),
             z: 0,
@@ -182,9 +250,14 @@ impl SceneNode {
         }
     }
 
-    /// Whether this node contributes pixels to a frame: it has a source and a
-    /// non-empty area. Invisible nodes are skipped by the snapshot builder.
+    /// Whether this node contributes pixels to a frame: it has a display-worthy
+    /// role (T5 — a roleless surface is never shown), a source, and a non-empty
+    /// area. Invisible nodes are skipped by the snapshot builder.
+    ///
+    /// For a toplevel, role + source *is* the definition of "mapped": the role
+    /// arrives with `xdg_surface.get_toplevel` and the source with the first
+    /// buffer commit, and unmap clears the source again.
     pub fn is_visible(&self) -> bool {
-        self.source.is_some() && self.size.0 > 0 && self.size.1 > 0
+        self.role.displays() && self.source.is_some() && self.size.0 > 0 && self.size.1 > 0
     }
 }

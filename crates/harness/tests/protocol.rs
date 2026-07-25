@@ -342,9 +342,12 @@ fn flooding_client_is_throttled_second_client_served_and_bounded() {
     );
 }
 
-/// Null attach unmaps: after `wl_surface.attach(null)` + commit, the surface
+/// Null attach unmaps: after `wl_surface.attach(null)` + commit, the toplevel
 /// loses its source and stops being visible (the protocol's unmap), while the
 /// node itself stays live in the scene.
+///
+/// Migrated in T5: the surface reaches visibility through the full toplevel dance
+/// (`map_toplevel`), because a roleless surface is no longer displayed at all.
 #[test]
 fn null_attach_unmaps_the_surface() {
     let scene = SceneThread::spawn();
@@ -353,25 +356,19 @@ fn null_attach_unmaps_the_surface() {
     host.add_client(server_end);
     let mut client = ScriptedClient::connect(client_end);
 
-    // Attach a buffer and commit → the surface is visible.
-    let surface = client.create_surface();
-    let mut pool = client.create_pool(4 * 4 * 4);
-    pool.write(&[255u8; 4 * 4 * 4]);
-    let buffer = client.create_buffer(&pool, 4, 4, ShmFormat::Xrgb8888);
-    client.attach(&surface, &buffer);
-    client.commit(&surface);
-    client.roundtrip();
+    // Map a window → visible.
+    let win = client.map_toplevel(4, 4, ShmFormat::Xrgb8888, &[255u8; 4 * 4 * 4]);
 
     let h = scene.handle();
     assert_eq!(
         h.query(|s| s.get(SurfaceId(0)).map(|n| n.is_visible())),
         Some(true),
-        "surface visible after attach + commit"
+        "toplevel visible after the mapping commit"
     );
 
     // Null attach + commit → unmap: source cleared, node still present.
-    client.attach_null(&surface);
-    client.commit(&surface);
+    client.attach_null(&win.surface);
+    client.commit(&win.surface);
     client.roundtrip();
     assert_eq!(
         h.query(|s| s.get(SurfaceId(0)).map(|n| n.is_visible())),

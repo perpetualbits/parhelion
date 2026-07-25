@@ -19,6 +19,10 @@ parhelion-core = { path = "../core" }
 # connects to the ProtocolHost over a socketpair. Same wayland-rs generation
 # (0.31) as the wayland-server the core frontend uses.
 wayland-client = "0.31"
+# Client-side xdg-shell bindings for the rig's scripted client (T5). Same crate
+# (and version) Smithay generates its server side from, so the two ends cannot
+# drift apart; only the `client` feature is enabled — the rig is a client.
+wayland-protocols = { version = "0.32", features = ["client"] }
 # PNG codec for golden storage. `png` is the minimal, pure-Rust, C-free choice —
 # it keeps CI apt-install-free (spike report §1). Heavier alternatives (`image`)
 # pull many format decoders we do not need; `lodepng` is a C port. Not a

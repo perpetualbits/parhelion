@@ -65,13 +65,34 @@
 //! drains its callbacks — bounded memory, no dropped messages, no stall for
 //! shard-mates. Policy lives in `docs/scene_graph_v1.md` §8.
 //!
-//! # Protocol scope (M0/M1 T1–T3)
+//! # xdg-shell and the mapping rule (T5)
+//!
+//! `xdg_wm_base` / `xdg_surface` / `xdg_toplevel` ride
+//! `smithay::wayland::shell::xdg` (again: frontend only, no renderer type). The
+//! lifecycle this module enforces is the protocol's, strictly:
+//!
+//! 1. **Initial commit, no buffer** → the compositor answers with a `configure`
+//!    (0×0 — the client picks its own size; no states in v1).
+//! 2. **The client must `ack_configure` before committing a buffer.** A buffer on
+//!    an unacked surface is a protocol error ([`State::commit`]).
+//! 3. **First buffer commit maps the toplevel** — it takes its C10 placement
+//!    ([`CASCADE_STEP_X`]) and becomes visible scene content.
+//! 4. **Null attach or `xdg_toplevel.destroy` unmaps it** — the scene node loses
+//!    its source (and, on destroy, its role), with structural damage.
+//!
+//! The load-bearing consequence, and the reason this task is a migration:
+//! **only mapped toplevels (and core-injected C10/harness content) are ever
+//! displayed.** A bare committed `wl_surface` is live in the scene and invisible,
+//! per Wayland (`crate::scene::NodeRole`, `docs/scene_graph_v1.md` §10).
+//!
+//! # Protocol scope (M0/M1 T1–T5)
 //!
 //! `wl_compositor` (surface create / commit / destroy, `wl_surface.frame`
-//! callbacks — T2) and `wl_shm` (T3: shared-memory buffers, copied at commit into
-//! a scene-side pixel block and released immediately), via
-//! `smithay::wayland::{compositor, shm}` (the frontend layers the decision points
-//! at; Smithay's renderer layer is never touched). xdg-shell (T5) and input (T6) are later.
+//! callbacks — T2), `wl_shm` (T3: shared-memory buffers, copied at commit into
+//! a scene-side pixel block and released immediately), and `xdg_wm_base` (T5:
+//! toplevels, above), via `smithay::wayland::{compositor, shm, shell::xdg}` (the
+//! frontend layers the decision points at; Smithay's renderer layer is never
+//! touched). Popups, input (T6), and decorations are later.
 
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
@@ -89,19 +110,26 @@ use smithay::reexports::calloop::{
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason, ObjectId};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_callback::WlCallback;
+use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_shm::Format;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
+use smithay::input::{SeatHandler, SeatState};
+use smithay::utils::{Serial, SERIAL_COUNTER};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     with_states, BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
     Damage, SurfaceAttributes,
 };
+use smithay::wayland::shell::xdg::{
+    PopupSurface, PositionerState, ShellClient, ToplevelSurface, XdgShellHandler, XdgShellState,
+    XdgToplevelSurfaceData,
+};
 use smithay::wayland::shm::{with_buffer_contents, BufferAccessError, ShmHandler, ShmState};
 
 use crate::scene::{
-    ClientKey, ContentDamage, PixelBuffer, ProtocolEvent, Rect, SceneHandle, SurfaceId,
-    TextureSource,
+    ClientKey, ContentDamage, NodeRole, PixelBuffer, ProtocolEvent, Rect, SceneHandle, SurfaceId,
+    TextureSource, ToplevelRole, Transform,
 };
 
 /// Per-client cap on **pending** (committed but not-yet-fired) `wl_surface.frame`
@@ -121,6 +149,36 @@ use crate::scene::{
 /// ~1 second of unacknowledged frames at 60 Hz — orders of magnitude past any
 /// honest need, yet a hard ceiling on a flooder's in-core footprint.
 pub const MAX_PENDING_FRAME_CALLBACKS: usize = 64;
+
+// ==========================================================================
+// C10 fallback placement — LOUDLY TEMPORARY.
+//
+// `CORE-BOUNDARY.md` C10 puts "default window placement" in the core precisely
+// so the compositor stays usable with every server dead. It is *not* the core's
+// job to decide where windows go: that is policy (§4 rule 4), and policy lives
+// in the reference policy daemon S1, which arrives in **M4**. Until then a
+// toplevel is placed by this cascade and nothing else.
+//
+// The one property that matters today is **determinism** — goldens depend on
+// the nth toplevel of a run landing in exactly the same place every time — so
+// the cascade is a pure function of the toplevel's creation index, with no
+// clock, no randomness, and no dependence on what else is on screen.
+// ==========================================================================
+
+/// X of the first toplevel's top-left corner. Zero: the first window sits at the
+/// output origin, which is also where the pre-T5 raw-commit path put content.
+pub const CASCADE_ORIGIN_X: i32 = 0;
+/// Y of the first toplevel's top-left corner (see [`CASCADE_ORIGIN_X`]).
+pub const CASCADE_ORIGIN_Y: i32 = 0;
+/// Horizontal offset added per subsequent toplevel.
+pub const CASCADE_STEP_X: i32 = 32;
+/// Vertical offset added per subsequent toplevel.
+pub const CASCADE_STEP_Y: i32 = 32;
+/// Number of steps before the cascade returns to the origin. The core does not
+/// know the output size (outputs arrive with the DRM backend in M2), so the
+/// cascade cannot clamp to a screen; wrapping is what keeps it from walking off
+/// into the far corner of an unbounded plane.
+pub const CASCADE_WRAP: u64 = 8;
 
 // ==========================================================================
 // Static Send/Sync regression guards (spike §5.5).
@@ -219,6 +277,8 @@ impl FramePresenter {
 enum Control {
     /// Admit a client connected on this stream (the shard-assignment seam).
     AddClient(UnixStream),
+    /// Send `xdg_wm_base.ping` to every shell client with a live toplevel (T5).
+    PingClients,
     /// Stop the dispatch loop and let the thread exit.
     Shutdown,
 }
@@ -249,6 +309,24 @@ impl ClientData for ClientState {
     }
 }
 
+/// What the dispatch thread tracks per live xdg toplevel. All of it is
+/// protocol-side bookkeeping; the *canonical* facts (role, placement, size,
+/// pixels) live in the scene (I-5) and this is only what is needed to drive the
+/// protocol objects, which never leave this thread (§7).
+struct ToplevelEntry {
+    /// Smithay's handle for this toplevel — how configures are sent and the
+    /// configured/acked state is queried.
+    toplevel: ToplevelSurface,
+    /// The C10 cascade placement assigned once, when the role was created, so a
+    /// toplevel that unmaps and remaps returns to the same spot.
+    placement: (i32, i32),
+    /// Whether this toplevel currently has committed content (is *mapped*).
+    /// Tracked here so the mapping commit — and only the mapping commit — sets
+    /// the node's geometry: doing it on every commit would damage the whole
+    /// extent each frame and undo T4's small-damage path.
+    mapped: bool,
+}
+
 /// The dispatch shard's protocol state — thin, protocol-only. Owns no scene
 /// data: its whole job is to translate protocol callbacks into [`ProtocolEvent`]s
 /// published to the scene owner.
@@ -260,6 +338,14 @@ struct State {
     /// the bytes through `smithay::wayland::shm` alone — no renderer type (the
     /// seam check, `docs/scene_graph_v1.md` §3).
     shm_state: ShmState,
+    /// Smithay's `xdg_wm_base` global/handler state (T5). The frontend layer
+    /// only — it validates the shell's request grammar and tracks configure
+    /// serials; the window *meaning* (map, placement, damage) is ours below.
+    xdg_shell_state: XdgShellState,
+    /// Seat state — **empty in M1** and present only because `delegate_xdg_shell!`
+    /// is bounded on `SeatHandler` (see that impl). No seat is created here, so
+    /// no `wl_seat` global is advertised; T6 fills this in.
+    seat_state: SeatState<State>,
     /// Handle used to admit clients and resolve object→client.
     dh: DisplayHandle,
     /// Monotonic source of [`SurfaceId`]s.
@@ -279,6 +365,14 @@ struct State {
     /// patching goes through `Arc::make_mut` (copy-on-write: an in-flight
     /// snapshot's pixels are never mutated).
     surface_pixels: HashMap<ObjectId, Arc<PixelBuffer>>,
+    /// Live xdg toplevels, keyed by their `wl_surface`'s object id (T5) — the
+    /// lookup `commit` uses to tell "this surface is a toplevel" from "this
+    /// surface is a bare `wl_surface`", which is now the difference between
+    /// content that can be displayed and content that cannot.
+    toplevels: HashMap<ObjectId, ToplevelEntry>,
+    /// Monotonic counter feeding the C10 cascade (`CASCADE_*`). Never reset, so
+    /// placements are a deterministic function of creation order within a run.
+    next_toplevel_index: u64,
     /// The publish edge to the scene owner.
     scene: SceneHandle,
     /// Latest presentation timestamp from the render side (shared with the
@@ -292,6 +386,9 @@ struct State {
     /// counter that shows partial copies copy less than the whole buffer
     /// (`ProtocolHost::bytes_copied`). Not load-bearing for dispatch.
     bytes_copied: Arc<AtomicUsize>,
+    /// Count of `xdg_wm_base.pong` replies received (T5 liveness check). Pure
+    /// observability — nothing acts on an unresponsive client in M1.
+    pongs_received: Arc<AtomicUsize>,
     /// Set by a `Shutdown` control message to end the loop.
     stop: bool,
 }
@@ -309,6 +406,136 @@ impl State {
         let key = ClientKey(self.next_client_key);
         self.next_client_key += 1;
         key
+    }
+
+    /// The next C10 fallback placement (see the `CASCADE_*` constants). Pure
+    /// function of the creation index: deterministic, clock-free, and unaffected
+    /// by what else is on screen. **Temporary** — the policy daemon (S1) takes
+    /// this over in M4.
+    fn alloc_cascade_placement(&mut self) -> (i32, i32) {
+        let step = (self.next_toplevel_index % CASCADE_WRAP) as i32;
+        self.next_toplevel_index += 1;
+        (
+            CASCADE_ORIGIN_X + step * CASCADE_STEP_X,
+            CASCADE_ORIGIN_Y + step * CASCADE_STEP_Y,
+        )
+    }
+
+    /// This surface's current title and app_id, as the client last set them.
+    /// Reads the role attributes Smithay maintains; the values are copied out so
+    /// only owned data crosses to the scene.
+    fn toplevel_metadata(surface: &WlSurface) -> (Option<String>, Option<String>) {
+        with_states(surface, |states| {
+            let attrs = states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .expect("toplevel surface has xdg role data")
+                .lock()
+                .expect("xdg role data lock");
+            (attrs.title.clone(), attrs.app_id.clone())
+        })
+    }
+
+    /// Unmap a toplevel's node: it loses its source (and so its visibility) with
+    /// the structural damage `clear_source` raises. Used by both unmap paths —
+    /// null attach and `xdg_toplevel.destroy`.
+    fn unmap_surface(&mut self, obj: &ObjectId) {
+        self.surface_pixels.remove(obj);
+        if let Some(&sid) = self.obj_to_surface.get(obj) {
+            self.scene.mutate(move |s| s.clear_source(sid));
+        }
+    }
+}
+
+impl XdgShellHandler for State {
+    fn xdg_shell_state(&mut self) -> &mut XdgShellState {
+        &mut self.xdg_shell_state
+    }
+
+    /// `xdg_surface.get_toplevel`: the surface has taken the toplevel role.
+    ///
+    /// The role goes to the scene immediately — it is canonical state (I-5) — but
+    /// the node stays *invisible* until a buffer commits: role + source is what
+    /// "mapped" means (`crate::scene::NodeRole`). The C10 placement is assigned
+    /// here, once, so an unmap/remap cycle returns to the same spot.
+    fn new_toplevel(&mut self, toplevel: ToplevelSurface) {
+        let obj = toplevel.wl_surface().id();
+        let placement = self.alloc_cascade_placement();
+        if let Some(&sid) = self.obj_to_surface.get(&obj) {
+            self.scene
+                .mutate(move |s| s.set_role(sid, NodeRole::Toplevel(ToplevelRole::default())));
+        }
+        self.toplevels.insert(
+            obj,
+            ToplevelEntry {
+                toplevel,
+                placement,
+                mapped: false,
+            },
+        );
+    }
+
+    /// `xdg_toplevel.destroy`: unmap, and drop the role — the `wl_surface` may
+    /// outlive its role object, and a roleless surface is never displayed. The
+    /// node itself stays live until the `wl_surface` is destroyed.
+    fn toplevel_destroyed(&mut self, toplevel: ToplevelSurface) {
+        let obj = toplevel.wl_surface().id();
+        self.toplevels.remove(&obj);
+        self.unmap_surface(&obj);
+        if let Some(&sid) = self.obj_to_surface.get(&obj) {
+            self.scene.mutate(move |s| s.set_role(sid, NodeRole::None));
+        }
+    }
+
+    /// `xdg_toplevel.set_title` → canonical state. Metadata only (T5): nothing
+    /// in the core branches on it.
+    fn title_changed(&mut self, toplevel: ToplevelSurface) {
+        let Some(&sid) = self.obj_to_surface.get(&toplevel.wl_surface().id()) else {
+            return;
+        };
+        let (title, _) = State::toplevel_metadata(toplevel.wl_surface());
+        self.scene.mutate(move |s| s.set_title(sid, title));
+    }
+
+    /// `xdg_toplevel.set_app_id` → canonical state. Metadata only, as
+    /// [`title_changed`](Self::title_changed).
+    fn app_id_changed(&mut self, toplevel: ToplevelSurface) {
+        let Some(&sid) = self.obj_to_surface.get(&toplevel.wl_surface().id()) else {
+            return;
+        };
+        let (_, app_id) = State::toplevel_metadata(toplevel.wl_surface());
+        self.scene.mutate(move |s| s.set_app_id(sid, app_id));
+    }
+
+    /// `xdg_wm_base.pong`: the client answered a ping and is alive. Counted for
+    /// observability; M1 takes no action on an unresponsive client (that is
+    /// policy, and it needs a timer the core does not run yet).
+    fn client_pong(&mut self, _client: ShellClient) {
+        self.pongs_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Popups are **out of scope for M1** (`docs/plans/m1_tasks.md` T5). This
+    /// trait method has no default, so it must exist; dismissing the popup at
+    /// once (`popup_done`) is the honest answer — the client learns immediately
+    /// that it has no popup, instead of waiting on a configure that a
+    /// half-implementation would never send correctly.
+    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+        surface.send_popup_done();
+    }
+
+    /// A popup grab, likewise dismissed — see [`new_popup`](Self::new_popup).
+    fn grab(&mut self, surface: PopupSurface, _seat: WlSeat, _serial: Serial) {
+        surface.send_popup_done();
+    }
+
+    /// Repositioning applies to popups only, which we dismiss on creation, so
+    /// there is nothing here to reposition.
+    fn reposition_request(
+        &mut self,
+        _surface: PopupSurface,
+        _positioner: PositionerState,
+        _token: u32,
+    ) {
     }
 }
 
@@ -357,6 +584,14 @@ impl CompositorHandler for State {
     /// only the damaged region is copied (partial copy, copy-on-write via
     /// [`build_pixel_block`]). The copy is a memcpy on the dispatch thread — *not*
     /// the frame path (I-1).
+    ///
+    /// **xdg-shell lifecycle (T5).** For a surface carrying the toplevel role
+    /// this is where the protocol's rules are enforced, in order: a buffer on a
+    /// surface that has not acked its configure is a protocol error and maps
+    /// nothing; the first buffer commit maps the toplevel at its C10 placement;
+    /// a null attach unmaps it and rearms the initial-configure dance; and any
+    /// commit that leaves the toplevel unconfigured is answered with a
+    /// `configure`.
     fn commit(&mut self, surface: &WlSurface) {
         let Some(&sid) = self.obj_to_surface.get(&surface.id()) else {
             return;
@@ -377,6 +612,23 @@ impl CompositorHandler for State {
             )
         });
 
+        // The xdg gate: a toplevel may not commit a buffer before acking its
+        // initial configure. `ensure_configured` posts the protocol error and
+        // returns false, in which case this commit maps nothing — the client is
+        // being disconnected anyway. (Smithay posts `xdg_surface.not_constructed`
+        // where the spec's dedicated code is `unconfigured_buffer`; the
+        // `xdg_surface` object is not reachable through Smithay's public API, so
+        // we take its code. Documented in `docs/scene_graph_v1.md` §10.)
+        if matches!(assignment, Some(BufferAssignment::NewBuffer(_)))
+            && let Some(entry) = self.toplevels.get(&obj)
+            && !entry.toplevel.ensure_configured()
+        {
+            return;
+        }
+
+        // Set by the null-attach arm; consumed after the configure check below.
+        let mut unmapped = false;
+
         match assignment {
             Some(BufferAssignment::NewBuffer(buffer)) => {
                 // Buffer==surface coordinates in M1 (no scale/transform yet); this
@@ -386,13 +638,28 @@ impl CompositorHandler for State {
                 match build_pixel_block(&buffer, prev, &damage_rects) {
                     Ok(Some((block, opaque, content_damage, bytes))) => {
                         self.bytes_copied.fetch_add(bytes, Ordering::Relaxed);
-                        self.surface_pixels.insert(obj, block.clone());
+                        self.surface_pixels.insert(obj.clone(), block.clone());
                         let size = (block.width, block.height);
                         let source = TextureSource::Shm(block);
-                        // Buffer defines pixel size; placement is separate (test
-                        // setters now, xdg-shell in T5). Only owned `Send` data
+                        // The mapping commit (first content on a toplevel) also
+                        // carries the C10 placement; later commits must not touch
+                        // geometry, or every frame would damage the whole extent.
+                        let placement = match self.toplevels.get_mut(&obj) {
+                            Some(entry) if !entry.mapped => {
+                                entry.mapped = true;
+                                Some(entry.placement)
+                            }
+                            _ => None,
+                        };
+                        // Buffer defines pixel size. Only owned `Send` data
                         // crosses to the scene, which computes the frame damage.
                         self.scene.mutate(move |s| {
+                            if let Some((dx, dy)) = placement {
+                                // Set while the node is still invisible (no source
+                                // yet) so this raises no damage of its own; the
+                                // attach below damages the mapped extent.
+                                s.set_geometry(sid, Transform::Translate { dx, dy }, size);
+                            }
                             s.attach_content(sid, size, source, opaque, content_damage);
                         });
                     }
@@ -407,13 +674,41 @@ impl CompositorHandler for State {
             // Null attach (`wl_surface.attach(null)`): unmap — the node loses its
             // source and becomes invisible; drop the retained block.
             Some(BufferAssignment::Removed) => {
-                self.surface_pixels.remove(&obj);
-                self.scene.mutate(move |s| s.clear_source(sid));
+                self.unmap_surface(&obj);
+                if let Some(entry) = self.toplevels.get_mut(&obj) {
+                    entry.mapped = false;
+                    unmapped = true;
+                }
             }
             // No buffer change this commit: the node keeps its current pixels.
             // Damage without a new buffer is a no-op — the content did not change,
             // so there is nothing to repaint.
             None => {}
+        }
+
+        // The initial configure, sent in response to the client's buffer-less
+        // "here I am" commit. Size 0×0 and no states means "you choose" — the core
+        // has no size policy to impose (§4 rule 4); the placement it does own is
+        // C10's cascade above.
+        if let Some(entry) = self.toplevels.get(&obj)
+            && !entry.toplevel.is_initial_configure_sent()
+        {
+            entry.toplevel.send_configure();
+        }
+
+        // Re-arm the dance *after* that check, so the unmapping commit itself
+        // earns no configure: per xdg-shell an unmapped surface must perform the
+        // initial commit/configure sequence again, and the configure belongs to
+        // that future commit, not to this one.
+        //
+        // Smithay would do this re-arming in its own commit hook, but that hook
+        // detects unmap through surface state its renderer helpers populate — and
+        // we use none of them (we supply our own renderer; that is the seam) — so
+        // it is inert for us and the core does it. See `docs/scene_graph_v1.md` §10.
+        if unmapped
+            && let Some(entry) = self.toplevels.get(&obj)
+        {
+            entry.toplevel.reset_initial_configure_sent();
         }
     }
 
@@ -421,6 +716,7 @@ impl CompositorHandler for State {
     fn destroyed(&mut self, surface: &WlSurface) {
         self.surfaces.remove(&surface.id());
         self.surface_pixels.remove(&surface.id());
+        self.toplevels.remove(&surface.id());
         if let Some(sid) = self.obj_to_surface.remove(&surface.id()) {
             self.scene.emit(ProtocolEvent::SurfaceDestroyed { surface: sid });
         }
@@ -443,6 +739,34 @@ impl BufferHandler for State {
     /// immediately, so we never hold a buffer past a commit — nothing to do here.
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
 }
+
+/// **Trait plumbing, not input.** `delegate_xdg_shell!` covers `xdg_popup`, and
+/// Smithay's popup dispatch is bounded on `D: SeatHandler` (a popup grab names a
+/// seat). So the shell cannot be delegated without this impl — even though T5
+/// implements no input at all.
+///
+/// It is deliberately inert: [`SeatState`] here holds **no seat**, because a
+/// `wl_seat` global appears only when [`Seat::new`](smithay::input::Seat::new) is
+/// called, which is **T6**'s job. Until then no seat global is advertised, no
+/// focus exists, and no callback below can fire. The focus types are `WlSurface`
+/// because that is what T6 will focus, and because Smithay implements the
+/// keyboard/pointer/touch target traits for it directly.
+impl SeatHandler for State {
+    type KeyboardFocus = WlSurface;
+    type PointerFocus = WlSurface;
+    type TouchFocus = WlSurface;
+
+    fn seat_state(&mut self) -> &mut SeatState<State> {
+        &mut self.seat_state
+    }
+}
+
+// `delegate_xdg_shell!` supplies the Dispatch/GlobalDispatch impls for
+// xdg_wm_base/xdg_surface/xdg_toplevel/xdg_popup/xdg_positioner, routing them to
+// `XdgShellState` (which validates the shell grammar, tracks configure serials,
+// and posts the role/serial protocol errors) and the `XdgShellHandler` impl
+// above. Frontend only: no renderer type crosses this seam either.
+smithay::delegate_xdg_shell!(State);
 
 // `delegate_shm!` supplies the Dispatch/GlobalDispatch impls for
 // wl_shm/wl_shm_pool/wl_buffer, routing them to `ShmState` (which validates
@@ -603,6 +927,9 @@ pub struct ProtocolHost {
     /// Running total of buffer bytes copied at commit (damage counter). Read by
     /// [`bytes_copied`](ProtocolHost::bytes_copied).
     bytes_copied: Arc<AtomicUsize>,
+    /// `xdg_wm_base.pong` replies received. Read by
+    /// [`pongs_received`](ProtocolHost::pongs_received).
+    pongs_received: Arc<AtomicUsize>,
 }
 
 impl ProtocolHost {
@@ -621,6 +948,7 @@ impl ProtocolHost {
         let present_ts = Arc::new(AtomicU32::new(0));
         let pending = Arc::new(AtomicUsize::new(0));
         let bytes = Arc::new(AtomicUsize::new(0));
+        let pongs = Arc::new(AtomicUsize::new(0));
 
         let presenter = FramePresenter {
             ping,
@@ -628,6 +956,7 @@ impl ProtocolHost {
         };
         let pending_for_thread = pending.clone();
         let bytes_for_thread = bytes.clone();
+        let pongs_for_thread = pongs.clone();
 
         let dispatch = std::thread::Builder::new()
             .name("parhelion-proto-0".into())
@@ -639,6 +968,7 @@ impl ProtocolHost {
                     present_ts,
                     pending_for_thread,
                     bytes_for_thread,
+                    pongs_for_thread,
                 )
             })
             .expect("spawn dispatch thread");
@@ -649,6 +979,7 @@ impl ProtocolHost {
             presenter,
             pending_frame_callbacks: pending,
             bytes_copied: bytes,
+            pongs_received: pongs,
         }
     }
 
@@ -679,6 +1010,24 @@ impl ProtocolHost {
     /// buffer (partial copy); the proportionality test asserts on the delta.
     pub fn bytes_copied(&self) -> usize {
         self.bytes_copied.load(Ordering::Relaxed)
+    }
+
+    /// Send `xdg_wm_base.ping` to every shell client that has a live toplevel —
+    /// the liveness half of ping/pong (T5). Asynchronous like every other control
+    /// message: this enqueues, the dispatch thread sends, and the client's `pong`
+    /// shows up in [`pongs_received`](Self::pongs_received). Nothing in the core
+    /// waits for it (I-3's spirit: no synchronous round-trip anywhere).
+    ///
+    /// M1 has no ping *scheduler* — the unresponsive-client policy (when to ping,
+    /// what to do about silence) is policy, not core, and needs S1 (M4). This
+    /// exists so the protocol side is complete and testable.
+    pub fn ping_clients(&self) {
+        let _ = self.control_tx.send(Control::PingClients);
+    }
+
+    /// Number of `xdg_wm_base.pong` replies received so far.
+    pub fn pongs_received(&self) -> usize {
+        self.pongs_received.load(Ordering::Relaxed)
     }
 }
 
@@ -841,6 +1190,7 @@ fn run_dispatch(
     present_ts: Arc<AtomicU32>,
     pending_frame_callbacks: Arc<AtomicUsize>,
     bytes_copied: Arc<AtomicUsize>,
+    pongs_received: Arc<AtomicUsize>,
 ) {
     let display: Display<State> = Display::new().expect("create wayland display");
     let dh = display.handle();
@@ -848,20 +1198,30 @@ fn run_dispatch(
     // Advertise `wl_shm`. The mandatory `argb8888`/`xrgb8888` formats are added by
     // `ShmState::new`; we request no extras (T3 handles exactly those two).
     let shm_state = ShmState::new::<State>(&dh, std::iter::empty());
+    // Advertise `xdg_wm_base` (T5) with Smithay's default wm capabilities. We
+    // implement none of the states those capabilities describe yet (maximize,
+    // fullscreen, minimize, window menu are out of scope for M1) — advertising
+    // beyond the defaults is deliberately not done here.
+    let xdg_shell_state = XdgShellState::new::<State>(&dh);
 
     let mut state = State {
         compositor_state,
         shm_state,
+        xdg_shell_state,
+        seat_state: SeatState::new(),
         dh: dh.clone(),
         next_surface_id: 0,
         next_client_key: 0,
         obj_to_surface: HashMap::new(),
         surfaces: HashMap::new(),
         surface_pixels: HashMap::new(),
+        toplevels: HashMap::new(),
+        next_toplevel_index: 0,
         scene: scene.clone(),
         present_ts,
         pending_frame_callbacks,
         bytes_copied,
+        pongs_received,
         stop: false,
     };
 
@@ -894,6 +1254,17 @@ fn run_dispatch(
                         };
                         // Insert on this thread's Display — the assignment seam.
                         let _ = state.dh.insert_client(stream, std::sync::Arc::new(data));
+                    }
+                    // One ping serial for the whole sweep; a client with several
+                    // toplevels is pinged once (the extra `send_ping`s report
+                    // "already pending" and are ignored — the ping is per shell
+                    // client, not per window). Enqueue only; the loop's single
+                    // flush site pushes it.
+                    Control::PingClients => {
+                        let serial = SERIAL_COUNTER.next_serial();
+                        for toplevel in state.xdg_shell_state.toplevel_surfaces() {
+                            let _ = toplevel.client().send_ping(serial);
+                        }
                     }
                     Control::Shutdown => state.stop = true,
                 }

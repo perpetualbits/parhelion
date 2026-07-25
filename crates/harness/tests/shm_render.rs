@@ -1,16 +1,23 @@
-//! T3 shm end-to-end golden tests: a scripted client draws pixels into a
-//! `wl_shm` buffer, attaches, and commits; the dispatch thread copies the buffer
-//! into the scene; the CPU compositor paints it over solid background nodes; and
-//! the frame is golden-compared.
+//! T3 shm end-to-end golden tests: a scripted client maps an xdg toplevel whose
+//! `wl_shm` buffer holds the pixels; the dispatch thread copies the buffer into
+//! the scene; the CPU compositor paints it over solid background nodes; and the
+//! frame is golden-compared.
 //!
-//! Governing design: `docs/scene_graph_v1.md` §3 (texture-source seam) and the
-//! T3 prompt. These exercise the *whole* shm path — client → `wl_shm` → copy at
-//! commit → scene → snapshot → blit — with tolerance-0 goldens.
+//! Governing design: `docs/scene_graph_v1.md` §3 (texture-source seam) and §10
+//! (mapping semantics). These exercise the *whole* shm path — client → `wl_shm` →
+//! copy at commit → scene → snapshot → blit — with tolerance-0 goldens.
+//!
+//! **Migrated in T5.** These tests used to commit a bare `wl_surface`, which the
+//! scene composited; a roleless surface is now never displayed (the mapping
+//! rule), so every one of them goes through `ScriptedClient::map_toplevel*` — the
+//! full configure/ack dance — instead. The *pixels* are unchanged: the first
+//! toplevel's C10 cascade placement is the output origin, exactly where the
+//! raw-commit path put the content, so the goldens did not move.
 //!
 //! Determinism: after `client.roundtrip()` the dispatch thread has already sent
-//! the `set_size`/`set_source` mutation into the scene channel (during the commit
-//! it processed before the sync reply), so a later `render.tick()` — whose
-//! `snapshot()` round-trips the same channel — observes it. No sleeps.
+//! the `set_geometry`/`attach_content` mutation into the scene channel (during
+//! the commit it processed before the sync reply), so a later `render.tick()` —
+//! whose `snapshot()` round-trips the same channel — observes it. No sleeps.
 //!
 //! To (re)create the goldens after an intended change: `UPDATE_GOLDENS=1 make test`.
 
@@ -104,13 +111,12 @@ fn raise_shm(h: &SceneHandle) {
 #[test]
 fn shm_xrgb_composites_over_solid() {
     let (scene, _host, mut client) = fixture();
-    let surface = client.create_surface();
-    let mut pool = client.create_pool((BUF * BUF * 4) as usize);
-    pool.write(&checkerboard(BUF, BUF, 255));
-    let buffer = client.create_buffer(&pool, BUF as i32, BUF as i32, ShmFormat::Xrgb8888);
-    client.attach(&surface, &buffer);
-    client.commit(&surface);
-    client.roundtrip();
+    client.map_toplevel(
+        BUF as i32,
+        BUF as i32,
+        ShmFormat::Xrgb8888,
+        &checkerboard(BUF, BUF, 255),
+    );
 
     let h = scene.handle();
     raise_shm(&h);
@@ -128,13 +134,12 @@ fn shm_xrgb_composites_over_solid() {
 #[test]
 fn shm_argb_blends_over_solid() {
     let (scene, _host, mut client) = fixture();
-    let surface = client.create_surface();
-    let mut pool = client.create_pool((BUF * BUF * 4) as usize);
-    pool.write(&checkerboard(BUF, BUF, 128));
-    let buffer = client.create_buffer(&pool, BUF as i32, BUF as i32, ShmFormat::Argb8888);
-    client.attach(&surface, &buffer);
-    client.commit(&surface);
-    client.roundtrip();
+    client.map_toplevel(
+        BUF as i32,
+        BUF as i32,
+        ShmFormat::Argb8888,
+        &checkerboard(BUF, BUF, 128),
+    );
 
     let h = scene.handle();
     raise_shm(&h);
@@ -153,15 +158,14 @@ fn shm_argb_blends_over_solid() {
 #[test]
 fn single_buffer_reuse_second_frame_visible() {
     let (scene, _host, mut client) = fixture();
-    let surface = client.create_surface();
-    let mut pool = client.create_pool((BUF * BUF * 4) as usize);
 
-    // Frame 1: the checkerboard.
-    pool.write(&checkerboard(BUF, BUF, 255));
-    let buffer = client.create_buffer(&pool, BUF as i32, BUF as i32, ShmFormat::Xrgb8888);
-    client.attach(&surface, &buffer);
-    client.commit(&surface);
-    client.roundtrip();
+    // Frame 1: map the window showing the checkerboard.
+    let mut win = client.map_toplevel(
+        BUF as i32,
+        BUF as i32,
+        ShmFormat::Xrgb8888,
+        &checkerboard(BUF, BUF, 255),
+    );
     assert_eq!(
         client.buffer_releases(),
         1,
@@ -170,9 +174,9 @@ fn single_buffer_reuse_second_frame_visible() {
 
     // Frame 2: rewrite the SAME buffer's memory to solid green, re-attach it, and
     // commit again — the single-buffer pattern the immediate release enables.
-    pool.write(&solid(BUF, BUF, [0, 200, 0]));
-    client.attach(&surface, &buffer);
-    client.commit(&surface);
+    win.pool.write(&solid(BUF, BUF, [0, 200, 0]));
+    client.attach(&win.surface, &win.buffer);
+    client.commit(&win.surface);
     client.roundtrip();
     assert_eq!(
         client.buffer_releases(),
@@ -193,16 +197,15 @@ fn single_buffer_reuse_second_frame_visible() {
 #[test]
 fn destroy_buffer_after_commit_is_safe() {
     let (scene, _host, mut client) = fixture();
-    let surface = client.create_surface();
-    let mut pool = client.create_pool((BUF * BUF * 4) as usize);
-    pool.write(&checkerboard(BUF, BUF, 255));
-    let buffer = client.create_buffer(&pool, BUF as i32, BUF as i32, ShmFormat::Xrgb8888);
-    client.attach(&surface, &buffer);
-    client.commit(&surface);
-    client.roundtrip();
+    let win = client.map_toplevel(
+        BUF as i32,
+        BUF as i32,
+        ShmFormat::Xrgb8888,
+        &checkerboard(BUF, BUF, 255),
+    );
 
     // Destroy the buffer the compositor already copied and released.
-    buffer.destroy();
+    win.buffer.destroy();
     client.roundtrip();
 
     let h = scene.handle();

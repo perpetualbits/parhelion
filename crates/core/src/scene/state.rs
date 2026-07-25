@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use crate::scene::node::{ClientKey, SceneNode, SurfaceId, TextureSource, Transform};
+use crate::scene::node::{ClientKey, NodeRole, SceneNode, SurfaceId, TextureSource, Transform};
 use crate::scene::region::{Rect, Region};
 use crate::scene::snapshot::{Snapshot, SnapshotDamage, SnapshotNode};
 
@@ -52,8 +52,9 @@ pub enum ContentDamage {
 /// Every variant carries only `Send` core tokens ([`SurfaceId`], [`ClientKey`])
 /// so it crosses the thread boundary freely and the scene never sees a protocol
 /// object. This is the grown successor to M0's `LedgerMsg`; the visual state
-/// (geometry, source) is *not* here because in M1 it comes from tests standing
-/// in for T3/T5, not from the wire (see the setters below).
+/// (role, geometry, source, title) is *not* here because it is not `Copy` and
+/// arrives through the closure setters below instead — the dispatch thread calls
+/// them from its shm (T3) and xdg-shell (T5) paths, as do tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolEvent {
     /// A surface was created by the given client.
@@ -275,6 +276,39 @@ impl Scene {
         }
     }
 
+    /// Set a node's role (T5) — which decides whether it may be displayed at all
+    /// (see [`NodeRole`]). Damages old ∪ new extent because a role change can
+    /// flip visibility in both directions: assigning a role to a surface that
+    /// already has a source maps it, and clearing the role back to
+    /// [`NodeRole::None`] (an `xdg_toplevel.destroy` that leaves the `wl_surface`
+    /// alive) unmaps it. No-op if the surface is absent.
+    pub fn set_role(&mut self, surface: SurfaceId, role: NodeRole) {
+        let old = self.extent_of(surface);
+        if let Some(node) = self.nodes.get_mut(&surface) {
+            node.role = role;
+        }
+        let new = self.extent_of(surface);
+        self.damage_rect(old);
+        self.damage_rect(new);
+    }
+
+    /// Record a toplevel's `xdg_toplevel.set_title`. Pure metadata: nothing in
+    /// the core branches on it and it damages nothing. No-op if the surface is
+    /// absent or is not a toplevel.
+    pub fn set_title(&mut self, surface: SurfaceId, title: Option<String>) {
+        if let Some(NodeRole::Toplevel(t)) = self.nodes.get_mut(&surface).map(|n| &mut n.role) {
+            t.title = title;
+        }
+    }
+
+    /// Record a toplevel's `xdg_toplevel.set_app_id`. Pure metadata, as
+    /// [`set_title`](Self::set_title). No-op if absent or not a toplevel.
+    pub fn set_app_id(&mut self, surface: SurfaceId, app_id: Option<String>) {
+        if let Some(NodeRole::Toplevel(t)) = self.nodes.get_mut(&surface).map(|n| &mut n.role) {
+            t.app_id = app_id;
+        }
+    }
+
     /// Set a node's stacking order (higher composites on top). A restack changes
     /// what is visible within the node's extent, so damage it. No-op if absent.
     pub fn set_z(&mut self, surface: SurfaceId, z: i32) {
@@ -356,6 +390,7 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scene::node::ToplevelRole;
 
     // ----- Migrated M0 ledger lifecycle tests (the ledger died; its behaviour
     // lives on here, now asserted against Scene). -----
@@ -414,6 +449,8 @@ mod tests {
 
     /// A created surface with no geometry/source is live but invisible — it
     /// contributes no snapshot node (a surface is silent until it "attaches").
+    /// And, from T5, geometry + source are **not enough**: a roleless surface is
+    /// never displayed (the mapping-semantics rule).
     #[test]
     fn created_surface_is_invisible_until_configured() {
         let mut s = Scene::new();
@@ -427,7 +464,55 @@ mod tests {
 
         s.set_geometry(surf, Transform::Translate { dx: 5, dy: 5 }, (10, 10));
         s.set_source(surf, TextureSource::Solid([1, 2, 3, 255]), true);
-        assert_eq!(s.snapshot().len(), 1, "visible once geometry+source set");
+        assert!(
+            s.snapshot().is_empty(),
+            "still invisible: a surface with no role is never displayed (T5)"
+        );
+
+        s.set_role(surf, NodeRole::Toplevel(ToplevelRole::default()));
+        assert_eq!(s.snapshot().len(), 1, "visible once it also has a role");
+    }
+
+    /// The role gate both ways: clearing a mapped toplevel's role back to `None`
+    /// (its `xdg_toplevel` destroyed while the `wl_surface` lives on) unmaps it.
+    #[test]
+    fn clearing_the_role_unmaps() {
+        let mut s = Scene::new();
+        let surf = SurfaceId(1);
+        s.apply(ProtocolEvent::SurfaceCreated {
+            surface: surf,
+            client: ClientKey(0),
+        });
+        s.set_role(surf, NodeRole::Toplevel(ToplevelRole::default()));
+        s.set_geometry(surf, Transform::Identity, (4, 4));
+        s.set_source(surf, TextureSource::Solid([1, 2, 3, 255]), true);
+        assert_eq!(s.snapshot().len(), 1);
+
+        s.set_role(surf, NodeRole::None);
+        assert!(s.snapshot().is_empty(), "role cleared → unmapped");
+        assert_eq!(s.surface_count(), 1, "the node itself is still live");
+    }
+
+    /// Title and app_id are recorded on the toplevel role and nothing else
+    /// changes — they are metadata, not behaviour (T5).
+    #[test]
+    fn title_and_app_id_are_recorded_on_the_role() {
+        let mut s = Scene::new();
+        let surf = SurfaceId(1);
+        s.apply(ProtocolEvent::SurfaceCreated {
+            surface: surf,
+            client: ClientKey(0),
+        });
+        // Before a role exists the setters are harmless no-ops.
+        s.set_title(surf, Some("ignored".into()));
+        assert_eq!(s.get(surf).unwrap().role, NodeRole::None);
+
+        s.set_role(surf, NodeRole::Toplevel(ToplevelRole::default()));
+        s.set_title(surf, Some("parhelion".into()));
+        s.set_app_id(surf, Some("org.parhelion.Test".into()));
+        let role = s.get(surf).unwrap().role.toplevel().expect("toplevel role");
+        assert_eq!(role.title.as_deref(), Some("parhelion"));
+        assert_eq!(role.app_id.as_deref(), Some("org.parhelion.Test"));
     }
 
     /// The snapshot is sorted back-to-front by z (ascending), ties by SurfaceId.
@@ -442,6 +527,9 @@ mod tests {
                 surface: id,
                 client: ClientKey(0),
             });
+            // Core-injected nodes (as the harness places them): displayable
+            // without a client role.
+            s.set_role(id, NodeRole::CoreOwned);
             s.set_geometry(id, Transform::Identity, (4, 4));
             s.set_source(id, TextureSource::Solid([id.0 as u8, 0, 0, 255]), true);
             s.set_z(id, z);
@@ -471,6 +559,7 @@ mod tests {
             surface: surf,
             client: ClientKey(0),
         });
+        s.set_role(surf, NodeRole::CoreOwned);
         s.set_geometry(surf, Transform::Identity, (4, 4));
         s.set_source(surf, TextureSource::Solid([10, 20, 30, 255]), true);
 

@@ -55,6 +55,9 @@ pub struct CpuCompositor {
     frame: Frame,
     /// The colour every frame starts from before nodes are drawn, `[r,g,b,a]`.
     clear: [u8; 4],
+    /// Set by [`resize`](Self::resize): the retained frame is gone, so the next
+    /// composite must repaint everything regardless of what damage it is handed.
+    force_full: bool,
 }
 
 impl CpuCompositor {
@@ -64,7 +67,28 @@ impl CpuCompositor {
         CpuCompositor {
             frame: Frame::new(width, height),
             clear,
+            // Nothing has been painted yet, so the first composite must be full
+            // even if the scene offers a region — the same reason a resize does.
+            force_full: true,
         }
+    }
+
+    /// Resize the output (T6: the nested backend's window changed size).
+    ///
+    /// The retained frame cannot survive this — its pixels describe a different
+    /// geometry — so the next composite repaints in full whatever damage the
+    /// snapshot carries. Keeping that guarantee *here* rather than asking the
+    /// caller to also damage the scene means a resize cannot produce a torn frame
+    /// through someone forgetting half of the contract.
+    ///
+    /// A no-op if the size is unchanged, so a window manager that resends the
+    /// same size does not cost a full repaint.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if self.frame.width() == width && self.frame.height() == height {
+            return;
+        }
+        self.frame = Frame::new(width, height);
+        self.force_full = true;
     }
 
     /// The current frame — the result of the most recent `composite` (or a blank
@@ -79,7 +103,15 @@ impl Compositor for CpuCompositor {
         let (fw, fh) = (self.frame.width() as i32, self.frame.height() as i32);
         let frame_rect = Rect::new(0, 0, fw, fh);
 
-        match &snapshot.damage {
+        // A fresh or just-resized frame has no retained content to be incremental
+        // against, so it repaints in full whatever the snapshot asked for.
+        let damage = if std::mem::take(&mut self.force_full) {
+            &SnapshotDamage::Full
+        } else {
+            &snapshot.damage
+        };
+
+        match damage {
             // Full damage: repaint the whole frame (first frame / fallback).
             SnapshotDamage::Full => {
                 let nodes = self.paint_rect(snapshot, frame_rect);

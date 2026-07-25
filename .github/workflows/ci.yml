@@ -4,12 +4,29 @@
 # `CLAUDE.md` ("Test before declaring done" → `make test` = workspace tests +
 # clippy -D warnings). This is the M0 skeleton: one job, one gate.
 #
-# NO system-package (apt) step exists, on purpose. Per the Smithay spike
+# SYSTEM PACKAGES: exactly one, and it is worth explaining why.
+#
+# The original rule here was "no apt step, on purpose": per the Smithay spike
 # (`docs/smithay_threading_spike.md` §1) the protocol layer uses the pure-Rust
-# wayland-backend and needs no libwayland; and this milestone's harness uses no
-# Smithay at all — only the pure-Rust `png` codec. The runner therefore needs
-# nothing beyond a Rust toolchain. When a real DRM/KMS backend arrives (M2), the
-# hardware-touching tests get their own job with the packages they need.
+# wayland-backend and needs no libwayland, and the harness uses only the
+# pure-Rust `png` codec. That rule earned its exception at M1 T6.
+#
+# `libxkbcommon` is now a **stated** dependency:
+#
+#   - `wl_keyboard` cannot be implemented without an xkb keymap — the protocol
+#     requires the compositor to send one — and xkbcommon is the library that
+#     compiles it. There is no pure-Rust equivalent in the ecosystem we depend on.
+#   - It was in fact already being linked *implicitly*: Smithay depends on the
+#     `xkbcommon` crate unconditionally, so every test binary has linked
+#     `libxkbcommon.so.0` since the protocol layer landed. CI passed because
+#     `ubuntu-latest` happens to ship the library — luck, not contract. Installing
+#     it explicitly converts that luck into a stated requirement, which is the
+#     actual change here.
+#
+# Everything else still holds: no libwayland, no GPU packages, no display server.
+# When the DRM/KMS backend arrives (M2) the hardware-touching tests get their own
+# job with the packages they need; the nested winit backend is *built* here but
+# never run, since it needs a display.
 name: CI
 
 on:
@@ -30,6 +47,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # The one system dependency (see the header): xkbcommon, for wl_keyboard's
+      # keymap. `-dev` because the crate links against it at build time.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libxkbcommon-dev
 
       # Stable toolchain with clippy — `make test` runs `cargo clippy` with
       # warnings denied, so the clippy component is required.

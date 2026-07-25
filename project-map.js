@@ -22,7 +22,7 @@ window.PROJECT_MAP = {
     tagline:
       "A Wayland compositor built as a 3D-native scene-graph engine with microkernel discipline — a small realtime core ringed by isolated, restartable, capability-scoped processes.",
     repo: "github.com/perpetualbits/parhelion",
-    updated: "2026-07-24",
+    updated: "2026-07-25",
   },
 
   // Four reserved states. Each ships with a glyph + label so meaning never
@@ -122,13 +122,22 @@ window.PROJECT_MAP = {
       deps: ["protocol-host", "scene-graph"],
     },
     {
-      id: "seat-input", label: "wl_seat (kbd + pointer)", layer: "protocol", status: "active",
+      id: "seat-input", label: "wl_seat (kbd + pointer)", layer: "protocol", status: "done",
       tags: ["M1", "T6"],
-      desc: "Input delivery to the focused client: keyboard and pointer via wl_seat, with focus following the topmost mapped toplevel as a temporary core fallback. Input must never wait on rendering (I-2).",
-      files: [],
-      specs: [{ label: "M1 tasks — T6", href: "docs/plans/m1_tasks.md" }],
-      parts: [],
-      deps: ["protocol-host", "winit"],
+      desc: "Input delivery to the focused client: keyboard and pointer via wl_seat, with focus following the topmost mapped toplevel as a temporary core fallback. Every source — the nested backend, the test rig, and later libinput — produces the same InputEvent and hands it to the dispatch thread, which owns the seat. Routing reads a dispatch-side replica of the scene's geometry rather than querying the scene, so input never waits on rendering (I-2).",
+      files: ["crates/core/src/input.rs", "crates/core/src/protocol.rs"],
+      specs: [
+        { label: "scene_graph_v1.md §11", href: "docs/scene_graph_v1.md" },
+        { label: "M1 tasks — T6", href: "docs/plans/m1_tasks.md" },
+      ],
+      parts: [
+        { label: "Seat + keymap", status: "done", desc: "wl_seat with keyboard and pointer capabilities; an xkb 'us' keymap delivered to each client." },
+        { label: "The input funnel", status: "done", desc: "One InputEvent enum, evdev codes, no Smithay type — a non-blocking message into the dispatch thread." },
+        { label: "Focus routing table", status: "done", desc: "Read-mostly replica of rect + stacking per mapped surface; ordering matches the snapshot's draw order." },
+        { label: "Focus policy (C10)", status: "done", desc: "Keyboard follows the topmost mapped toplevel; pointer follows the cursor. Temporary — S1 takes over in M4." },
+        { label: "Cursor surfaces", status: "planned", desc: "set_cursor is accepted and ignored for rendering; the cursor plane is M2." },
+      ],
+      deps: ["protocol-host", "xdg-shell"],
     },
     {
       id: "frame-callbacks", label: "Frame callbacks & flush", layer: "protocol", status: "done",
@@ -278,13 +287,36 @@ window.PROJECT_MAP = {
       deps: [],
     },
     {
-      id: "winit", label: "winit nested backend", layer: "backend", status: "active",
+      id: "winit", label: "winit nested backend", layer: "backend", status: "done",
       tags: ["M1", "T6"],
-      desc: "A development backend that presents the core's CPU frames in a window and feeds window input into the input path — a window Roland can actually see, without needing real hardware.",
-      files: [],
-      specs: [{ label: "M1 tasks — T6", href: "docs/plans/m1_tasks.md" }],
-      parts: [],
-      deps: ["cpu-compositor"],
+      desc: "A development backend that presents the core's CPU frames in a window and feeds window input into the input path — a window Roland can actually see, without needing real hardware. Raw winit + softbuffer, deliberately not Smithay's winit backend (which is welded to the renderer layer we bypass). Ships parhelion-dev: the window plus a real Wayland socket for external clients.",
+      files: ["crates/backend-winit/"],
+      specs: [
+        { label: "scene_graph_v1.md §11.4", href: "docs/scene_graph_v1.md" },
+        { label: "M1 tasks — T6", href: "docs/plans/m1_tasks.md" },
+      ],
+      parts: [
+        { label: "Window + presentation", status: "done", desc: "softbuffer blit of the retained frame; one documented channel-order conversion." },
+        { label: "Input translation", status: "done", desc: "winit keys → evdev (unmapped keys counted, never fatal), buttons, motion, and scroll into the funnel." },
+        { label: "Resize", status: "done", desc: "Window resize → output resize + full damage; the compositor holds the repaint guarantee itself." },
+        { label: "parhelion-dev + socket", status: "done", desc: "The thin dev binary; the listening socket lives in the core so it is testable without a display." },
+      ],
+      deps: ["cpu-compositor", "seat-input"],
+    },
+    {
+      id: "t-input", label: "T-input thread", layer: "backend", status: "seam",
+      tags: ["M1", "M2", "§7"],
+      desc: "CORE-BOUNDARY §7 gives input its own thread. M1 has its INTERFACE but not its thread: winit's event loop must own the main thread and delivers input intake and presentation together, so in the nested backend that loop is T-input. The funnel it feeds is already the seam a real T-input pushes into — libinput on its own thread (M2) becomes a third producer of an existing shape, and nothing downstream changes. A bounded, recorded deviation, not a redesign.",
+      files: ["crates/core/src/input.rs"],
+      specs: [
+        { label: "scene_graph_v1.md §11.2", href: "docs/scene_graph_v1.md" },
+        { label: "CORE-BOUNDARY §7", href: "docs/CORE-BOUNDARY.md" },
+      ],
+      parts: [
+        { label: "InputEvent funnel", status: "done", desc: "The interface: every source produces it, the dispatch thread applies it." },
+        { label: "Dedicated thread", status: "planned", desc: "Arrives with libinput and the DRM backend (M2)." },
+      ],
+      deps: ["seat-input"],
     },
     {
       id: "drm", label: "DRM/KMS + libinput", layer: "backend", status: "planned",
@@ -356,6 +388,8 @@ window.PROJECT_MAP = {
         { label: "Scene-render goldens", status: "done", desc: "Stacking, clipping, snapshot isolation (M1 T1)." },
         { label: "Toplevel dance helper", status: "done", desc: "map_toplevel drives the whole xdg mapping sequence, so every test reads as 'a window' (M1 T5)." },
         { label: "Protocol-error assertions", status: "done", desc: "Tests pin the specific error code, never merely a disconnect (M1 T5)." },
+        { label: "Input injection", status: "done", desc: "Scripted seat events through the production funnel; one ordered event log, because ordering is what the tests check (M1 T6)." },
+        { label: "Socket tests", status: "done", desc: "A real client over a real listening socket — the dev binary's plumbing, verified without a display (M1 T6)." },
       ],
       deps: [],
     },

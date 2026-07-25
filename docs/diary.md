@@ -470,3 +470,69 @@ guards. This closes M0.
   golden rig. `make test`: 69 tests green (+13), clippy clean; goldens re-blessed:
   none. New golden `xdg_cascade`, verified to reject a one-pixel placement drift.
   `#harness` `#core`
+
+## M1 T6 — input, and a window Roland can actually look at
+
+- **The funnel was the whole design.** One `InputEvent` enum, evdev codes at both
+  ends, no Smithay type anywhere near it — and suddenly winit and the test rig are
+  the same producer as far as the core is concerned. That means CI exercises the
+  production input path rather than a test-shaped imitation of it, and it means
+  M2's libinput arrives as a third producer of an existing shape instead of a
+  second implementation of input. Everything else in this task was plumbing
+  hanging off that one decision. `#input` `#design-decision`
+
+- **The §7 deviation, said out loud.** winit owns the main thread and hands you
+  input and presentation through the same loop; there is no arrangement in which a
+  nested backend gets a separate T-input. So M1 has T-input's *interface* and not
+  its *thread*, and the doc says exactly that: what the pure model wants, what
+  winit forces, why it is bounded (protocol objects still have one owner; the
+  funnel is already the seam), and what replaces it (libinput + DRM, M2). Writing
+  "we deviate here, for this reason, until then" costs a paragraph. Discovering an
+  undocumented deviation two milestones later costs a week. `#tradeoff` `#invariant`
+
+- **Roland picked the replica over the query, and I'm glad.** I'd flagged both:
+  ask the scene thread per pointer motion (one source of truth, but a synchronous
+  cross-thread round-trip on the input path that can queue behind a snapshot) or
+  keep a small read-mostly replica on the dispatch thread. §7 already names the
+  replica for T-input, and I-2 is explicitly about input not waiting on rendering
+  — the query would have been a slow-motion violation of an invariant we wrote
+  down ourselves. The replica costs two fields kept in step, in one function.
+  `#design-decision` `#invariant`
+
+- **The bug that looked like nothing.** Smithay's pointer API wants the focused
+  surface's *origin in global space*; I passed the cursor's *surface-local*
+  position. Both are `(f64, f64)`, both type-check, and the result is every
+  `enter` reporting (0,0) — which reads like "hit-testing works, coordinates are
+  just zero" rather than "you passed the wrong quantity". Fixed by making
+  `FocusMap::at` return a `Hit { origin, local }` so the two can never be
+  confused again. A tuple was the actual defect; the compiler could not help until
+  the names existed. `#bug` `#discovery`
+
+- **The keycode table earns its tradeoff tag.** winit `KeyCode` → evdev is a
+  hand-written match covering the standard typing set. Unmapped keys are dropped
+  and *counted* — a media key must not kill the compositor, and a silent drop is
+  indistinguishable from a broken input path when someone reports "my keyboard
+  does nothing". The table is deliberately not exhaustive: M2's libinput hands us
+  evdev codes directly and deletes this file rather than growing it. `#tradeoff`
+
+- **CI's "first" system dependency was already there.** The proud comment said no
+  apt step, on purpose. Then I ran `ldd` on a test binary: `libxkbcommon.so.0`,
+  linked since the protocol layer landed, because Smithay depends on the xkbcommon
+  crate unconditionally. CI has been passing on the fact that `ubuntu-latest`
+  ships it. So the apt step doesn't *add* a dependency, it converts luck into a
+  contract — and the comment now says so instead of claiming a purity we lost
+  months ago without noticing. `#discovery` `#ci`
+
+- **What I could and could not verify.** Headlessly: everything except the window
+  — 7 input rig tests, 2 socket tests over a real Unix socket with real clients,
+  the keycode table, the softbuffer conversion. Then I launched `parhelion-dev`
+  for four seconds on this machine: it bound `wayland-3`, printed it, accepted a
+  connection, and stayed up. What I cannot check is what the window *looked like*
+  — that Roland's eyes have to do. Stating the boundary beats implying I saw
+  pixels I never saw. `#backend`
+
+- **A small honest wart.** SIGTERM leaves the socket and lock files behind (no
+  handler, so `Drop` never runs); a clean window-close unlinks them properly, and
+  wayland-server's lock protocol makes a stale socket harmless on the next bind.
+  Noted rather than fixed: signal handling in the dev binary is not M1's business.
+  `make test`: 89 tests green (+20), clippy clean, goldens untouched. `#backend`

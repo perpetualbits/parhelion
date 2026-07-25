@@ -3,8 +3,8 @@
 > **Re-entrancy header.**
 > **Status:** Draft v0.1 · **Date:** 2026-07-24 · **Kind:** subsystem design (the scene graph, render loop, and snapshot mechanism).
 > **Upstream:** `VISION.md` Theses 1 & 3; `CORE-BOUNDARY.md` §3 (C4 scene graph, C5 render loop), §7 (threading), §10.3 (snapshot representation — open); `docs/plans/m1_tasks.md` T1.
-> **Downstream:** T2 (frame callbacks / flush ownership / backpressure — landed, §8), T3 (wl_shm → real `Shm` source — landed, §3.1), T4 (damage tracking — landed, §9), T5 (xdg-shell, roles, and the mapping-semantics migration — landed, §10), T6 (input/winit).
-> **Canonical for:** `crates/core/src/scene/`, `crates/core/src/render.rs`, and the CPU compositor in `crates/backend-headless/src/composite.rs`.
+> **Downstream:** T2 (frame callbacks / flush ownership / backpressure — landed, §8), T3 (wl_shm → real `Shm` source — landed, §3.1), T4 (damage tracking — landed, §9), T5 (xdg-shell, roles, and the mapping-semantics migration — landed, §10), T6 (seat/input, focus, and the nested winit backend — landed, §11).
+> **Canonical for:** `crates/core/src/scene/`, `crates/core/src/input.rs`, `crates/core/src/render.rs`, the protocol frontend's scene/input edges in `crates/core/src/protocol.rs`, and the backends in `crates/backend-headless/` and `crates/backend-winit/`.
 > **Change control:** this document is the single canonical scene-graph doc (CLAUDE.md: one doc per subsystem). It supersedes the M0 ledger's role; the ledger is gone.
 
 ---
@@ -487,12 +487,163 @@ its content.
   test, and the null-attach rig test. Scene-injected (`place_solid`) tests are
   untouched by design.
 
-## 11. What later tasks add here
+## 11. Input, focus, and the nested backend (T6)
 
-| Task | Adds to the scene graph |
-|------|-------------------------|
-| **T6** | Seat/input; focus = topmost mapped toplevel (temporary C10 policy); the winit nested backend presenting these frames. |
+T5 gave the compositor windows. T6 gives it a user: a `wl_seat` with keyboard and
+pointer, a focus policy, and a desktop window that shows the composited scene and
+feeds real input into it.
 
-Anything requiring 3D transform math, `presentation-time`, opaque-region occlusion
-culling (M5), or persistent snapshot sharing (§10.3) is out of scope until
-explicitly scheduled.
+**Canonical for:** [`input`](../crates/core/src/input.rs) (the funnel and the focus
+routing table), the seat and input application in
+[`protocol`](../crates/core/src/protocol.rs), and the whole of
+[`crates/backend-winit`](../crates/backend-winit/).
+
+### 11.1 One funnel, two producers
+
+Every input source produces the same value — [`InputEvent`] — and hands it to
+`ProtocolHost::input`, which is a **message into the dispatch thread**. The
+dispatch thread, still the only thread that touches Wayland objects (§8.1,
+unchanged), applies it to the Smithay seat handles.
+
+```
+   winit event loop ─┐
+   (nested backend)  │   InputEvent          ┌────────────────────────┐
+                     ├──(control channel)───▶│  T-proto[0] (dispatch) │
+   test rig ─────────┘   non-blocking        │  seat handles:         │
+   (ProtocolHost::input)                     │  keyboard.input(),     │
+                                             │  pointer.motion/button │
+                                             │  /axis + frame         │
+                                             └────────────────────────┘
+```
+
+The funnel names **no Smithay type**: key codes are Linux evdev codes, buttons
+are `BTN_*` codes, coordinates are output-space `f64`s. Backends depend on the
+core and must not learn the protocol library's vocabulary — the same rule that
+keeps `Frame` out of the core. It also means the rig injects events through
+exactly the production path, so what CI exercises is what runs.
+
+### 11.2 The §7 deviation — winit owns the main thread
+
+`CORE-BOUNDARY.md` §7 gives input its own thread (T-input). **M1 does not have
+one**, and this is the honest statement of why:
+
+- **What the pure model says:** T-input owns input devices and the focus routing
+  table; T-render owns presentation; they are separate threads.
+- **What winit forces:** its event loop must run on the main thread and delivers
+  *both* input intake and window presentation through that one loop. A nested
+  backend cannot split them.
+- **What we did:** in the nested backend, that single loop is "T-input" — it
+  translates events into the funnel and drives the render tick.
+- **Why it is bounded, not a redesign:** the *interface* a real T-input needs
+  already exists and is already the only way in (the funnel); protocol objects
+  are still touched only by the dispatch thread, so §7's actual ownership rule is
+  intact; and it applies to the *development* backend alone.
+- **What replaces it:** libinput on its own thread with the DRM backend, **M2**.
+  It produces the same `InputEvent`s, and nothing downstream changes.
+
+### 11.3 Focus, hit-testing, and the read-mostly replica
+
+Two C10 fallback policies, both loudly temporary (S1 replaces them in M4):
+
+- **Keyboard focus = the topmost mapped toplevel**, recomputed on every map and
+  unmap. A re-focus that would change nothing sends nothing.
+- **Pointer focus = the topmost mapped surface under the cursor**, with
+  enter/leave on crossings and surface-local coordinates.
+
+Both read a [`FocusMap`] — **a read-mostly replica**, owned by the dispatch
+thread, of just enough scene geometry (rect + z per mapped surface) to answer
+"who is on top?" and "who is under the cursor?".
+
+**Why a replica rather than querying the scene.** Asking the scene thread on
+every pointer motion is a synchronous cross-thread round-trip *on the input
+path*, and it can queue behind the render thread's snapshot request — which is
+exactly the coupling **I-2** forbids ("input delivery MUST NOT wait on
+rendering"). §7 names this pattern for T-input directly: "focus routing table
+(read-mostly replica of canonical focus)". The scene stays canonical (I-5); the
+replica is derived and reconstructible, updated by the same dispatch-thread code
+that publishes the map/unmap/resize to the scene, so it cannot drift without that
+code being wrong about what it just said.
+
+The replica's ordering (ascending `z`, ties by `SurfaceId`) is **the snapshot's
+draw order**, deliberately. If the two disagreed, input would land on a window the
+user cannot see.
+
+The T5 rule extends here for free: only mapped toplevels are in the table, so a
+roleless or unmapped surface receives no focus, no keys, and no pointer events —
+what cannot be seen cannot be clicked.
+
+**A coordinate trap, recorded.** Smithay's pointer API is given the focused
+surface's **origin in global space** and derives the client's surface-local
+coordinates itself. Passing the local position instead type-checks and produces
+plausible-looking output (`(0, 0)` at every enter). `FocusMap::at` therefore
+returns a [`Hit`] naming `origin` and `local` separately rather than one bare
+tuple — the bug is easy to write once and impossible to see afterwards.
+
+### 11.4 The nested backend (`crates/backend-winit`)
+
+Raw winit + softbuffer, **not** `smithay::backend::winit` (which is welded to
+Smithay's GLES renderer, the layer the threading-fit decision bypasses):
+
+- **Presentation.** The retained `Frame` (tightly-packed RGBA8) is converted to
+  softbuffer's `0x00RRGGBB` `u32` layout — one function, one channel-order
+  comment, its own unit tests. Alpha is dropped: the window is opaque and the
+  frame is already flattened against its clear colour.
+- **Resize.** Window resize → `CpuCompositor::resize` (which forces the next
+  composite to be full — its retained pixels describe the old geometry) **and**
+  `Scene::damage_full`. The compositor holds that guarantee itself so a resize
+  cannot tear through someone implementing only half the contract. The headless
+  output keeps its fixed size, so goldens are untouched.
+- **Keycodes.** winit `KeyCode` → evdev is a table in the backend (the core knows
+  only evdev). It covers the standard typing set; **unmapped keys are dropped and
+  counted**, never fatal — a media key must not take the compositor down, and a
+  counter keeps the gap visible instead of silent. M2's libinput delivers evdev
+  codes directly and makes the table unnecessary rather than bigger.
+- **The socket.** `ProtocolHost::listen_auto` / `listen_at` bind a real Wayland
+  socket and admit connections through the same seam as the rig's socketpairs.
+  Living in the core (not the binary) is what makes it testable without a
+  display — `harness/tests/socket.rs` drives a real client over a real socket.
+- **`parhelion-dev`.** The thin binary: scene + host + render loop + window +
+  socket, printing its `WAYLAND_DISPLAY`. All logic is in the libraries.
+
+**The cursor.** Client `set_cursor` requests are accepted and ignored for
+rendering: in nested mode the host desktop draws the cursor, and the hardware
+cursor plane is M2 (C1). Accepting the request is not a protocol violation; the
+client's chosen shape simply is not shown yet.
+
+**Key repeat.** `repeat_info` is advertised (600 ms / 25 Hz). The compositor
+generates no repeat events — since `wl_keyboard` v4 the protocol makes repeat the
+client's job — so those two constants are the whole implementation, and that is
+correct rather than missing.
+
+### 11.5 T6 tests
+
+- **`input` unit tests** (`core::input`): hit-testing (surface-local coordinates,
+  half-open far edges), stacking resolution matching draw order, unmapped
+  surfaces unroutable, empty-map behaviour.
+- **`harness/tests/input.rs`**: seat capabilities + a keymap that really is xkb
+  text; keys with evdev codes, monotonic serials, and modifiers ordered before
+  the key they modify; focus following topmost across map/unmap (the enter/leave
+  *sequence*, not just the end state); pointer crossing two cascaded windows with
+  surface-local coordinates; a click reaching the window under the cursor and
+  only after its enter; axis events; and roleless/unmapped surfaces receiving
+  nothing.
+- **`harness/tests/socket.rs`**: a real client over a real listening socket maps a
+  window; the socket keeps accepting after the first client.
+- **`backend-winit` unit tests**: the keycode table (values, no duplicates,
+  unmapped counted not fatal) and the softbuffer conversion (channel order, alpha
+  dropped, buffer reuse on shrink).
+
+## 12. What later tasks add here
+
+M1's tasks are complete through T6; T7 is the milestone's acceptance run (a real
+terminal under the nested backend), which adds no new mechanism here.
+
+The named successors to this document's temporary parts, all **M2**: the real
+T-input thread on libinput (§11.2), the vblank-tied frame scheduler that replaces
+the test-controlled tick (§4), the cursor plane (§11.4), `presentation-time`
+pacing and occlusion-gated frame callbacks (§8.3), and buffer scale/transform,
+which un-merges the surface-vs-buffer coordinate site marked in §9.3. Placement
+and focus policy leave for the policy daemon S1 in **M4** (§10.4, §11.3).
+
+Anything requiring 3D transform math, opaque-region occlusion culling (M5), or
+persistent snapshot sharing (§10.3) is out of scope until explicitly scheduled.

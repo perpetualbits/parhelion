@@ -129,6 +129,11 @@ Supporting documents:
 - `docs/sessions/` — one summary per session
 - `docs/plans/` — per-milestone task slicings (`mN_tasks.md`)
 - `docs/prompts/` — prompts authored in the chat project for Claude Code
+- `project-map.js` — the project map's data (`window.PROJECT_MAP`): every
+  subsystem node, its status, files, and specs; the single source of truth
+  behind the map (see "Project map" above)
+- `project-map.html` — the renderer for that data; derives its glyphs, counts,
+  and layout from `project-map.js` and holds no facts of its own
 
 ---
 
@@ -200,16 +205,29 @@ When a new document is created, add it to
 
 ### Project map
 
-The repository has an interactive project map — `project-map.js` (pure data:
-`window.PROJECT_MAP`, the single source of truth) rendered by
-`project-map.html`. **After every completed task or milestone, update
-`project-map.js` in the same session** so node/part `status` values, `files`,
-`specs`, and any new nodes reflect the tree. Status is *derived, never
-invented*: `done` means code is in the tree and green under `make test`;
-`active` is current-milestone work not yet shipped; `planned` is a later
-milestone; `seam` is a reserved interface filled later. The HTML derives its
-glyphs and counts from the data, so editing the data file is enough; verify it
-still parses (`node -e "global.window={}; require('./project-map.js')"`).
+`project-map.html` + `project-map.js` at the repo root render an
+interactive map of the architecture. The `.js` file is pure data
+(`window.PROJECT_MAP`) and the single source of truth the renderer
+reads.
+
+Standing order — every session that changes code, docs, or the status
+of any planned work:
+
+- Update the affected nodes and parts before closing the session:
+  status transitions (planned → active → done; seams filled), new
+  nodes when a new subsystem, crate, or canonical doc appears, and
+  `files` / `specs` paths when they change.
+- Status is derived, never invented: `done` only for work in the tree
+  and green under `make test` in this session; `active` is
+  current-milestone work not yet shipped; `planned` is a later
+  milestone; `seam` for interfaces deliberately reserved for later
+  filling.
+- Bump `project.updated` to the session date.
+- The file stays pure data and must remain syntactically valid —
+  verify with `node --check project-map.js` (or equivalent) before
+  closing. The HTML derives its glyphs and counts from the data, so
+  editing the data file is enough.
+- The session summary lists map changes alongside file changes.
 
 ---
 

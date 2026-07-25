@@ -16,6 +16,10 @@
 //! - [`render`] — the render seam ([`render::Compositor`]) and the T-render
 //!   skeleton ([`render::RenderLoop`]) that composites snapshots (C5). Carries
 //!   no backend type — the concrete pixel target lives in a backend crate.
+//! - [`input`] — the input funnel ([`input::InputEvent`]) every input source
+//!   produces, and the focus routing table ([`input::FocusMap`]) the dispatch
+//!   thread keeps as a read-mostly replica (C2, §7, I-2). T-input's *interface*;
+//!   its thread arrives with libinput in M2.
 //! - [`protocol::ProtocolHost`] — the Wayland protocol frontend at
 //!   `shards = 1`, per the decision "2026-07-24 — Smithay threading fit". It
 //!   owns a dispatch thread (the `Display`) and publishes surface lifecycle to
@@ -24,6 +28,7 @@
 //! The remaining CORE-BOUNDARY §3 components (DRM/KMS, input, buffers, regime
 //! machine, capabilities) arrive across M1..M9 (`docs/parhelion_milestone_plan.md`).
 
+pub mod input;
 pub mod protocol;
 pub mod render;
 pub mod scene;

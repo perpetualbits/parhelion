@@ -47,7 +47,7 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 
@@ -55,11 +55,14 @@ use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::wl_buffer::{self, WlBuffer};
 use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_compositor::WlCompositor;
+use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
+use wayland_client::protocol::wl_pointer::{self, WlPointer};
 use wayland_client::protocol::wl_registry::WlRegistry;
+use wayland_client::protocol::wl_seat::{self, WlSeat};
 use wayland_client::protocol::wl_shm::{self, Format, WlShm};
 use wayland_client::protocol::wl_shm_pool::WlShmPool;
 use wayland_client::protocol::wl_surface::WlSurface;
-use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
 use wayland_protocols::xdg::shell::client::xdg_popup::{self, XdgPopup};
 use wayland_protocols::xdg::shell::client::xdg_positioner::XdgPositioner;
 use wayland_protocols::xdg::shell::client::xdg_surface::{self, XdgSurface};
@@ -90,6 +93,15 @@ struct App {
     /// `pong` immediately (a well-behaved client), so this is the client-side half
     /// of the liveness handshake.
     pings: u32,
+    /// Every input-related event received, in arrival order (T6). One list, not
+    /// one per kind, because **order is the thing most worth asserting**: an
+    /// `enter` must precede any key or button, and a `leave` must precede the
+    /// next surface's `enter`.
+    input_events: Vec<SeatEvent>,
+    /// The xkb keymap the compositor sent, as text.
+    keymap: Option<String>,
+    /// Capabilities advertised on `wl_seat`, as the raw bitfield.
+    seat_capabilities: u32,
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for App {
@@ -241,6 +253,130 @@ impl Dispatch<XdgToplevel, ()> for App {
     }
 }
 
+impl Dispatch<WlSeat, ()> for App {
+    /// Record the advertised capabilities; the name event is ignored.
+    fn event(
+        state: &mut Self,
+        _: &WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Capabilities { capabilities } = event {
+            state.seat_capabilities = capabilities.into();
+        }
+    }
+}
+
+impl Dispatch<WlKeyboard, ()> for App {
+    /// Record keymap, focus changes, keys, and modifiers — in one ordered list,
+    /// because the ordering is half of what the tests check.
+    fn event(
+        state: &mut Self,
+        _: &WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            // The keymap arrives as a file descriptor holding xkb text. A real
+            // client mmaps it; reading is equivalent here and needs no unsafe.
+            wl_keyboard::Event::Keymap { fd, size, .. } => {
+                let file = File::from(fd);
+                let mut text = String::new();
+                Read::take(file, size as u64).read_to_string(&mut text).ok();
+                // The map is NUL-terminated on the wire; trim so callers can
+                // compare against plain text.
+                state.keymap = Some(text.trim_end_matches('\0').to_string());
+            }
+            wl_keyboard::Event::Enter { surface, .. } => {
+                state.input_events.push(SeatEvent::KeyboardEnter {
+                    surface: surface.id().protocol_id(),
+                });
+            }
+            wl_keyboard::Event::Leave { surface, .. } => {
+                state.input_events.push(SeatEvent::KeyboardLeave {
+                    surface: surface.id().protocol_id(),
+                });
+            }
+            wl_keyboard::Event::Key {
+                key, state: s, serial, ..
+            } => {
+                state.input_events.push(SeatEvent::Key {
+                    key,
+                    pressed: matches!(s, WEnum::Value(wl_keyboard::KeyState::Pressed)),
+                    serial,
+                });
+            }
+            wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
+                state.input_events.push(SeatEvent::Modifiers {
+                    depressed: mods_depressed,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlPointer, ()> for App {
+    /// Record crossings, motion, buttons, and axis events in arrival order.
+    /// `frame` is ignored: it groups the events above, and the rig asserts on the
+    /// events themselves.
+    fn event(
+        state: &mut Self,
+        _: &WlPointer,
+        event: wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_pointer::Event::Enter {
+                surface,
+                surface_x,
+                surface_y,
+                ..
+            } => state.input_events.push(SeatEvent::PointerEnter {
+                surface: surface.id().protocol_id(),
+                x: surface_x,
+                y: surface_y,
+            }),
+            wl_pointer::Event::Leave { surface, .. } => {
+                state.input_events.push(SeatEvent::PointerLeave {
+                    surface: surface.id().protocol_id(),
+                })
+            }
+            wl_pointer::Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => state.input_events.push(SeatEvent::PointerMotion {
+                x: surface_x,
+                y: surface_y,
+            }),
+            wl_pointer::Event::Button {
+                button,
+                state: s,
+                serial,
+                ..
+            } => state.input_events.push(SeatEvent::PointerButton {
+                button,
+                pressed: matches!(s, WEnum::Value(wl_pointer::ButtonState::Pressed)),
+                serial,
+            }),
+            wl_pointer::Event::Axis { axis, value, .. } => {
+                state.input_events.push(SeatEvent::PointerAxis {
+                    axis: u32::from(axis),
+                    value,
+                })
+            }
+            _ => {}
+        }
+    }
+}
+
 impl Dispatch<XdgPositioner, ()> for App {
     /// `xdg_positioner` is write-only — it emits no events. The rig creates one
     /// solely to reach `xdg_surface.get_popup` in the double-role error test.
@@ -268,6 +404,78 @@ impl Dispatch<XdgPopup, ()> for App {
         _: &QueueHandle<Self>,
     ) {
     }
+}
+
+/// One seat event the scripted client received, flattened for assertions (T6).
+///
+/// Surfaces are identified by their client-side object id rather than the proxy,
+/// so a test can say "the enter went to *that* window" without holding protocol
+/// objects in its expectations.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SeatEvent {
+    /// `wl_keyboard.enter` — this surface now has keyboard focus.
+    KeyboardEnter {
+        /// Object id of the focused surface.
+        surface: u32,
+    },
+    /// `wl_keyboard.leave` — this surface lost keyboard focus.
+    KeyboardLeave {
+        /// Object id of the surface that lost focus.
+        surface: u32,
+    },
+    /// `wl_keyboard.key` — a key changed state. `key` is the **evdev** code.
+    Key {
+        /// evdev keycode.
+        key: u32,
+        /// Whether this was a press.
+        pressed: bool,
+        /// The event's serial, for monotonicity assertions.
+        serial: u32,
+    },
+    /// `wl_keyboard.modifiers` — the modifier state changed.
+    Modifiers {
+        /// Depressed (currently held) modifier mask.
+        depressed: u32,
+    },
+    /// `wl_pointer.enter` — the cursor entered this surface, at surface-local
+    /// coordinates.
+    PointerEnter {
+        /// Object id of the entered surface.
+        surface: u32,
+        /// Surface-local x.
+        x: f64,
+        /// Surface-local y.
+        y: f64,
+    },
+    /// `wl_pointer.leave` — the cursor left this surface.
+    PointerLeave {
+        /// Object id of the surface left.
+        surface: u32,
+    },
+    /// `wl_pointer.motion` — the cursor moved within the focused surface.
+    PointerMotion {
+        /// Surface-local x.
+        x: f64,
+        /// Surface-local y.
+        y: f64,
+    },
+    /// `wl_pointer.button` — a button changed state. `button` is a `BTN_*` code.
+    PointerButton {
+        /// `BTN_*` code.
+        button: u32,
+        /// Whether this was a press.
+        pressed: bool,
+        /// The event's serial.
+        serial: u32,
+    },
+    /// `wl_pointer.axis` — scrolling. `axis` is 0 for vertical, 1 for horizontal
+    /// (the protocol's own numbering).
+    PointerAxis {
+        /// Axis number, per `wl_pointer.axis`.
+        axis: u32,
+        /// Scroll amount.
+        value: f64,
+    },
 }
 
 /// A protocol error the server sent this client, flattened so tests need not
@@ -318,6 +526,21 @@ pub struct ScriptedClient {
     shm: WlShm,
     /// The bound `xdg_wm_base`, present iff the global was advertised (T5).
     wm_base: XdgWmBase,
+    // The seat objects are held, not read: they exist so the compositor has
+    // somewhere to deliver keyboard and pointer events (an unbound seat receives
+    // nothing), and the rig records those events through the `Dispatch` impls
+    // rather than through these handles. Held rather than dropped so the client's
+    // object lifetime matches a real application's.
+    /// The bound `wl_seat` (T6).
+    #[allow(dead_code)]
+    seat: WlSeat,
+    /// This client's `wl_keyboard`, obtained at connect so no test can forget to
+    /// ask for one before asserting on focus.
+    #[allow(dead_code)]
+    keyboard: WlKeyboard,
+    /// This client's `wl_pointer`, likewise.
+    #[allow(dead_code)]
+    pointer: WlPointer,
 }
 
 impl ScriptedClient {
@@ -344,6 +567,14 @@ impl ScriptedClient {
         let wm_base: XdgWmBase = globals
             .bind(&qh, 1..=6, ())
             .expect("xdg_wm_base global advertised");
+        // Bind wl_seat and take both capabilities (T6). Presence of the global is
+        // part of what the rig asserts; taking keyboard and pointer here means a
+        // test never has to remember to.
+        let seat: WlSeat = globals
+            .bind(&qh, 1..=9, ())
+            .expect("wl_seat global advertised");
+        let keyboard = seat.get_keyboard(&qh, ());
+        let pointer = seat.get_pointer(&qh, ());
         ScriptedClient {
             conn,
             queue,
@@ -351,6 +582,9 @@ impl ScriptedClient {
             compositor,
             shm,
             wm_base,
+            seat,
+            keyboard,
+            pointer,
         }
     }
 
@@ -592,6 +826,55 @@ impl ScriptedClient {
     /// Number of `xdg_wm_base.ping` events received (each answered with `pong`).
     pub fn pings_received(&self) -> u32 {
         self.app.pings
+    }
+
+    // ----- Seat / input observation (T6) ------------------------------------
+
+    /// Every seat event received so far, in arrival order. Ordering is
+    /// load-bearing (`enter` before input, `leave` before the next `enter`), so
+    /// tests assert on slices of this list rather than on per-kind counters.
+    pub fn input_events(&self) -> &[SeatEvent] {
+        &self.app.input_events
+    }
+
+    /// Drop all recorded seat events — lets a test ignore the setup traffic
+    /// (focus arriving as windows map) and assert only on what it then provokes.
+    pub fn clear_input_events(&mut self) {
+        self.app.input_events.clear();
+    }
+
+    /// The xkb keymap the compositor sent, as text (`None` until it arrives).
+    pub fn keymap(&self) -> Option<&str> {
+        self.app.keymap.as_deref()
+    }
+
+    /// The `wl_seat` capability bitfield the compositor advertised.
+    pub fn seat_capabilities(&self) -> u32 {
+        self.app.seat_capabilities
+    }
+
+    /// The client-side object id of a surface — how [`SeatEvent`]s name the
+    /// surface an event was delivered to.
+    pub fn surface_id(&self, surface: &WlSurface) -> u32 {
+        surface.id().protocol_id()
+    }
+
+    /// Pump round-trips until at least `n` seat events have arrived, or fail
+    /// loudly. Deterministic: the events are already in flight when this is
+    /// called (the compositor sent them before the sync reply), so this waits on
+    /// a definite condition rather than a timer.
+    pub fn pump_until_input_events(&mut self, n: usize) {
+        for _ in 0..1000 {
+            if self.app.input_events.len() >= n {
+                return;
+            }
+            self.roundtrip();
+        }
+        panic!(
+            "expected at least {n} seat events, got {}: {:?}",
+            self.app.input_events.len(),
+            self.app.input_events
+        );
     }
 
     // ----- Protocol-error observation (T5) ----------------------------------

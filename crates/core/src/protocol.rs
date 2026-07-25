@@ -105,7 +105,7 @@ use smithay::reexports::calloop::{
     channel::{channel as calloop_channel, Channel, Event as ChannelEvent, Sender as CalloopSender},
     generic::{Generic, NoIoDrop},
     ping::{make_ping, Ping, PingSource},
-    EventLoop, Interest, Mode, PostAction,
+    EventLoop, Interest, LoopHandle, Mode, PostAction,
 };
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason, ObjectId};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
@@ -113,9 +113,16 @@ use smithay::reexports::wayland_server::protocol::wl_callback::WlCallback;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_shm::Format;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
-use smithay::input::{SeatHandler, SeatState};
-use smithay::utils::{Serial, SERIAL_COUNTER};
+use smithay::reexports::wayland_server::{
+    Client, Display, DisplayHandle, ListeningSocket, Resource,
+};
+use smithay::backend::input::{Axis, AxisSource, ButtonState, KeyState};
+use smithay::input::keyboard::{FilterResult, KeyboardHandle, Keycode, XkbConfig};
+use smithay::input::pointer::{
+    AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, PointerHandle,
+};
+use smithay::input::{Seat, SeatHandler, SeatState};
+use smithay::utils::{Logical, Point, Serial, SERIAL_COUNTER};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     with_states, BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
@@ -127,6 +134,7 @@ use smithay::wayland::shell::xdg::{
 };
 use smithay::wayland::shm::{with_buffer_contents, BufferAccessError, ShmHandler, ShmState};
 
+use crate::input::{FocusMap, InputEvent};
 use crate::scene::{
     ClientKey, ContentDamage, NodeRole, PixelBuffer, ProtocolEvent, Rect, SceneHandle, SurfaceId,
     TextureSource, ToplevelRole, Transform,
@@ -179,6 +187,26 @@ pub const CASCADE_STEP_Y: i32 = 32;
 /// cascade cannot clamp to a screen; wrapping is what keeps it from walking off
 /// into the far corner of an unbounded plane.
 pub const CASCADE_WRAP: u64 = 8;
+
+// ==========================================================================
+// Seat constants (T6).
+// ==========================================================================
+
+/// The seat's name, as advertised to clients. One seat is all M1 models
+/// (`CORE-BOUNDARY.md` C2); multi-seat is not a milestone concern.
+pub const SEAT_NAME: &str = "seat0";
+
+/// Delay before key repeat starts, in ms — advertised via `wl_keyboard.repeat_info`.
+///
+/// **The compositor generates no repeat events.** Since `wl_keyboard` v4 the
+/// protocol makes repeat the *client's* job: the compositor advertises the rate
+/// and delay it wants, and the client synthesises the repeats. So these two
+/// constants are the whole of Parhelion's key-repeat implementation, and that is
+/// correct, not a gap.
+pub const KEY_REPEAT_DELAY_MS: i32 = 600;
+
+/// Key repeat rate in keys per second (see [`KEY_REPEAT_DELAY_MS`]).
+pub const KEY_REPEAT_RATE_HZ: i32 = 25;
 
 // ==========================================================================
 // Static Send/Sync regression guards (spike §5.5).
@@ -277,6 +305,15 @@ impl FramePresenter {
 enum Control {
     /// Admit a client connected on this stream (the shard-assignment seam).
     AddClient(UnixStream),
+    /// Start accepting clients on this bound Wayland socket (T6): the dispatch
+    /// thread registers it as a `calloop` source and admits everything that
+    /// connects. The socket is bound by the caller, so the display name is known
+    /// without a round-trip.
+    Listen(ListeningSocket),
+    /// Apply one input event to the seat (T6) — the funnel's crossing into the
+    /// dispatch thread. Producers (winit's loop, the test rig) never touch a
+    /// protocol object themselves.
+    Input(InputEvent),
     /// Send `xdg_wm_base.ping` to every shell client with a live toplevel (T5).
     PingClients,
     /// Stop the dispatch loop and let the thread exit.
@@ -342,18 +379,40 @@ struct State {
     /// only — it validates the shell's request grammar and tracks configure
     /// serials; the window *meaning* (map, placement, damage) is ours below.
     xdg_shell_state: XdgShellState,
-    /// Seat state — **empty in M1** and present only because `delegate_xdg_shell!`
-    /// is bounded on `SeatHandler` (see that impl). No seat is created here, so
-    /// no `wl_seat` global is advertised; T6 fills this in.
+    /// Smithay's seat state (T6): owns the `wl_seat` global, capability
+    /// advertisement, and keymap delivery.
     seat_state: SeatState<State>,
+    /// Keyboard handle — where [`InputEvent::Key`] events are applied, and the
+    /// owner of the xkb state that turns keycodes into modifiers.
+    keyboard: KeyboardHandle<State>,
+    /// Pointer handle — motion/button/axis application and per-client focus.
+    pointer: PointerHandle<State>,
+    /// Latest pointer position in output coordinates, kept so a button or axis
+    /// event knows where the cursor is without the source having to resend it.
+    pointer_pos: (f64, f64),
+    /// The focus routing table (§7's read-mostly replica; see
+    /// [`crate::input::FocusMap`]). Updated by the same code that publishes a
+    /// map/unmap to the scene, so it cannot drift independently.
+    focus_map: FocusMap,
+    /// The surface that currently has keyboard focus, so a re-focus that would
+    /// change nothing sends no events.
+    keyboard_focus: Option<SurfaceId>,
     /// Handle used to admit clients and resolve object→client.
     dh: DisplayHandle,
+    /// Handle to this thread's `calloop` loop, so a source callback can register
+    /// *another* source — specifically, the listening socket that arrives after
+    /// the loop is already running (T6).
+    loop_handle: LoopHandle<'static, State>,
     /// Monotonic source of [`SurfaceId`]s.
     next_surface_id: u64,
     /// Monotonic source of [`ClientKey`]s.
     next_client_key: u64,
     /// Maps live protocol surfaces to their core id, for commit/destroy lookup.
     obj_to_surface: HashMap<ObjectId, SurfaceId>,
+    /// The reverse direction (T6): from a core id back to its protocol object,
+    /// so input routed by [`FocusMap`] (which speaks core tokens only) can reach
+    /// the `wl_surface` it belongs to.
+    sid_to_obj: HashMap<SurfaceId, ObjectId>,
     /// Live `wl_surface` handles, keyed by object id — the set [`present`] drains
     /// frame callbacks from, and the set the per-client backlog is computed over.
     /// The `WlSurface` never leaves this thread (it is not `Send`), which is the
@@ -437,12 +496,191 @@ impl State {
     }
 
     /// Unmap a toplevel's node: it loses its source (and so its visibility) with
-    /// the structural damage `clear_source` raises. Used by both unmap paths —
-    /// null attach and `xdg_toplevel.destroy`.
+    /// the structural damage `clear_source` raises, and it leaves the focus
+    /// routing table — what cannot be seen cannot be clicked or focused. Used by
+    /// both unmap paths: null attach and `xdg_toplevel.destroy`.
     fn unmap_surface(&mut self, obj: &ObjectId) {
         self.surface_pixels.remove(obj);
         if let Some(&sid) = self.obj_to_surface.get(obj) {
             self.scene.mutate(move |s| s.clear_source(sid));
+            self.focus_map.unmap(sid);
+            self.refocus_keyboard();
+        }
+    }
+
+    /// The live `wl_surface` for a core id, if it still exists. The bridge from
+    /// the focus table's core tokens back to protocol objects — which never leave
+    /// this thread (§7).
+    fn wl_surface_for(&self, surface: SurfaceId) -> Option<WlSurface> {
+        let obj = self.sid_to_obj.get(&surface)?;
+        self.surfaces.get(obj).filter(|s| s.is_alive()).cloned()
+    }
+
+    /// Apply the **C10 focus fallback**: keyboard focus is the topmost mapped
+    /// toplevel. Called whenever that set changes (map, unmap, destroy, client
+    /// gone). A re-focus that would change nothing sends nothing, so a client
+    /// does not see spurious `leave`/`enter` pairs.
+    ///
+    /// **Loudly temporary.** "Focus follows topmost" is a policy decision — a
+    /// reasonable user might want click-to-focus, focus-follows-mouse, or a
+    /// tiling scheme — and `CORE-BOUNDARY.md` §4 rule 4 puts policy in a server.
+    /// The reference policy daemon S1 takes this over in **M4**; it lives here
+    /// now only because a compositor nothing can be typed into is not a
+    /// compositor (C10: the core stays usable with every server dead).
+    fn refocus_keyboard(&mut self) {
+        let target = self.focus_map.topmost();
+        if target == self.keyboard_focus {
+            return;
+        }
+        self.keyboard_focus = target;
+        let surface = target.and_then(|sid| self.wl_surface_for(sid));
+        let keyboard = self.keyboard.clone();
+        let serial = SERIAL_COUNTER.next_serial();
+        // Sends leave to the old focus and enter to the new one, in that order.
+        keyboard.set_focus(self, surface, serial);
+    }
+}
+
+/// Admit a client on `stream`: give it a core [`ClientKey`], the per-client
+/// protocol state, and a scene handle for its `ClientGone`, then insert it on
+/// this thread's `Display` — the shard-assignment seam (requirement 1).
+///
+/// One function, two callers: the [`ProtocolHost::add_client`] control message
+/// (the rig's socketpairs) and the listening socket's accept loop (real clients,
+/// T6). Both must produce identical state, so they share the code rather than
+/// resembling each other.
+fn admit_client(state: &mut State, stream: UnixStream) {
+    let key = state.alloc_client_key();
+    let data = ClientState {
+        compositor_state: CompositorClientState::default(),
+        key,
+        scene: state.scene.clone(),
+    };
+    let _ = state.dh.insert_client(stream, Arc::new(data));
+}
+
+// ==========================================================================
+// The input funnel's dispatch-side half (T6).
+// ==========================================================================
+
+/// Apply one [`InputEvent`] to the seat. Runs on the dispatch thread — the only
+/// thread that may touch protocol objects (§7) — reached by a control message
+/// from whatever produced the event (winit's loop, or a test).
+///
+/// Every event gets a fresh serial from the shared counter, so serials are
+/// monotonic across keyboard and pointer alike (clients use them to order
+/// requests against events, and to prove a request answers a specific event).
+///
+/// **I-2 holds by construction here:** nothing in this function consults the
+/// render side or the scene thread. Pointer routing reads the dispatch thread's
+/// own [`FocusMap`] replica, so delivery cannot queue behind a frame.
+fn apply_input(state: &mut State, event: InputEvent) {
+    match event {
+        InputEvent::Key {
+            code,
+            pressed,
+            time_ms,
+        } => {
+            let keyboard = state.keyboard.clone();
+            let serial = SERIAL_COUNTER.next_serial();
+            let key_state = if pressed {
+                KeyState::Pressed
+            } else {
+                KeyState::Released
+            };
+            // xkb keycodes are evdev + 8 (the X11 inheritance). Smithay sends
+            // `raw - 8` back on the wire, so the client sees the evdev code it
+            // expects — the funnel speaks evdev at both ends.
+            keyboard.input::<(), _>(
+                state,
+                Keycode::new(code + 8),
+                key_state,
+                serial,
+                time_ms,
+                // No compositor keybindings in M1: every key is forwarded to the
+                // focused client. Grabs and shortcuts are policy (S1, M4).
+                |_, _, _| FilterResult::Forward,
+            );
+        }
+        InputEvent::PointerMotion { x, y, time_ms } => {
+            state.pointer_pos = (x, y);
+            // Hit-test the replica, then translate the core id to the object.
+            // Smithay is given the focused surface's **origin** in global space
+            // (it derives the client's surface-local coordinates from it), which
+            // is why [`Hit`] names origin and local separately.
+            let focus = state.focus_map.at(x, y).and_then(|hit| {
+                state
+                    .wl_surface_for(hit.surface)
+                    .map(|s| (s, Point::<f64, Logical>::from(hit.origin)))
+            });
+            let pointer = state.pointer.clone();
+            let serial = SERIAL_COUNTER.next_serial();
+            // `motion` emits the leave/enter pair itself when the focus changes,
+            // always before the motion event — which is what makes
+            // "enter before input" true without us sequencing it by hand.
+            pointer.motion(
+                state,
+                focus,
+                &MotionEvent {
+                    location: Point::from((x, y)),
+                    serial,
+                    time: time_ms,
+                },
+            );
+            pointer.frame(state);
+        }
+        InputEvent::PointerButton {
+            button,
+            pressed,
+            time_ms,
+        } => {
+            let pointer = state.pointer.clone();
+            let serial = SERIAL_COUNTER.next_serial();
+            // Goes to whatever the last motion focused — no re-hit-test, because
+            // a button must be delivered to the surface that received the enter,
+            // even if geometry changed underneath in between.
+            pointer.button(
+                state,
+                &ButtonEvent {
+                    serial,
+                    time: time_ms,
+                    button,
+                    state: if pressed {
+                        ButtonState::Pressed
+                    } else {
+                        ButtonState::Released
+                    },
+                },
+            );
+            pointer.frame(state);
+        }
+        InputEvent::PointerAxis {
+            horizontal,
+            vertical,
+            steps,
+            time_ms,
+        } => {
+            let pointer = state.pointer.clone();
+            // M1's only axis source is a stepped wheel (winit's line/pixel deltas
+            // are normalised by the backend); touchpad kinetic scrolling needs
+            // libinput and arrives with it (M2).
+            let mut frame = AxisFrame::new(time_ms).source(AxisSource::Wheel);
+            if horizontal != 0.0 {
+                frame = frame.value(Axis::Horizontal, horizontal);
+                if steps != 0 {
+                    // v120 is the protocol's high-resolution step unit: one
+                    // physical wheel click is 120.
+                    frame = frame.v120(Axis::Horizontal, steps * 120);
+                }
+            }
+            if vertical != 0.0 {
+                frame = frame.value(Axis::Vertical, vertical);
+                if steps != 0 {
+                    frame = frame.v120(Axis::Vertical, steps * 120);
+                }
+            }
+            pointer.axis(state, frame);
+            pointer.frame(state);
         }
     }
 }
@@ -557,6 +795,7 @@ impl CompositorHandler for State {
     fn new_surface(&mut self, surface: &WlSurface) {
         let sid = self.alloc_surface_id();
         self.obj_to_surface.insert(surface.id(), sid);
+        self.sid_to_obj.insert(sid, surface.id());
         // Keep the object handle so the reverse edge ([`present`]) can drain this
         // surface's frame callbacks. Cheap clone (an Arc-backed resource id).
         self.surfaces.insert(surface.id(), surface.clone());
@@ -662,6 +901,25 @@ impl CompositorHandler for State {
                             }
                             s.attach_content(sid, size, source, opaque, content_damage);
                         });
+
+                        // Mirror the same fact into the input routing table (T6).
+                        // A toplevel's extent is its placement plus the buffer's
+                        // size, so this re-runs on every content commit — a client
+                        // that commits a differently-sized buffer resizes its
+                        // input region with its pixels, in one place, from the
+                        // same values the scene was just told about. Non-toplevel
+                        // surfaces never enter the table: no role, no pixels, no
+                        // input (the T5 rule, extended).
+                        if let Some(entry) = self.toplevels.get(&obj) {
+                            let (dx, dy) = entry.placement;
+                            let rect = Rect::new(dx, dy, size.0 as i32, size.1 as i32);
+                            // z is 0 for every toplevel in M1 (stacking policy is
+                            // S1's, M4); ties break by SurfaceId in both the
+                            // snapshot and the routing table, so input and pixels
+                            // agree on who is on top.
+                            self.focus_map.map(sid, rect, 0);
+                            self.refocus_keyboard();
+                        }
                     }
                     // Non-shm buffer or zero-size: nothing to show (no dmabuf in M1).
                     Ok(None) => {}
@@ -713,12 +971,19 @@ impl CompositorHandler for State {
     }
 
     /// A surface was destroyed: drop the mappings and publish `SurfaceDestroyed`.
+    ///
+    /// This also covers client disconnect — wayland-server destroys every object
+    /// a departing client owned, so it is the one place surfaces leave the focus
+    /// routing table no matter how they go.
     fn destroyed(&mut self, surface: &WlSurface) {
         self.surfaces.remove(&surface.id());
         self.surface_pixels.remove(&surface.id());
         self.toplevels.remove(&surface.id());
         if let Some(sid) = self.obj_to_surface.remove(&surface.id()) {
+            self.sid_to_obj.remove(&sid);
+            self.focus_map.unmap(sid);
             self.scene.emit(ProtocolEvent::SurfaceDestroyed { surface: sid });
+            self.refocus_keyboard();
         }
     }
 }
@@ -740,17 +1005,20 @@ impl BufferHandler for State {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
 }
 
-/// **Trait plumbing, not input.** `delegate_xdg_shell!` covers `xdg_popup`, and
-/// Smithay's popup dispatch is bounded on `D: SeatHandler` (a popup grab names a
-/// seat). So the shell cannot be delegated without this impl — even though T5
-/// implements no input at all.
+/// The seat's handler side (T6). Focus targets are `WlSurface` — the thing a
+/// Wayland client actually receives input on, and the type Smithay implements
+/// the keyboard/pointer/touch target traits for directly.
 ///
-/// It is deliberately inert: [`SeatState`] here holds **no seat**, because a
-/// `wl_seat` global appears only when [`Seat::new`](smithay::input::Seat::new) is
-/// called, which is **T6**'s job. Until then no seat global is advertised, no
-/// focus exists, and no callback below can fire. The focus types are `WlSurface`
-/// because that is what T6 will focus, and because Smithay implements the
-/// keyboard/pointer/touch target traits for it directly.
+/// Both callbacks are deliberately empty:
+///
+/// - `focus_changed` — the core *sets* focus (C10 policy, [`refocus_keyboard`]),
+///   so being told about it afterwards adds nothing in M1. When focus is
+///   S1's decision (M4) this is where the control plane would learn of it.
+/// - `cursor_image` — a client asked to set the cursor. **Accepted and ignored
+///   for rendering**: in the nested backend the host desktop draws the cursor,
+///   and the hardware cursor plane is M2 (`CORE-BOUNDARY.md` C1). Ignoring it is
+///   not a protocol violation — the request is honoured by being accepted — but
+///   the client's chosen shape is not shown yet.
 impl SeatHandler for State {
     type KeyboardFocus = WlSurface;
     type PointerFocus = WlSurface;
@@ -759,7 +1027,17 @@ impl SeatHandler for State {
     fn seat_state(&mut self) -> &mut SeatState<State> {
         &mut self.seat_state
     }
+
+    fn focus_changed(&mut self, _seat: &Seat<State>, _focused: Option<&WlSurface>) {}
+
+    fn cursor_image(&mut self, _seat: &Seat<State>, _image: CursorImageStatus) {}
 }
+
+// `delegate_seat!` supplies the Dispatch/GlobalDispatch impls for
+// wl_seat/wl_keyboard/wl_pointer/wl_touch, routing them to `SeatState` (which
+// owns capability advertisement, keymap delivery, and per-client focus
+// bookkeeping) and the `SeatHandler` impl above.
+smithay::delegate_seat!(State);
 
 // `delegate_xdg_shell!` supplies the Dispatch/GlobalDispatch impls for
 // xdg_wm_base/xdg_surface/xdg_toplevel/xdg_popup/xdg_positioner, routing them to
@@ -991,6 +1269,47 @@ impl ProtocolHost {
         let _ = self.control_tx.send(Control::AddClient(stream));
     }
 
+    /// Feed one input event into the seat (T6) — the funnel's public door.
+    ///
+    /// Callable from any thread: winit's event loop on the main thread, a test
+    /// on the test thread. It only *enqueues* onto the control channel and wakes
+    /// the dispatch thread, which owns every protocol object (§7) and does the
+    /// actual delivery. Non-blocking, so an input source is never made to wait on
+    /// the compositor (**I-2**).
+    pub fn input(&self, event: InputEvent) {
+        let _ = self.control_tx.send(Control::Input(event));
+    }
+
+    /// Bind a Wayland socket in `$XDG_RUNTIME_DIR` (`wayland-1`, `wayland-2`, …)
+    /// and start accepting clients on it. Returns the display name to put in
+    /// `WAYLAND_DISPLAY`.
+    ///
+    /// The socket is bound *here*, on the caller's thread, so the name is known
+    /// immediately; only the accepting is handed to the dispatch thread. That
+    /// keeps this a plain fallible call instead of a cross-thread round-trip.
+    pub fn listen_auto(&self) -> std::io::Result<String> {
+        let socket = ListeningSocket::bind_auto("wayland", 1..33)
+            .map_err(|e| std::io::Error::other(format!("bind wayland socket: {e}")))?;
+        let name = socket
+            .socket_name()
+            .expect("bind_auto always names its socket")
+            .to_string_lossy()
+            .into_owned();
+        let _ = self.control_tx.send(Control::Listen(socket));
+        Ok(name)
+    }
+
+    /// Bind a Wayland socket at an explicit path and start accepting clients on
+    /// it. Used where `$XDG_RUNTIME_DIR` should not be involved — notably tests,
+    /// which bind inside their own temporary directory and so neither depend on
+    /// the environment nor collide with a real session.
+    pub fn listen_at(&self, path: impl Into<std::path::PathBuf>) -> std::io::Result<()> {
+        let socket = ListeningSocket::bind_absolute(path.into())
+            .map_err(|e| std::io::Error::other(format!("bind wayland socket: {e}")))?;
+        let _ = self.control_tx.send(Control::Listen(socket));
+        Ok(())
+    }
+
     /// A clone of the render side's notice handle. Hand this to the
     /// [`RenderLoop`](crate::render::RenderLoop) so its ticks fire frame
     /// callbacks (the reverse edge).
@@ -1194,6 +1513,12 @@ fn run_dispatch(
 ) {
     let display: Display<State> = Display::new().expect("create wayland display");
     let dh = display.handle();
+
+    // The loop is created before the state because the state holds a handle to
+    // it: sources that arrive *after* the loop is running (the listening socket,
+    // T6) are registered from inside a source callback, which needs the handle.
+    let mut event_loop: EventLoop<State> = EventLoop::try_new().expect("create calloop event loop");
+    let handle = event_loop.handle();
     let compositor_state = CompositorState::new::<State>(&dh);
     // Advertise `wl_shm`. The mandatory `argb8888`/`xrgb8888` formats are added by
     // `ShmState::new`; we request no extras (T3 handles exactly those two).
@@ -1204,15 +1529,44 @@ fn run_dispatch(
     // beyond the defaults is deliberately not done here.
     let xdg_shell_state = XdgShellState::new::<State>(&dh);
 
+    // The seat (T6): one seat, keyboard + pointer, no touch. Creating it here
+    // advertises the `wl_seat` global with those capabilities; Smithay delivers
+    // the keymap to each client that binds a keyboard.
+    let mut seat_state = SeatState::<State>::new();
+    // `SeatState` owns the seat (it keeps the list of them alive); we keep only
+    // the two capability handles, which is all the input path needs.
+    let mut seat = seat_state.new_wl_seat(&dh, SEAT_NAME);
+    let keyboard = seat
+        .add_keyboard(
+            // An explicit `us` layout rather than the empty default: the keymap
+            // must be the same on every machine or the rig's keycode assertions
+            // would depend on the developer's xkb configuration.
+            XkbConfig {
+                layout: "us",
+                ..XkbConfig::default()
+            },
+            KEY_REPEAT_DELAY_MS,
+            KEY_REPEAT_RATE_HZ,
+        )
+        .expect("compile the default xkb keymap");
+    let pointer = seat.add_pointer();
+
     let mut state = State {
         compositor_state,
         shm_state,
         xdg_shell_state,
-        seat_state: SeatState::new(),
+        seat_state,
+        keyboard,
+        pointer,
+        pointer_pos: (0.0, 0.0),
+        focus_map: FocusMap::new(),
+        keyboard_focus: None,
         dh: dh.clone(),
+        loop_handle: handle.clone(),
         next_surface_id: 0,
         next_client_key: 0,
         obj_to_surface: HashMap::new(),
+        sid_to_obj: HashMap::new(),
         surfaces: HashMap::new(),
         surface_pixels: HashMap::new(),
         toplevels: HashMap::new(),
@@ -1224,9 +1578,6 @@ fn run_dispatch(
         pongs_received,
         stop: false,
     };
-
-    let mut event_loop: EventLoop<State> = EventLoop::try_new().expect("create calloop event loop");
-    let handle = event_loop.handle();
 
     // The Display's poll fd: readable when a client has pending requests. The
     // Generic source *owns* the Display, handing it back as the callback's
@@ -1245,21 +1596,36 @@ fn run_dispatch(
         .insert_source(control_rx, |event, _, state: &mut State| {
             if let ChannelEvent::Msg(control) = event {
                 match control {
-                    Control::AddClient(stream) => {
-                        let key = state.alloc_client_key();
-                        let data = ClientState {
-                            compositor_state: CompositorClientState::default(),
-                            key,
-                            scene: state.scene.clone(),
-                        };
-                        // Insert on this thread's Display — the assignment seam.
-                        let _ = state.dh.insert_client(stream, std::sync::Arc::new(data));
-                    }
+                    Control::AddClient(stream) => admit_client(state, stream),
                     // One ping serial for the whole sweep; a client with several
                     // toplevels is pinged once (the extra `send_ping`s report
                     // "already pending" and are ignored — the ping is per shell
                     // client, not per window). Enqueue only; the loop's single
                     // flush site pushes it.
+                    // A bound socket arrived: register it so everything that
+                    // connects is admitted through the same seam as the rig's
+                    // socketpair clients (`add_client`).
+                    Control::Listen(socket) => {
+                        let listen_handle = state.loop_handle.clone();
+                        let inserted = listen_handle.insert_source(
+                            Generic::new(socket, Interest::READ, Mode::Level),
+                            |_readiness, socket, state: &mut State| {
+                                // Accept everything queued; `accept` yields None
+                                // when the backlog is drained.
+                                while let Ok(Some(stream)) = socket.accept() {
+                                    admit_client(state, stream);
+                                }
+                                Ok(PostAction::Continue)
+                            },
+                        );
+                        // A failed registration means the loop is tearing down;
+                        // dropping the socket unbinds it, which is the right
+                        // outcome (no half-listening compositor).
+                        let _ = inserted;
+                    }
+                    // The input funnel's crossing (T6): apply on this thread,
+                    // where the seat's protocol objects live.
+                    Control::Input(event) => apply_input(state, event),
                     Control::PingClients => {
                         let serial = SERIAL_COUNTER.next_serial();
                         for toplevel in state.xdg_shell_state.toplevel_surfaces() {

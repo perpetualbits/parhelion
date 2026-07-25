@@ -12,6 +12,7 @@ members = [
     "crates/dialect",
     "crates/harness",
     "crates/backend-headless",
+    "crates/backend-winit",
 ]
 
 # Workspace-wide lint policy. Each crate opts in with `[lints] workspace = true`.

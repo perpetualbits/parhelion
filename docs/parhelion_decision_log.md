@@ -309,6 +309,77 @@ below, reasoning now living in the dialect spec and VISION.md.)
   broken, so disconnection alone proves nothing. Building the capability once, at
   the rig level, is what makes every later conformance test cheap.
 
+## 2026-07-25 — Seat, input, and the nested backend (M1 T6)
+
+### Input reaches the core through one funnel; the nested backend's winit loop is T-input's stand-in
+
+- **Source:** M1 T6 (prompt 09); `docs/scene_graph_v1.md` §11.1–§11.2; the §7
+  honesty clause in `docs/plans/m1_tasks.md` T6.
+- **Affects:** `crates/core/src/input.rs` (`InputEvent`), `protocol.rs`
+  (`ProtocolHost::input`, seat application), `crates/backend-winit/` (new crate);
+  `CORE-BOUNDARY.md` §7 (deviation recorded, spec **not** amended), I-2.
+- **Decision:** Every input source produces the same `InputEvent` — evdev key
+  codes, `BTN_*` buttons, output-space coordinates, **no Smithay type** — and
+  hands it to `ProtocolHost::input`, a non-blocking message into the dispatch
+  thread, which applies it to the seat. In the nested backend, winit's main-thread
+  event loop *is* T-input: it must own the main thread and delivers input intake
+  and presentation together, so M1 has T-input's **interface** without T-input's
+  **thread**. The real split arrives with libinput and DRM (M2), producing the
+  same `InputEvent`s.
+- **Reasoning:** §7's load-bearing rule is that protocol objects have one owning
+  thread, and that still holds — the loop sends messages, it does not reach into
+  compositor state. Pretending to a thread split winit forbids would be dishonest
+  RT of the kind the milestone plan warns about; recording the deviation with its
+  replacement named keeps it bounded rather than becoming folklore.
+
+### Pointer routing reads a dispatch-thread replica, not a query into the scene
+
+- **Source:** M1 T6; Roland's ruling when the two options were put to him;
+  `docs/scene_graph_v1.md` §11.3.
+- **Affects:** `crates/core/src/input.rs` (`FocusMap`, `Hit`), the map/unmap and
+  commit paths in `protocol.rs`; invariants I-2 (satisfied) and I-5 (unaffected).
+- **Decision:** The dispatch thread keeps a **read-mostly replica** of each mapped
+  surface's rect and stacking order and answers "topmost" / "under the cursor"
+  from it. The scene remains canonical; the replica is derived, reconstructible,
+  and updated by the same code that publishes the map/unmap/resize to the scene.
+  Its ordering is the snapshot's draw order (ascending `z`, ties by `SurfaceId`)
+  by construction.
+- **Reasoning:** The alternative — `SceneHandle::query` per pointer motion — is a
+  synchronous cross-thread round-trip on the input path that can queue behind the
+  render thread's snapshot request, which is precisely what **I-2** forbids. §7
+  names this exact pattern for T-input ("focus routing table — read-mostly
+  replica of canonical focus"). The cost is a second copy of two fields; the
+  discipline that keeps it honest is that both writes happen in one place.
+
+### Focus policy: keyboard follows the topmost mapped toplevel (C10, until M4)
+
+- **Source:** M1 T6; `docs/scene_graph_v1.md` §11.3.
+- **Affects:** `protocol.rs` (`refocus_keyboard`), `CORE-BOUNDARY.md` C10, §4 rule 4.
+- **Decision:** Keyboard focus is the topmost mapped toplevel, recomputed on map
+  and unmap; pointer focus is the topmost mapped surface under the cursor. Both
+  are C10 fallbacks, module-documented as temporary; the reference policy daemon
+  S1 takes them over in **M4**. Client `set_cursor` is accepted and ignored for
+  rendering (the host desktop draws the cursor in nested mode; the cursor plane is
+  M2).
+- **Reasoning:** Focus *is* policy — a reasonable user might want click-to-focus or
+  focus-follows-mouse — so §4 rule 4 exiles it. It lives in the core now for the
+  same reason as default placement: a compositor nothing can be typed into is not
+  a compositor, and C10 exists so the core stays usable with every server dead.
+
+### CI gains its first stated system dependency: `libxkbcommon`
+
+- **Source:** M1 T6; `.github/workflows/ci.yml` (header amended, not deleted).
+- **Affects:** CI; the "no apt step, on purpose" rule from M0.
+- **Decision:** CI installs `libxkbcommon-dev`. The M0 rule is amended rather than
+  dropped: still no libwayland, no GPU packages, no display server, and the winit
+  backend is built but never run.
+- **Reasoning:** `wl_keyboard` cannot exist without an xkb keymap, and xkbcommon
+  is what compiles one. **Discovery worth recording:** the dependency was already
+  there implicitly — Smithay depends on the `xkbcommon` crate unconditionally, so
+  every test binary has linked `libxkbcommon.so.0` since the protocol layer
+  landed, and CI passed because `ubuntu-latest` happens to ship it. The change is
+  therefore from *luck* to *contract*, which is the honest way to describe it.
+
 ## Pending
 
 - Lock-screen fail-locked design (`CORE-BOUNDARY.md` §6 note).

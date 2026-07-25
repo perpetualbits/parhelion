@@ -1,0 +1,37 @@
+# crates/backend-winit — the nested development backend (M1 T6).
+#
+# Governing docs: `docs/scene_graph_v1.md` §11 (input and the nested backend),
+# `docs/plans/m1_tasks.md` T6. This crate is what makes M1 a compositor Roland
+# can *see*: a desktop window showing the composited scene, and desktop input
+# feeding the core's input funnel.
+#
+# It deliberately does NOT use `smithay::backend::winit`: that backend is welded
+# to Smithay's GLES renderer, which the layer-selection decision
+# ("2026-07-24 — Smithay threading fit") bypasses. We drive winit ourselves and
+# present with softbuffer, so no renderer type from Smithay enters the tree.
+[package]
+name = "parhelion-backend-winit"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# The core: the input funnel this backend produces events for, the scene it
+# snapshots, and the render loop it ticks.
+parhelion-core = { path = "../core" }
+# The CPU compositor and the `Frame` this backend blits to the window. The
+# headless backend owns both; presenting them in a window is this crate's whole
+# addition, which is why there is no third copy of the compositor here.
+parhelion-backend-headless = { path = "../backend-headless" }
+# Window creation and desktop input intake. Pinned to the 0.30 series (0.31 is
+# still in beta); the API churn winit is known for lands behind this crate,
+# which is the only place that names it.
+winit = "0.30"
+# CPU-side presentation: hand a window a buffer of pixels, no GPU API, no GL
+# context. The honest match for a CPU compositor — and it keeps the M1 backend
+# free of the graphics stack M2 will introduce deliberately.
+softbuffer = "0.4"
+
+# Inherit the workspace lint policy (see the root Cargo.toml).
+[lints]
+workspace = true

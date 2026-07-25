@@ -172,6 +172,14 @@ impl<C: Compositor> RenderLoop<C> {
     pub fn compositor(&self) -> &C {
         &self.compositor
     }
+
+    /// The compositor, mutably — for the one thing only its owner can do: tell
+    /// it the output changed size (T6, the nested backend's window resize). The
+    /// core still never interprets what a frame *is*; it only hands the backend
+    /// back the target it lent.
+    pub fn compositor_mut(&mut self) -> &mut C {
+        &mut self.compositor
+    }
 }
 
 #[cfg(test)]

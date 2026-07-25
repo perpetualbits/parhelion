@@ -37,6 +37,11 @@ softbuffer = "0.4"
 # from the handler, polled by the loop — with no unsafe of our own.
 signal-hook = { version = "0.3", default-features = false }
 
+[dev-dependencies]
+# Temporary directories for the dev-binary test's sockets, so it depends on no
+# `$XDG_RUNTIME_DIR` and cannot collide with a running session.
+tempfile = "3"
+
 # Inherit the workspace lint policy (see the root Cargo.toml).
 [lints]
 workspace = true

@@ -44,6 +44,31 @@ Measured damage for a keystroke now ranges **0.11%–1.87%** of the output acros
 runs (bound: 25%) — the variance is foot repainting a cell, a line, or a prompt
 row, and it is why the bound is generous.
 
+### The second CI failure: the dev-binary test could not find the binary
+
+The push after the fix above went red again, differently:
+
+```
+spawn parhelion-dev — was it built? : Os { code: 2, kind: NotFound }
+```
+
+`cargo test` builds a binary's *unit-test* harness, but it does not place
+`target/debug/parhelion-dev`; only `cargo build` does. Locally that file existed
+because I had run `cargo build` while developing — on a fresh runner it does not.
+The test was reconstructing the path from its own executable's location, which
+encoded that assumption invisibly.
+
+Fixed properly rather than papered over: the test **moved to
+`crates/backend-winit/tests/`**, the package that owns the binary, where
+`env!("CARGO_BIN_EXE_parhelion-dev")` gives the path *and* cargo guarantees the
+binary is built first. Verified by deleting `target/debug/parhelion-dev` and
+re-running the full gate.
+
+**What CI proved in the meantime:** the acceptance test and all six clipboard
+tests — including the `wl-copy`/`wl-paste` round trip — **passed on the runner**.
+The compositor work was sound; both CI failures were test-infrastructure
+assumptions that only held on my machine.
+
 ## 1. Clipboard v1 (`wl_data_device_manager`)
 
 Implemented through Smithay's data-device machinery. **The bytes never touch the

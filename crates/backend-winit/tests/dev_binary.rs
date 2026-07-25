@@ -1,6 +1,10 @@
 //! T7: the `parhelion-dev` binary's own plumbing — socket, shutdown, cleanup —
 //! exercised as a real subprocess, on a machine with no display.
 //!
+//! Lives in this crate, not the harness, because `CARGO_BIN_EXE_parhelion-dev`
+//! is only available to the package that owns the binary — and with it comes
+//! cargo's guarantee that the binary exists before the test runs.
+//!
 //! Governing design: `docs/scene_graph_v1.md` §11.4 and the T6 session summary's
 //! open wart (a signal left the socket and its lock file behind). The fix is only
 //! believable if the *binary* is what gets signalled, so this spawns it in
@@ -19,14 +23,17 @@ use std::time::{Duration, Instant};
 /// How long to wait for any single condition before failing loudly.
 const BUDGET: Duration = Duration::from_secs(20);
 
-/// Path to the binary under test, as cargo built it for this test run.
-fn dev_binary() -> std::path::PathBuf {
-    // `CARGO_BIN_EXE_*` is only set for bins in the *same* crate, so resolve it
-    // from the test executable's own directory instead: target/<profile>/deps/…
-    let mut dir = std::env::current_exe().expect("test executable path");
-    dir.pop(); // deps/
-    dir.pop(); // <profile>/
-    dir.join("parhelion-dev")
+/// Path to the binary under test.
+///
+/// `CARGO_BIN_EXE_<name>` is set by cargo for integration tests **in the package
+/// that owns the binary**, and cargo guarantees the binary is built before the
+/// test runs. That guarantee is why this test lives here rather than in the
+/// harness crate: there, the path had to be reconstructed from the test
+/// executable's own location, and `target/debug/parhelion-dev` only exists if
+/// someone happened to have run `cargo build` — true on a developer's machine,
+/// false on a fresh CI runner, which is exactly how it failed.
+fn dev_binary() -> &'static str {
+    env!("CARGO_BIN_EXE_parhelion-dev")
 }
 
 /// Spawn `parhelion-dev --headless --socket <path>` and wait until it reports

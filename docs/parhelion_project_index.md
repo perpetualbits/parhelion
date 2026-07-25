@@ -42,7 +42,7 @@ the standing instruction set every session obeys.
 | `docs/parhelion_project_index.md` | This file. | Living |
 | `docs/diary.md` | Running narrative diary; the why behind non-obvious choices, tagged. | Living |
 | `docs/sessions/` | One summary per Claude Code session (files changed, build/test result). | Living · latest `_session_2026-07-25_seat-input-winit-t6.md` |
-| `docs/plans/` | Per-milestone task breakdowns (`mN_tasks.md`), written at each milestone's start. | `m1_tasks.md` (M1 "One window, honestly", T1–T7) |
+| `docs/plans/` | Per-milestone task breakdowns (`mN_tasks.md`), written at each milestone's start. | `m1_tasks.md` (M1 "One window, honestly", T1–T7 — **complete**), `m2_tasks.md` (M2 "On the metal", T0–T8 — T0 in progress) |
 | `docs/prompts/` | Task prompts authored in the chat project for Claude Code. | `prompt_00_scaffolding.md`, `prompt_04_scene_graph_v1.md`, `prompt_05_frame_callbacks_backpressure.md`, `prompt_06_shm_seam_check.md`, `prompt_08_xdg_shell.md`, `prompt_09_seat_input_winit.md`, `prompt_10_m1_acceptance.md`, `prompt_11_clipboard_m1_close.md` |
 | `docs/archive/` | Superseded documents, kept verbatim; do not edit. | `0002-procedural-content-open-vocabulary.md` (superseded in format by the decision log) |
 | `third_party/spine/` | Vendored, pinned SPINE core spec (v0.4) from ENO; read-only. | Empty — pending Roland copying the spec files |
@@ -76,6 +76,18 @@ T6.
 ---
 
 ## Current state
+
+- **Milestone: M2 (On the metal) — T0 complete 2026-07-25** (`docs/plans/m2_tasks.md`).
+  M1's promissory notes paid or honestly reported. **Paid:** the dispatch-thread
+  spin, via a client-intake restructure — one `calloop` source per client (its
+  socket `try_clone`d at admission), the aggregate poll fd no longer watched, and
+  throttling as a literal source *disable* with hysteresis on re-arm. The spin ends
+  by construction: 100 046 loop turns in 300 ms under the old semantics, ~15 now.
+  **Reported, not paid:** the subsurface tripwire is impossible — every refusal
+  point kills `foot` (it creates nine subsurfaces and puts pixels in eight), so the
+  debt stands until **M2 T7** and foot renders undecorated until then. The T7b
+  claim that foot never calls `get_subsurface` was a measurement error of mine and
+  is corrected in the decision log. `make test`: **110 tests green**, clippy clean.
 
 - **M1 T7b** (2026-07-25) — clipboard v1 and the CI fix. `wl_data_device_manager`
   implemented properly (focus-gating **is** the v1 capability model, satisfying

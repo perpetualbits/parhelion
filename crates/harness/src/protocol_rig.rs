@@ -66,6 +66,8 @@ use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat::{self, WlSeat};
 use wayland_client::protocol::wl_shm::{self, Format, WlShm};
 use wayland_client::protocol::wl_shm_pool::WlShmPool;
+use wayland_client::protocol::wl_subcompositor::WlSubcompositor;
+use wayland_client::protocol::wl_subsurface::WlSubsurface;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
 use wayland_protocols::xdg::shell::client::xdg_popup::{self, XdgPopup};
@@ -323,6 +325,33 @@ impl Dispatch<WlOutput, ()> for App {
             wl_output::Event::Done => state.output_done += 1,
             _ => {}
         }
+    }
+}
+
+impl Dispatch<WlSubcompositor, ()> for App {
+    /// Emits no events; it hands out `wl_subsurface` objects.
+    fn event(
+        _: &mut Self,
+        _: &WlSubcompositor,
+        _: <WlSubcompositor as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WlSubsurface, ()> for App {
+    /// Emits no events either. The rig creates one only to prove the compositor
+    /// refuses it out loud (M2 T0's tripwire); it never gets to be useful.
+    fn event(
+        _: &mut Self,
+        _: &WlSubsurface,
+        _: <WlSubsurface as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
     }
 }
 
@@ -857,6 +886,22 @@ impl ScriptedClient {
         surface.destroy();
     }
 
+    /// Flush what fits, and treat a full socket as success.
+    ///
+    /// This is what a flooding client actually experiences once backpressure
+    /// bites: the compositor stops reading, the kernel buffer fills, and the
+    /// client's own writes start returning `WouldBlock`. That is the mechanism
+    /// working, not a failure — so a test that floods deliberately uses this
+    /// rather than [`flush`](Self::flush), which panics on it.
+    pub fn flush_best_effort(&self) {
+        match self.conn.flush() {
+            Ok(()) => {}
+            Err(wayland_client::backend::WaylandError::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("client flush failed for a reason other than a full socket: {e}"),
+        }
+    }
+
     /// Flush buffered requests to the socket **without** waiting for the server
     /// (no round-trip). Used to pile requests onto a deliberately-throttled
     /// socket in the backpressure test, where a round-trip would block forever
@@ -967,6 +1012,22 @@ impl ScriptedClient {
     pub fn get_toplevel(&mut self, xdg_surface: &XdgSurface) -> XdgToplevel {
         let qh = self.queue.handle();
         xdg_surface.get_toplevel(&qh, ())
+    }
+
+    /// Ask for a subsurface (`wl_subcompositor.get_subsurface`).
+    ///
+    /// Parhelion advertises `wl_subcompositor` because clients refuse to start
+    /// without it, and refuses this request with a protocol error because the
+    /// scene does not composite subsurfaces yet (M2 T0's tripwire; the real
+    /// implementation is M2 T7). The rig has this so a test can prove the refusal
+    /// is *loud*.
+    pub fn get_subsurface(&mut self, surface: &WlSurface, parent: &WlSurface) -> WlSubsurface {
+        let qh = self.queue.handle();
+        let subcompositor: WlSubcompositor = self
+            .globals
+            .bind(&qh, 1..=1, ())
+            .expect("wl_subcompositor global advertised");
+        subcompositor.get_subsurface(surface, parent, &qh, ())
     }
 
     /// Create an `xdg_positioner` (`xdg_wm_base.create_positioner`). Needed only

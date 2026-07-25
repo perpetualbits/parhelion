@@ -123,9 +123,13 @@ reverted it**, because it fails the milestone:
 2. **Withdrawing it breaks real clients**: `foot` refuses to start —
    `err: wayland.c:1746: no sub compositor`, exit 230 — so M1's acceptance
    criterion fails outright.
-3. **The gap is dormant, though**: `WAYLAND_DEBUG=1` shows foot calls
-   `get_subsurface` **zero** times in a full session. The global's existence is a
-   startup probe, not something it exercises.
+3. ~~**The gap is dormant, though**: `WAYLAND_DEBUG=1` shows foot calls
+   `get_subsurface` **zero** times in a full session.~~
+   **> CORRECTION (M2 T0): this was wrong.** The grep matched `@` where the debug
+   format uses `#`, so it found nothing and I read that as evidence of absence.
+   foot creates **nine** subsurfaces and puts buffers in **eight** — its client-side
+   decorations, which Parhelion silently drops. The gap is not dormant; it is
+   visible as an undecorated terminal. See the decision log's correction entry.
 
 So the advertisement stays as a **stated debt**, documented in the code, the scene
 doc (§12.3), and the decision log — and `conformance.rs` now pins the exact set of

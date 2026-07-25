@@ -23,7 +23,9 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use parhelion_backend_headless::composite::CpuCompositor;
-use parhelion_core::protocol::{ProtocolHost, MAX_PENDING_FRAME_CALLBACKS};
+use parhelion_core::protocol::{
+    ProtocolHost, MAX_PENDING_FRAME_CALLBACKS, RESUME_PENDING_FRAME_CALLBACKS,
+};
 use parhelion_core::render::RenderLoop;
 use parhelion_core::scene::{ClientKey, SceneThread, SurfaceId};
 use parhelion_harness::protocol_rig::{ScriptedClient, ShmFormat};
@@ -339,6 +341,112 @@ fn flooding_client_is_throttled_second_client_served_and_bounded() {
         h.query(|s| s.surface_count_for(ClientKey(0))),
         1,
         "A still connected (throttled, not disconnected)"
+    );
+}
+
+/// **The no-spin assertion (M2 T0).** During a sustained flood the dispatch loop
+/// must stay *idle*, not merely correct.
+///
+/// This is the T2 promise coming due. Under the old design a throttled client was
+/// skipped but its socket stayed registered in wayland-backend's aggregate poll
+/// fd, so that fd remained permanently ready and the loop turned continuously
+/// with nothing to do — a busy-wait on the dispatch thread. Per-client readiness
+/// sources make throttling literal: the client's own source is *disabled*, there
+/// is no readiness to report, and the loop sleeps on its timeout.
+///
+/// **Verified to fail against the pre-restructure behaviour.** Reproducing the old
+/// semantics exactly — skip a throttled client's dispatch but leave its readiness
+/// source enabled — makes this loop turn **100 046 times in 300 ms** against the
+/// bound of 200 (and roughly 15 in the fixed build). That is the spin, measured;
+/// reverted after checking.
+#[test]
+fn a_sustained_flood_does_not_spin_the_dispatch_loop() {
+    let (_scene, host, mut render) = scene_host_render();
+
+    let (sa, ca) = UnixStream::pair().expect("socketpair a");
+    host.add_client(sa);
+    let mut a = ScriptedClient::connect(ca);
+
+    let surf_a = a.create_surface();
+    let mut pool_a = a.create_pool(2 * 2 * 4);
+    pool_a.write(&[255u8; 2 * 2 * 4]);
+    let buf_a = a.create_buffer(&pool_a, 2, 2, ShmFormat::Xrgb8888);
+
+    // Drive A to the throttle bound.
+    while host.pending_frame_callbacks() < MAX_PENDING_FRAME_CALLBACKS {
+        let _cb = a.frame(&surf_a);
+        a.attach(&surf_a, &buf_a);
+        a.commit(&surf_a);
+        a.roundtrip();
+    }
+
+    // Pile a large flood into A's now-unpolled socket without round-trips.
+    for _ in 0..5000 {
+        let _cb = a.frame(&surf_a);
+        a.attach(&surf_a, &buf_a);
+        a.commit(&surf_a);
+    }
+    // Best-effort: with the client's source disabled nothing is reading this
+    // socket, so the kernel buffer fills and the flush stops short. That is
+    // backpressure arriving at the client, which is the intended end state.
+    a.flush_best_effort();
+
+    // Now let wall-clock time pass with the flood outstanding. A spinning loop
+    // would turn thousands of times in this window; a sleeping one turns a handful
+    // (its 20 ms idle timeout, plus any real wakeups).
+    let before = host.dispatch_iterations();
+    let window = Duration::from_millis(300);
+    std::thread::sleep(window);
+    let turns = host.dispatch_iterations() - before;
+
+    // The loop's own idle timeout is 20 ms, so ~15 turns are expected in 300 ms.
+    // The bound is generous enough to absorb scheduling noise and any incidental
+    // wakeups, and still two orders of magnitude below a busy-wait.
+    const SPIN_BOUND: usize = 200;
+    assert!(
+        turns <= SPIN_BOUND,
+        "dispatch loop turned {turns} times in {window:?} with a flood outstanding \
+         (bound {SPIN_BOUND}) — it is spinning, not sleeping"
+    );
+
+    // And the flood is still bounded and the client still alive: the no-spin fix
+    // must not have quietly become a no-backpressure fix.
+    assert!(
+        host.pending_frame_callbacks() <= MAX_PENDING_FRAME_CALLBACKS + 1,
+        "backlog stayed at the bound while the loop slept"
+    );
+
+    // Re-arm: a tick drains the callbacks, and A is served again. Without this the
+    // throttle would be a one-way door — a client that floods once, ever, would
+    // never be polled again.
+    render.tick(1234);
+    let mut resumed = false;
+    for _ in 0..200 {
+        if host.pending_frame_callbacks() < RESUME_PENDING_FRAME_CALLBACKS {
+            resumed = true;
+            break;
+        }
+        render.tick(1234);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        resumed,
+        "ticks drained the backlog below the re-arm mark ({} pending)",
+        host.pending_frame_callbacks()
+    );
+
+    // A's buffered flood is now admitted again — proof the source was re-enabled
+    // rather than merely marked. Its backlog climbs from the drained state.
+    let after_drain = host.pending_frame_callbacks();
+    for _ in 0..200 {
+        if host.pending_frame_callbacks() > after_drain {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!(
+        "A was never polled again after draining: throttle did not re-arm \
+         (pending stuck at {after_drain})"
     );
 }
 

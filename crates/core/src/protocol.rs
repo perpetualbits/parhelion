@@ -103,11 +103,13 @@ use std::time::Duration;
 
 use smithay::reexports::calloop::{
     channel::{channel as calloop_channel, Channel, Event as ChannelEvent, Sender as CalloopSender},
-    generic::{Generic, NoIoDrop},
+    generic::Generic,
     ping::{make_ping, Ping, PingSource},
-    EventLoop, Interest, LoopHandle, Mode, PostAction,
+    EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationToken,
 };
-use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason, ObjectId};
+use smithay::reexports::wayland_server::backend::{
+    ClientData, ClientId, DisconnectReason, ObjectId,
+};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_callback::WlCallback;
 use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource;
@@ -195,6 +197,27 @@ pub const CASCADE_STEP_Y: i32 = 32;
 /// cascade cannot clamp to a screen; wrapping is what keeps it from walking off
 /// into the far corner of an unbounded plane.
 pub const CASCADE_WRAP: u64 = 8;
+
+/// The backlog at which a throttled client's socket is polled again (M2 T0).
+///
+/// Hysteresis: a client is throttled at [`MAX_PENDING_FRAME_CALLBACKS`] (64) and
+/// resumed only once it has drained to a **quarter** of that. Re-arming at the
+/// same mark it was throttled at would make a steady flooder oscillate — disabled
+/// and enabled on alternate ticks, one syscall each way, for as long as it kept
+/// flooding. A gap of 48 callbacks means a client that is merely *busy* resumes
+/// after one render tick drains it, while a client that is genuinely flooding
+/// stays parked until it stops.
+pub const RESUME_PENDING_FRAME_CALLBACKS: usize = MAX_PENDING_FRAME_CALLBACKS / 4;
+
+// ==========================================================================
+// Protocol error codes we post ourselves (M2 T0).
+// ==========================================================================
+
+/// `wl_display.error.implementation` — "the compositor cannot implement this
+/// request". The protocol's own way for a server to admit a limitation rather
+/// than blame the client, and what libwayland posts from
+/// `wl_client_post_implementation_error`. Used by the subsurface tripwire.
+pub const WL_DISPLAY_ERROR_IMPLEMENTATION: u32 = 3;
 
 // ==========================================================================
 // Seat constants (T6).
@@ -402,6 +425,10 @@ struct Counters {
     pongs_received: Arc<AtomicUsize>,
     /// `set_selection` requests accepted (T7b).
     selections_set: Arc<AtomicUsize>,
+    /// Dispatch-loop iterations (M2 T0). The spin's measure: under the old
+    /// aggregate-fd design a throttled client kept the loop turning with nothing
+    /// to do, and this is the number that showed it.
+    dispatch_iterations: Arc<AtomicUsize>,
 }
 
 impl Counters {
@@ -412,8 +439,26 @@ impl Counters {
             bytes_copied: Arc::new(AtomicUsize::new(0)),
             pongs_received: Arc::new(AtomicUsize::new(0)),
             selections_set: Arc::new(AtomicUsize::new(0)),
+            dispatch_iterations: Arc::new(AtomicUsize::new(0)),
         }
     }
+}
+
+/// A client's readiness source: the calloop registration for **our own clone** of
+/// its socket, plus whether it is currently being polled.
+///
+/// The clone matters. wayland-backend keeps every client socket inside one epoll
+/// fd of its own, and exposes no way to deregister a single client from it — which
+/// is why the old design could only *skip* a throttled client, leaving its data
+/// unread and the aggregate fd permanently ready (the spin). Owning a second
+/// descriptor for the same socket gives us a registration we control.
+struct ClientSource {
+    /// The calloop registration, so it can be disabled, enabled, and removed.
+    token: RegistrationToken,
+    /// Whether the source is currently polled. Tracked rather than queried
+    /// because calloop has no "is this enabled" accessor, and toggling an
+    /// already-toggled source would be a wasted syscall per pass.
+    enabled: bool,
 }
 
 /// What the dispatch thread tracks per live xdg toplevel. All of it is
@@ -484,6 +529,14 @@ struct State {
     /// The surface that currently has keyboard focus, so a re-focus that would
     /// change nothing sends no events.
     keyboard_focus: Option<SurfaceId>,
+    /// The `Display`, owned here rather than by a calloop source (M2 T0).
+    ///
+    /// It used to live inside the aggregate `Generic` source, which handed it back
+    /// as a callback argument. With per-client readiness sources there is no such
+    /// argument, so the state owns it and each dispatch **takes it out and puts it
+    /// back** — `dispatch_single_client` needs `&mut Display` and `&mut State` at
+    /// once, and taking the `Option` is how those two borrows stop overlapping.
+    display: Option<Display<State>>,
     /// Handle used to admit clients and resolve object→client.
     dh: DisplayHandle,
     /// Handle to this thread's `calloop` loop, so a source callback can register
@@ -526,6 +579,10 @@ struct State {
     present_ts: Arc<AtomicU32>,
     /// Observability counters, shared with the host (see [`Counters`]).
     counters: Counters,
+    /// One readiness source per client (M2 T0) — the shape that makes throttling
+    /// literal: a throttled client's source is *disabled*, so its socket is not
+    /// polled at all until it drains.
+    client_sources: HashMap<ClientId, ClientSource>,
     /// Set when a surface was destroyed, so the selection is re-checked once the
     /// departing client's teardown has finished (see [`refresh_selection`]).
     ///
@@ -680,13 +737,46 @@ impl State {
 /// T6). Both must produce identical state, so they share the code rather than
 /// resembling each other.
 fn admit_client(state: &mut State, stream: UnixStream) {
+    // Our own descriptor for the same socket, used purely as a readiness signal.
+    // wayland-backend keeps the one it is given inside its own epoll and offers no
+    // way to deregister a single client from it; this clone is the registration we
+    // control, and therefore the thing throttling can switch off.
+    let readiness = match stream.try_clone() {
+        Ok(fd) => fd,
+        Err(_) => return, // out of descriptors: admit nothing rather than half-admit
+    };
+
     let key = state.alloc_client_key();
     let data = ClientState {
         compositor_state: CompositorClientState::default(),
         key,
         scene: state.scene.clone(),
     };
-    let _ = state.dh.insert_client(stream, Arc::new(data));
+    let Ok(client) = state.dh.insert_client(stream, Arc::new(data)) else {
+        return;
+    };
+    let id = client.id();
+
+    // One source per client: readiness here means "this client has requests", and
+    // the callback dispatches that client alone.
+    let dispatch_id = id.clone();
+    let token = state.loop_handle.insert_source(
+        Generic::new(readiness, Interest::READ, Mode::Level),
+        move |_readiness, _fd, state: &mut State| {
+            Ok(dispatch_one_client(state, dispatch_id.clone()))
+        },
+    );
+    // On registration failure the loop is tearing down; the client is admitted but
+    // never polled, which is the same outcome as not admitting it.
+    if let Ok(token) = token {
+        state.client_sources.insert(
+            id,
+            ClientSource {
+                token,
+                enabled: true,
+            },
+        );
+    }
 }
 
 // ==========================================================================
@@ -1132,7 +1222,9 @@ impl CompositorHandler for State {
 
 // `delegate_compositor!` supplies the Dispatch/GlobalDispatch impls for
 // wl_compositor/wl_surface/wl_subcompositor/wl_region/wl_callback, routing them
-// to `CompositorState` and the `CompositorHandler` impl above.
+// to `CompositorState` and the `CompositorHandler` impl above. The subsurface
+// tripwire lives in [`State::commit`], not in a hand-written replacement for this
+// macro — see the note there.
 smithay::delegate_compositor!(State);
 
 impl ShmHandler for State {
@@ -1584,6 +1676,16 @@ impl ProtocolHost {
         self.counters.pongs_received.load(Ordering::Relaxed)
     }
 
+    /// How many times the dispatch loop has turned (M2 T0).
+    ///
+    /// The spin's measure. Under the old aggregate-fd design, a throttled client's
+    /// unread data kept the loop's source permanently ready, so this climbed
+    /// without bound during a flood while no useful work happened. With per-client
+    /// sources the throttled client is not polled at all, and the loop sleeps.
+    pub fn dispatch_iterations(&self) -> usize {
+        self.counters.dispatch_iterations.load(Ordering::Relaxed)
+    }
+
     /// Number of `set_selection` requests the compositor has accepted — i.e. how
     /// many times the clipboard changed hands. Observability for tests waiting on
     /// "the clipboard is ready"; the content itself never passes through the
@@ -1622,92 +1724,108 @@ fn surface_frame_backlog(surface: &WlSurface) -> usize {
     })
 }
 
-/// Dispatch client requests, applying the per-client backpressure bound, on the
-/// `Display` that calloop's `Generic` source is guarding. **Does not flush** —
-/// flushing is owned by the single site in [`run_dispatch`]; this only reads
-/// requests (firing the `CompositorHandler` callbacks).
+/// Dispatch one client's pending requests (M2 T0).
 ///
-/// Backpressure (I-10): rather than `dispatch_clients` (which reads every ready
-/// client), we dispatch **per client** and skip any whose pending frame-callback
-/// backlog is at or over [`MAX_PENDING_FRAME_CALLBACKS`]. A skipped client's
-/// socket is simply not read this pass, so its requests stay in the kernel
-/// buffer (and its own writes block once that fills) until a render tick drains
-/// its callbacks below the bound — never dropped, and shard-mates keep being
-/// served. Note (v1 cost, `docs/scene_graph_v1.md` §8): while a skipped client
-/// has unread data the level-triggered `Display` source stays ready, so the loop
-/// spins to keep serving others during an active flood; this is the dispatch
-/// thread, not the frame path (I-1 is unaffected). The tighter fix is M2.
+/// Called from that client's own readiness source, so "which client has data" is
+/// answered by the event loop rather than by us asking every client in turn.
 ///
-/// `unsafe` is confined here and justified at the block. The workspace lints
-/// warn on `unsafe_code`; this one use is the documented Smithay + calloop
-/// integration and is allowed with the justification below.
-#[allow(unsafe_code)]
-fn pump_display(
-    display: &mut NoIoDrop<Display<State>>,
-    state: &mut State,
-) -> std::io::Result<PostAction> {
-    // SAFETY: `NoIoDrop::get_mut` is unsafe solely because using the returned
-    // `&mut` to drop or close the underlying fd would corrupt calloop's
-    // registration of this source. We only call `backend()`/`dispatch_single_client`,
-    // which read requests — never drop or close the fd. This is the standard
-    // wayland-server-on-calloop pattern (cf. Smithay's anvil).
-    let display = unsafe { display.get_mut() };
+/// The `Display` is taken out of the state for the call and put back after:
+/// `dispatch_single_client` wants `&mut Display` *and* `&mut State`, and those two
+/// borrows cannot overlap while the display lives in the state. **Does not
+/// flush** — flushing is owned by the single site in [`run_dispatch`].
+fn dispatch_one_client(state: &mut State, id: ClientId) -> PostAction {
+    let Some(mut display) = state.display.take() else {
+        // Only possible if this were re-entered from inside a dispatch, which
+        // calloop does not do. Bail rather than panic: a compositor that aborts on
+        // an impossible condition is worse than one that skips a wakeup.
+        return PostAction::Continue;
+    };
+    let result = display.backend().dispatch_single_client(state, id.clone());
+    state.display = Some(display);
 
-    // Drop object handles for surfaces whose client is gone, so the backlog and
-    // callback bookkeeping never touches a dead resource; drop their retained
-    // pixel blocks too (a client that disconnects without destroying surfaces).
+    // Housekeeping that used to run once per aggregate pass, now per dispatch:
+    // drop object handles for surfaces whose client is gone, so backlog and
+    // callback bookkeeping never touch a dead resource, and drop their retained
+    // pixel blocks (a client that disconnects without destroying its surfaces).
     state.surfaces.retain(|_, s| s.is_alive());
     state
         .surface_pixels
         .retain(|obj, _| state.surfaces.contains_key(obj));
 
-    // Per-client pending-callback backlog, computed once for the throttle
-    // decision below (and republished for observability).
+    // A dispatch error means the client is gone (EOF, or it was killed for a
+    // protocol error). Its socket would otherwise stay readable-at-EOF forever,
+    // and a level-triggered source over a dead socket is a spin of its own — so
+    // the source is removed here, at the one place that learns of the death.
+    if result.is_err() {
+        remove_client_source(state, &id);
+    }
+
+    // A surface was destroyed during this dispatch; now that the client's teardown
+    // is complete, re-check whether it took the clipboard with it (T7b).
+    if std::mem::take(&mut state.selection_needs_refresh) {
+        state.refresh_selection();
+    }
+
+    update_throttles(state);
+    republish_backlog(state);
+    PostAction::Continue
+}
+
+/// Total pending frame callbacks per client — the throttle signal.
+fn per_client_backlog(state: &State) -> HashMap<ClientId, usize> {
     let mut backlog: HashMap<ClientId, usize> = HashMap::new();
     for surface in state.surfaces.values() {
         if let Some(client) = surface.client() {
             *backlog.entry(client.id()).or_default() += surface_frame_backlog(surface);
         }
     }
+    backlog
+}
 
-    // Dispatch each live client, skipping the over-bound ones (their sockets go
-    // unread — the backpressure). Collect ids first so the immutable backend
-    // handle borrow ends before the mutable per-client dispatch.
-    let ids: Vec<ClientId> = {
-        let mut v = Vec::new();
-        state.dh.backend_handle().with_all_clients(|id| v.push(id));
-        v
-    };
-    for id in ids {
-        let over = backlog.get(&id).copied().unwrap_or(0) >= MAX_PENDING_FRAME_CALLBACKS;
-        if !over {
-            // Ignore per-client errors (e.g. WouldBlock when a client has nothing
-            // pending, or a client that just disconnected): they are not fatal to
-            // the loop, and disconnect is handled via ClientData::disconnected.
-            let _ = display.backend().dispatch_single_client(state, id);
-        }
-    }
-
-    // A surface was destroyed during this pass; now that the client's teardown
-    // is complete, re-check whether it took the clipboard with it.
-    if std::mem::take(&mut state.selection_needs_refresh) {
-        state.refresh_selection();
-    }
-
-    // Republish the up-to-date total *after* dispatch, so a caller that just
-    // round-tripped a client observes that client's new backlog (the rig test
-    // relies on this to know when the bound is reached).
-    let total: usize = state
-        .surfaces
-        .values()
-        .map(surface_frame_backlog)
-        .sum();
+/// Publish the total pending-callback count for observability (the rig's
+/// backpressure test reads it through [`ProtocolHost::pending_frame_callbacks`]).
+fn republish_backlog(state: &State) {
+    let total: usize = state.surfaces.values().map(surface_frame_backlog).sum();
     state
         .counters
         .pending_frame_callbacks
         .store(total, Ordering::Relaxed);
+}
 
-    Ok(PostAction::Continue)
+/// Apply the backpressure policy (I-10's fairness rider), now literally.
+///
+/// A client at or over [`MAX_PENDING_FRAME_CALLBACKS`] has its readiness source
+/// **disabled**: the event loop stops polling that socket entirely, so its
+/// requests stay in the kernel buffer and its own writes block once that fills.
+/// It is re-enabled once its backlog drains below
+/// [`RESUME_PENDING_FRAME_CALLBACKS`] — the hysteresis gap that stops a steady
+/// flooder from toggling the registration on every tick.
+///
+/// **This is what ends the spin.** The old design could only *skip* a throttled
+/// client while the aggregate fd stayed ready, so the loop turned continuously
+/// with nothing to do. With the client's own source disabled there is no readiness
+/// to report, and the loop sleeps: the fix is structural, not a bound on how fast
+/// we spin.
+fn update_throttles(state: &mut State) {
+    let backlog = per_client_backlog(state);
+    let handle = state.loop_handle.clone();
+    for (id, source) in state.client_sources.iter_mut() {
+        let pending = backlog.get(id).copied().unwrap_or(0);
+        let over = pending >= MAX_PENDING_FRAME_CALLBACKS;
+        let drained = pending < RESUME_PENDING_FRAME_CALLBACKS;
+        if source.enabled && over && handle.disable(&source.token).is_ok() {
+            source.enabled = false;
+        } else if !source.enabled && drained && handle.enable(&source.token).is_ok() {
+            source.enabled = true;
+        }
+    }
+}
+
+/// Drop a departed client's readiness source and forget it.
+fn remove_client_source(state: &mut State, id: &ClientId) {
+    if let Some(source) = state.client_sources.remove(id) {
+        state.loop_handle.remove(source.token);
+    }
 }
 
 /// The reverse edge's dispatch-side half: a frame was presented, so fire the
@@ -1768,30 +1886,35 @@ fn run_dispatch(
     let mut event_loop: EventLoop<State> = EventLoop::try_new().expect("create calloop event loop");
     let handle = event_loop.handle();
     let compositor_state = CompositorState::new::<State>(&dh);
-    // **`wl_subcompositor`: advertised, and not yet honoured — a stated debt.**
+    // **`wl_subcompositor`: advertised, used by real clients, and NOT composited.**
+    // A stated debt, blocking on M2 T7 — and the measurement below is the reason
+    // T0's tripwire is not here.
     //
-    // `CompositorState::new` creates this global as a side effect, and Smithay
-    // implements its protocol correctly — but *Parhelion's scene ignores
-    // subsurfaces*: only a root surface's buffer becomes a scene node, so content
-    // a client put in a subsurface would silently not render.
+    // The scene composites only root surfaces; a subsurface's content is dropped.
+    // T0 set out to make that refusal loud (decision log: "advertise before
+    // support requires loud refusal at point of use"). Both refusal points were
+    // implemented and measured against `foot`, and both kill it:
     //
-    // T7b set out to withdraw it on the "advertise only what we honour"
-    // principle, and the global *is* separable
-    // (`dh.remove_global::<State>(compositor_state.subcompositor_global())`).
-    // Withdrawing it was measured, and it makes Parhelion unusable by real
-    // clients: `foot` refuses to start — `err: wayland.c:1746: no sub compositor`,
-    // exit 230 — which would fail the M1 acceptance criterion outright.
+    //   * refusing `get_subsurface` — foot creates **nine** subsurfaces during
+    //     startup, so it dies at once;
+    //   * refusing a subsurface that commits a buffer — **eight** of those nine
+    //     carry real pixels (its client-side decorations), so it dies a moment
+    //     later.
     //
-    // What the same measurement also showed: foot binds the global but calls
-    // `get_subsurface` **zero** times in a full session (checked with
-    // `WAYLAND_DEBUG=1`). So today the gap is *dormant* for the clients we run —
-    // the global's existence is a startup sanity check they make, not something
-    // they exercise. That is a reason to schedule the real fix, not to relax about
-    // it: a client that does use subsurfaces loses that content with no error.
+    // (An earlier session reported "foot calls `get_subsurface` zero times". That
+    // was wrong — a `WAYLAND_DEBUG` grep matching `@` where the format uses `#` —
+    // and the correction is recorded in the decision log. The whole tripwire
+    // design rested on it.)
     //
-    // The honest resolution is to implement subsurfaces (scene work, a slice of
-    // its own — likely alongside popups). Until then this is a recorded debt with
-    // its evidence, not an unexamined side effect. See the T7b session summary.
+    // So there is no refusal point that keeps an honest client alive: foot both
+    // requires the global and uses it for content. Loud refusal and a working
+    // terminal are mutually exclusive until subsurfaces are real (M2 T7), and the
+    // milestone's own acceptance criterion is the terminal.
+    //
+    // **Consequence, stated:** foot renders today **without its decorations** —
+    // title bar, borders, corners are all subsurfaces we silently drop. That is
+    // the silent wrongness the decision exists to forbid, and it stands, visibly,
+    // until T7 pays it.
 
     // Advertise `wl_shm`. The mandatory `argb8888`/`xrgb8888` formats are added by
     // `ShmState::new`; we request no extras (T3 handles exactly those two).
@@ -1862,6 +1985,7 @@ fn run_dispatch(
     );
 
     let mut state = State {
+        display: Some(display),
         compositor_state,
         shm_state,
         xdg_shell_state,
@@ -1877,6 +2001,7 @@ fn run_dispatch(
         keyboard_focus: None,
         dh: dh.clone(),
         loop_handle: handle.clone(),
+        client_sources: HashMap::new(),
         next_surface_id: 0,
         next_client_key: 0,
         obj_to_surface: HashMap::new(),
@@ -1892,15 +2017,10 @@ fn run_dispatch(
         stop: false,
     };
 
-    // The Display's poll fd: readable when a client has pending requests. The
-    // Generic source *owns* the Display, handing it back as the callback's
-    // second argument so we can dispatch and flush in place.
-    handle
-        .insert_source(
-            Generic::new(display, Interest::READ, Mode::Level),
-            |_readiness, display, state: &mut State| pump_display(display, state),
-        )
-        .expect("register display source");
+    // NOTE (M2 T0): the `Display`'s aggregate poll fd is **not** registered. Client
+    // readiness comes from the per-client sources created in `admit_client`, which
+    // is what makes throttling a real deregistration rather than a skipped read.
+    // Grep-verifiable: the display's fd is registered with no calloop source.
 
     // Control channel: admit clients (the accept seam) and shutdown. The stop
     // flag lives in `State` so both this closure (via its `&mut State` argument)
@@ -1970,6 +2090,12 @@ fn run_dispatch(
     handle
         .insert_source(ping_source, |_event, _metadata, state: &mut State| {
             present(state);
+            // Firing callbacks is what drains a throttled client's backlog — and a
+            // throttled client's source is disabled, so it can never re-arm from
+            // its own dispatch. This is the *only* place the re-arm can happen,
+            // which is why it lives here rather than only after a dispatch.
+            update_throttles(state);
+            republish_backlog(state);
         })
         .expect("register frame-present ping source");
 
@@ -1977,6 +2103,14 @@ fn run_dispatch(
     // level-triggered readiness — it is a safety net, not the primary wakeup
     // (all sources wake the loop).
     while !state.stop {
+        // Counted for the no-spin assertion (M2 T0): under the old aggregate-fd
+        // design a throttled client kept this loop turning with nothing to do, and
+        // this number is how the flooding test proves it no longer does.
+        state
+            .counters
+            .dispatch_iterations
+            .fetch_add(1, Ordering::Relaxed);
+
         event_loop
             .dispatch(Some(Duration::from_millis(20)), &mut state)
             .expect("calloop dispatch");

@@ -236,11 +236,43 @@ call* — there is no per-request read cap. So the backlog is bounded by
 `MAX_PENDING_FRAME_CALLBACKS` **plus one socket-read burst**, not a tight
 per-event constant; the throttle prevents the *next* read, not the current one.
 The client's own writes block once its kernel socket buffer fills — that is the
-end-to-end backpressure. **v1 cost, chosen deliberately (keep it simple):** while
-a throttled client has unread data the level-triggered `Display` source stays
-ready, so the dispatch loop spins to keep serving others during an active flood.
-This is the dispatch thread, *not* the frame path (I-1 is unaffected), and the
-tighter fix (per-client readiness / edge management) is M2.
+end-to-end backpressure.
+
+**The v1 cost, and how M2 T0 paid it.** v1 could only *skip* a throttled client:
+its socket stayed registered inside wayland-backend's single aggregate poll fd,
+which therefore stayed permanently ready, and the dispatch loop turned
+continuously with nothing to do — a busy-wait on the dispatch thread (never the
+frame path, so I-1 was unaffected). **M2 T0 replaced the intake with per-client
+readiness sources**, and throttling became literal: at `add_client` the client's
+socket is `try_clone`d and *that* descriptor is registered with `calloop`, so a
+throttled client's source can simply be **disabled**. No readiness, no wakeups,
+no spin — the loop sleeps on its timeout. Measured: reproducing the old semantics
+makes the loop turn **100 046 times in 300 ms** where the fixed build turns ~15
+(`harness/tests/protocol.rs::a_sustained_flood_does_not_spin_the_dispatch_loop`).
+
+**Hysteresis.** Throttle at `MAX_PENDING_FRAME_CALLBACKS` (64), resume below
+`RESUME_PENDING_FRAME_CALLBACKS` (16 — a quarter). Re-arming at the same mark
+would make a steady flooder toggle its registration on alternate ticks; the gap
+means a merely-busy client resumes after one render tick while a real flooder
+stays parked. The re-arm happens where the backlog is *drained* — in the
+present/callback path — because a disabled client can never re-arm from its own
+dispatch.
+
+**Two alternatives, rejected, so they stay rejected:**
+
+- *Edge-triggering the aggregate fd.* It stops the spin and starves shard-mates:
+  the aggregate fd never goes quiet while a throttled client holds unread data, so
+  no new edge arrives — including for other clients that become ready. Fairness
+  is the whole point of the rider; trading it for CPU is the wrong direction.
+- *Timer-based rate limiting.* Bounds how fast the loop spins without ending the
+  spin. It would satisfy an "iterations stay bounded" assertion while leaving the
+  promise unkept, which is worse than not fixing it: the test would then certify
+  the wrong thing.
+
+**Shard-readiness, as a side effect.** Per-client sources are the shape a future
+shard takes ownership of — a shard is "these clients' sources plus their
+`Display`". The restructure moves toward the spike's shard-count-agnostic
+interface rather than bending it.
 
 ### 8.6 T2 tests (`harness/tests/protocol.rs`)
 
@@ -702,23 +734,35 @@ context, no per-client grant, no smaller grant set for remote clients. Ordinary
 Wayland, correct for M1; C8's capability machinery (M4) is where it becomes a
 policy question.
 
-### 12.3 `wl_subcompositor`: an advertised global we do not honour
+### 12.3 `wl_subcompositor`: advertised, used, and not composited
 
-Recorded here because it is the one place Parhelion advertises something it does
-not implement, and because the attempt to fix it produced a useful measurement.
+The one place Parhelion advertises something it does not implement — and, after
+M2 T0, the one place where "refuse loudly instead" was tried and found impossible.
 
-The scene ignores subsurfaces: only a root surface's buffer becomes a scene node.
-The global **is** separable (`CompositorState::subcompositor_global()` +
-`DisplayHandle::remove_global`), and withdrawing it was implemented and measured —
-whereupon `foot` refuses to start (`no sub compositor`, exit 230), failing M1's
-acceptance criterion. The same measurement showed `foot` never calls
-`get_subsurface`, so the gap is *dormant* for the clients we run: the global's
-existence is a startup probe, not something they exercise.
+The scene composites only root surfaces; a subsurface's content is dropped. T0's
+plan was to make that refusal loud (decision log: *advertise-before-support
+requires loud refusal at point of use*). Both candidate refusal points were
+implemented and measured against `foot`:
 
-So the advertisement stays as a **stated debt**; the conformance test pins the
-exact advertised set so the next change to it is deliberate; and the honest
-resolution — implementing subsurfaces — is scheduled work rather than a silent
-omission.
+| Refuse at | Result |
+|---|---|
+| `get_subsurface` | foot dies at startup — it creates **nine** subsurfaces |
+| a subsurface committing a buffer | foot dies moments later — **eight** of the nine carry pixels |
+
+They are foot's client-side decorations. **There is no refusal point that keeps an
+honest client alive**, so loud refusal and a working terminal are mutually
+exclusive until subsurfaces are real (**M2 T7**) — and the milestone's acceptance
+criterion *is* the terminal.
+
+The premise T0 was built on ("foot binds the global but never calls
+`get_subsurface`") was **my measurement error** — a `WAYLAND_DEBUG` grep matching
+`@` where the format uses `#` — and the correction is recorded in the decision log.
+
+**Consequence, stated plainly:** foot renders **without its decorations** today.
+That is exactly the silent wrongness the principle forbids; it stands, visibly,
+until T7 pays it. The conformance suite pins the behaviour
+(`a_subsurface_is_accepted_and_its_content_is_silently_not_composited`) so that
+test inverts the day subsurfaces land.
 
 ### 12.4 Graceful shutdown
 

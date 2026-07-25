@@ -85,6 +85,7 @@ window.PROJECT_MAP = {
         { label: "Accept seam / shard assignment", status: "done", desc: "add_client routes a socket to a shard." },
         { label: "wl_compositor / wl_surface", status: "done", desc: "create / commit / destroy via Smithay's compositor handler." },
         { label: "Send/Sync static guards", status: "done", desc: "Compile-time regression guards on the threading facts." },
+        { label: "Per-client readiness", status: "done", desc: "One calloop source per client (M2 T0): throttling disables a source outright, ending the dispatch-loop spin by construction — and it is the shape a future shard owns." },
       ],
       deps: [],
     },
@@ -139,12 +140,13 @@ window.PROJECT_MAP = {
     {
       id: "subsurfaces", label: "Subsurfaces", layer: "protocol", status: "seam",
       tags: ["M1", "debt"],
-      desc: "wl_subcompositor is ADVERTISED but not honoured: the scene composites only root surfaces. Withdrawing the advertisement was implemented and measured — foot then refuses to start (no sub compositor, exit 230), failing M1's acceptance — while the same trace showed foot never calls get_subsurface, so the gap is dormant for the clients we run. It stays as a stated debt with the advertised global set pinned by test; the honest fix is implementing subsurfaces, likely alongside popups.",
+      desc: "wl_subcompositor is ADVERTISED and USED by real clients, and their content is silently dropped: the scene composites only root surfaces. foot creates NINE subsurfaces and puts pixels in EIGHT — its decorations — so it currently renders undecorated under Parhelion. M2 T0 tried to make the gap refuse loudly at both candidate points (creating a subsurface; committing content to one) and both kill foot, which is the milestone's own acceptance criterion. There is no containment, only payment: M2 T7. (An earlier claim that foot never calls get_subsurface was a measurement error, corrected in the decision log.)",
       files: ["crates/core/src/protocol.rs"],
       specs: [{ label: "scene_graph_v1.md §12.3", href: "docs/scene_graph_v1.md" }],
       parts: [
         { label: "Global advertised", status: "done", desc: "Clients that probe for it start; withdrawing it breaks them." },
-        { label: "Scene composition", status: "planned", desc: "Subsurface tree, parent-relative placement, commit semantics." },
+        { label: "Loud refusal", status: "planned", desc: "Impossible while unimplemented — every refusal point kills foot. The conformance test pins the wrong behaviour and inverts at T7." },
+        { label: "Scene composition", status: "planned", desc: "Subsurface tree, parent-relative placement, sync/desync commit, input hit-testing (M2 T7)." },
       ],
       deps: ["scene-graph"],
     },

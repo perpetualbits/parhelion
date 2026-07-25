@@ -82,14 +82,13 @@ fn a_buffer_offset_past_the_pool_is_rejected() {
 
 /// The registry advertises exactly the set of globals Parhelion means to serve.
 ///
-/// **On `wl_subcompositor`:** it is in this list, and it is the one global whose
-/// presence is a *stated debt* rather than a claim — the scene does not composite
-/// subsurfaces. Withdrawing it was tried and measured: `foot` then refuses to
-/// start (`no sub compositor`, exit 230), which fails the milestone's own
-/// acceptance criterion. The real resolution is implementing subsurfaces; see the
-/// T7b session summary for the evidence and the decision this is waiting on. The
-/// assertion below therefore pins *what is advertised today*, so that a future
-/// change to that set is deliberate.
+/// **On `wl_subcompositor`:** it is advertised *ahead of its support*, which the
+/// governing decision permits on one condition — every unsupported request on it
+/// must refuse loudly (see `asking_for_a_subsurface_is_refused_out_loud`).
+/// Withdrawing it instead was tried and measured: `foot` then refuses to start
+/// (`no sub compositor`, exit 230), because clients hard-gate on the presence of
+/// globals they never use. The assertion below pins *what is advertised*, so any
+/// future change to that set is deliberate rather than a side effect.
 #[test]
 fn the_registry_advertises_exactly_the_expected_globals() {
     let (_scene, _host, client) = fixture();
@@ -124,6 +123,49 @@ fn the_registry_advertises_exactly_the_expected_globals() {
         globals.len(),
         8,
         "no global is advertised that this test does not name: {globals:?}"
+    );
+}
+
+/// **Subsurfaces: what a client can do, and what silently does not happen.**
+///
+/// This test pins the *current, unhappy* truth rather than a wish. Parhelion
+/// advertises `wl_subcompositor` and lets clients build subsurfaces — and then
+/// does not composite them, because the scene draws only root surfaces until
+/// M2 T7.
+///
+/// M2 T0 tried to make that refusal loud at both candidate points (creating a
+/// subsurface; committing content to one) and **both kill `foot`**: it creates
+/// nine subsurfaces at startup and puts real pixels in eight of them (its
+/// client-side decorations). Loud refusal and a working terminal are mutually
+/// exclusive until subsurfaces exist. The evidence is in the T0 session summary;
+/// the decision log carries the correction that overturned T0's premise.
+///
+/// **This test inverts at M2 T7**, when the content below actually appears.
+#[test]
+fn a_subsurface_is_accepted_and_its_content_is_silently_not_composited() {
+    let (scene, _host, mut client) = fixture();
+
+    let parent = client.create_surface();
+    let child = client.create_surface();
+    let _subsurface = client.get_subsurface(&child, &parent);
+
+    let mut pool = client.create_pool(8 * 8 * 4);
+    pool.write(&[255u8; 8 * 8 * 4]);
+    let buffer = client.create_buffer(&pool, 8, 8, ShmFormat::Xrgb8888);
+    client.attach(&child, &buffer);
+    client.commit(&child);
+    client.commit(&parent); // sync subsurface: content lands with the parent
+    client.roundtrip();
+
+    assert!(
+        client.protocol_error().is_none(),
+        "the client is not refused — it cannot be, and foot is the proof"
+    );
+    assert!(
+        scene.handle().snapshot().is_empty(),
+        "and its content is not composited: nothing reached the scene. This is the \
+         debt M2 T7 pays; if this assertion starts failing, T7 has landed and this \
+         test should invert."
     );
 }
 

@@ -667,3 +667,52 @@ guards. This closes M0.
   compositor holds the introduction. Thirty-nine bytes of UTF-8 crossed between
   `wl-copy` and `wl-paste` in the test, and Parhelion never saw a single one of
   them. `make test`: 108 tests green. `#core` `#milestone`
+
+## M2 T0 — the measurement I got wrong, and the spin that ended
+
+- **I was wrong about foot, and a decision was built on it.** T7b reported that
+  foot binds `wl_subcompositor` but never calls `get_subsurface` — the basis for
+  T0's whole tripwire design, and for the superseding principle Roland wrote into
+  prompt 12. It was a bad grep: `wl_subcompositor@N` where `WAYLAND_DEBUG` prints
+  `#`. Empty output, read as evidence of absence. foot in fact creates **nine**
+  subsurfaces and puts pixels in **eight** — its decorations. I had even caught
+  the same `@`/`#` mistake later in that session while checking wl-copy's focus,
+  and never went back to re-run the subsurface count. `#bug` `#discovery`
+
+- **What the correct measurement cost.** Both refusal points were implemented
+  before I understood the shape: refuse at `get_subsurface` (foot dies at startup)
+  and refuse at "a subsurface commits a buffer" (foot dies moments later, because
+  eight of nine carry content). The second one I genuinely believed in for about
+  twenty minutes — it is the better rule, refusing exactly where content would be
+  dropped, and foot's *first* subsurface is pixel-less, which made it look
+  survivable. Nine subsurfaces later, no. There is no refusal point that keeps an
+  honest client alive. `#tradeoff`
+
+- **So the debt stands, and it is visible.** foot renders without decorations
+  under Parhelion today. That is the silent wrongness the principle forbids, and
+  it cannot be contained — only paid, at T7. The useful outcome of T0's first item
+  is therefore not a tripwire but an honest test that pins the wrong behaviour and
+  inverts when it is fixed, plus a correction entry so nobody rebuilds on the bad
+  number. Writing "I measured this wrong and here is what is true" costs less than
+  one session; leaving it costs whatever gets built on top. `#milestone`
+
+- **The spin ended by construction, which is the only way it could.** The T2
+  promise was "deregister a throttled client's socket". You cannot: wayland-backend
+  keeps every client socket inside one epoll fd and hands out no per-client
+  registration. The move is to stop asking it — `try_clone` the socket at intake
+  and register *our* descriptor with calloop, one source per client. Then throttle
+  is `handle.disable(&token)` and there is simply no readiness to report. The
+  numbers: old semantics turn the dispatch loop 100 046 times in 300 ms with a
+  flood outstanding; the new one turns about fifteen. `#core`
+
+- **Two tempting non-fixes, written down so they stay dead.** Edge-triggering the
+  aggregate fd stops the spin and starves shard-mates — the fd never goes quiet
+  while a throttled client holds data, so nobody else's readiness produces an edge.
+  Timer-based rate limiting bounds the spin without ending it, and would have made
+  the "iterations stay bounded" assertion pass while the promise stayed unkept:
+  a test certifying the wrong thing is worse than no test. `#design-decision`
+
+- **A pleasant side effect.** Per-client sources are the shape a shard owns. The
+  spike asked for an interface where growing to N shards is an implementation
+  change; this restructure moved toward it without being asked to. `make test`:
+  110 tests green. `#core`

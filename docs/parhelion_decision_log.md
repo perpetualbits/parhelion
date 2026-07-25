@@ -509,13 +509,102 @@ below, reasoning now living in the dialect spec and VISION.md.)
   global the whole ecosystem probes for, produces a compositor nothing will talk to
   — which is a worse outcome than a documented, dormant, scheduled gap.
 
+## 2026-07-25 — Advertise-before-support, refined (M2 T0)
+
+### Advertise-before-support requires loud refusal at point of use — never silent wrongness
+
+- **Source:** prompt 12 / chat review of T7b; Roland's resolution of the T7b
+  Pending item.
+- **Supersedes:** "advertise only what we honour" **in its absolutist reading**
+  (2026-07-25, T7b). The principle stands; the mechanical application does not.
+- **Affects:** the protocol layer (`crates/core/src/protocol.rs`), T7b's pinned
+  advertised-globals test, `docs/scene_graph_v1.md` §12.3.
+- **Why the absolutist reading fails:** T7b measured it. Clients hard-gate on the
+  *presence* of globals they never *use* — `foot` binds `wl_subcompositor`, calls
+  `get_subsurface` **zero** times, and refuses to start without the global.
+  Withdrawal fails honest clients at the door; silent non-support renders wrong.
+  Neither is acceptable.
+- **Decision:** A global may be advertised ahead of support **only if every
+  unsupported request on it posts a protocol error with a clear message.** The
+  client is told, at the exact moment it asks for the thing, that the thing does
+  not exist yet.
+- **Known cost, accepted:** this converts *degraded* into *dead* for clients that
+  actually create subsurfaces (toolkits use them for tooltips, popups, CSD
+  shadows). That is the right trade for a development compositor — a dead client
+  with a diagnostic beats a live client rendering a lie — and it is temporary:
+  retired when subsurfaces land (**M2 T7**).
+- **Applied to:** `wl_subcompositor` now.
+
+### Client intake is per-client readiness sources; throttling deregisters
+
+- **Source:** M2 T0 (prompt 12), paying T2's recorded M2 promise;
+  `docs/scene_graph_v1.md` §8.5.
+- **Affects:** `crates/core/src/protocol.rs` (`admit_client`,
+  `dispatch_one_client`, `update_throttles`, `ClientSource`, `State::display`);
+  invariant I-10's fairness rider; the spike's shard-count-agnostic requirement.
+- **Decision:** At `add_client` the client's socket is `try_clone`d and *that*
+  descriptor is registered as its own `calloop` source; readiness dispatches that
+  client alone. wayland-backend's aggregate poll fd is **no longer watched**
+  (grep-verifiable: no `Generic::new(display, …)`). Throttling is then literal —
+  the client's source is **disabled** — and re-armed below
+  `RESUME_PENDING_FRAME_CALLBACKS` (a quarter of the throttle mark; hysteresis, so
+  a steady flooder does not toggle its registration every tick).
+- **Reasoning:** v1 could only *skip* a throttled client, because the backend
+  keeps every client socket inside one epoll fd and exposes no way to deregister
+  one; that fd therefore stayed ready and the dispatch loop busy-waited. Owning a
+  second descriptor is what makes a registration we control. **The spin ends by
+  construction, not by bounding** — measured: the old semantics turn the loop
+  100 046 times in 300 ms, the new one ~15.
+- **Rejected, recorded so they stay rejected:** edge-triggering the aggregate fd
+  (stops the spin, starves shard-mates — the aggregate never goes quiet while a
+  throttled client holds data, so other clients' readiness produces no edge);
+  timer-based rate limiting (bounds the spin without ending it, and would let an
+  "iterations bounded" test certify the wrong thing).
+- **Shard-readiness:** per-client sources are the objects a future shard takes
+  ownership of — a shard becomes "these clients' sources plus their `Display`".
+  This moves toward the spike's interface requirement rather than bending it.
+
+### CORRECTION (M2 T0): foot *does* use subsurfaces — the entry above rests on a bad measurement
+
+- **Source:** M2 T0, implementing the tripwire the entry above requires.
+- **What was wrong:** T7b reported that `foot` "binds `wl_subcompositor` but calls
+  `get_subsurface` **zero** times". That was my error — a `WAYLAND_DEBUG` grep
+  written as `wl_subcompositor@N.get_subsurface` where the debug format uses `#`,
+  so it matched nothing and I read the empty result as evidence of absence. The
+  claim propagated into the T7b session summary, the T7b decision entry, this
+  prompt's superseding entry, and the code comments.
+- **What is actually true**, measured with the corrected pattern: `foot` creates
+  **nine** subsurfaces during startup and attaches buffers to **eight** of them.
+  They are its client-side decorations — title bar, borders, corners.
+- **What this overturns:** the premise "clients hard-gate on the *presence* of
+  globals they never *use*". foot both requires the global **and** uses it for
+  content. The reasoning in the entry above therefore does not apply to
+  `wl_subcompositor`, which was its only application.
+- **What was tried, and measured, before reporting:** both candidate refusal
+  points were implemented. Refusing `get_subsurface` kills foot at startup;
+  refusing a subsurface that *commits a buffer* (the narrower rule — refuse where
+  content would actually be dropped, which foot's pixel-less input-region
+  subsurface would have survived) kills it a moment later, because eight of its
+  nine subsurfaces carry pixels. **There is no refusal point that keeps an honest
+  client alive.**
+- **Status: the tripwire is not implemented, and the debt stands.** Loud refusal
+  and a working terminal are mutually exclusive until subsurfaces are real
+  (M2 T7), and the milestone's acceptance criterion *is* the terminal. The
+  advertise-before-support principle above is untouched and still governs any
+  *future* global; it simply has no applicable instance today.
+- **Consequence, now visible and stated:** foot renders **without its
+  decorations** — they are subsurfaces we silently drop. That is exactly the
+  silent wrongness the principle forbids, and it stands until T7. It also means
+  the interactive smoke will show an undecorated terminal; that is this debt, not
+  a new bug.
+
 ## Pending
 
-- **Subsurfaces (raised 2026-07-25, T7b).** `wl_subcompositor` is advertised but
-  the scene does not composite subsurfaces. Withdrawing the advertisement was
-  measured and breaks real clients (see the T7b entry above), so the debt stands
-  until subsurfaces are implemented. Roland's call on when — a natural pairing
-  with popups.
+- **Subsurfaces (re-raised 2026-07-25, M2 T0).** `wl_subcompositor` is advertised
+  and used by real clients, and their content is silently dropped — foot loses its
+  decorations. No loud-refusal point exists that keeps foot alive (see the
+  correction above), so the debt cannot be contained; it can only be paid.
+  Scheduled: **M2 T7**. If it should move earlier, that is Roland's call.
 - Lock-screen fail-locked design (`CORE-BOUNDARY.md` §6 note).
 - Adoption of ENO's project-index + sessions/ + diary structure:
   agreed in principle; instantiate at repo creation.

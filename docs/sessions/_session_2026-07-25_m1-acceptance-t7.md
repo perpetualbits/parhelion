@@ -139,13 +139,18 @@ global. Flagging rather than growing scope.
 
 I verified everything below headlessly except what the window looks like.
 
+> **`wayland-N` is a placeholder.** `parhelion-dev` prints the real display name
+> it bound (`wayland-3`, say) and echoes a copy-pasteable `try …` line — use that
+> number. It changes between runs, because the socket is bound to the first free
+> slot.
+
 ```bash
 # Terminal 1 — the compositor (a window should appear)
-cargo run -p parhelion-backend-winit --bin parhelion-dev
+cargo run -p parhelion-backend-winit --bin parhelion-dev &
 # it prints:  parhelion-dev: WAYLAND_DISPLAY=wayland-N
 
 # Terminal 2 — a real terminal, inside it
-WAYLAND_DISPLAY=wayland-N foot
+WAYLAND_DISPLAY=wayland-3 foot   # use the number printed above
 ```
 
 With foot running, also check: **glyphs render** (not blocks or garbage), **typing

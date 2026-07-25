@@ -111,9 +111,14 @@ offset is rejected with artifacts (128–144 differing pixels across the pair).
 
 ## Interactive checklist — please run this one
 
+> **`wayland-N` is a placeholder.** `parhelion-dev` prints the real display name
+> it bound (`wayland-3`, say) and echoes a copy-pasteable `try …` line — use that
+> number. It changes between runs, because the socket is bound to the first free
+> slot.
+
 ```bash
 cargo run -p parhelion-backend-winit --bin parhelion-dev     # terminal 1
-WAYLAND_DISPLAY=wayland-N foot                                # terminal 2
+WAYLAND_DISPLAY=wayland-3 foot   # terminal 2 — use the number printed above
 ```
 
 1. **foot now has decorations** — title bar and borders, drawn by foot into
@@ -130,3 +135,25 @@ WAYLAND_DISPLAY=wayland-N foot                                # terminal 2
 
 Items 4 and 5 are the two M1 leftovers I have never been able to check; the rest
 is covered by tests.
+
+---
+
+## Smoke results — run by Roland, 2026-07-26
+
+Verified on the dev machine, by eye, against `parhelion-dev` + real clients:
+
+| Item | Result |
+|---|---|
+| **foot has a title bar** | ✅ Decorations composite — the subsurface work, confirmed visually |
+| **A second, independent terminal (`rt`, Roland's own)** | ✅ Runs, has a title bar, "generally looks OK" |
+| **`rt` launched *from inside* foot** | ✅ A second window appears, typeable, immediate — multi-window, focus handover and C10 cascade placement all working live |
+| **Typing latency (both terminals)** | ✅ Immediate |
+| **Resize the Parhelion window** | ✅ *(M1 leftover, open since T6 — now closed)* |
+| **Cursor over the window** | ✅ No flicker *(M1 leftover, open since T6 — now closed)* |
+
+**The two items no test could reach are now verified**, and the milestone's claim
+has a second witness: `rt` was written by Roland against no knowledge of
+Parhelion's internals, and it behaves like foot does. Two unrelated clients, one
+launched by the other, both decorated, both responsive.
+
+Roland's summary: *"I would call this a success."*

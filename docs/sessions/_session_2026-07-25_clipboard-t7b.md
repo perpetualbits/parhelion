@@ -143,17 +143,22 @@ item: acceptance bullet "Registry no longer advertises `wl_subcompositor`" is
 
 ## 3. Interactive checklist (extended)
 
+> **`wayland-N` is a placeholder.** `parhelion-dev` prints the real display name
+> it bound (`wayland-3`, say) and echoes a copy-pasteable `try …` line — use that
+> number. It changes between runs, because the socket is bound to the first free
+> slot.
+
 ```bash
 # Terminal 1 — the compositor
-cargo run -p parhelion-backend-winit --bin parhelion-dev
+cargo run -p parhelion-backend-winit --bin parhelion-dev &
 #   prints: parhelion-dev: WAYLAND_DISPLAY=wayland-N
 
 # Terminal 2 — a real terminal inside it
-WAYLAND_DISPLAY=wayland-N foot
+WAYLAND_DISPLAY=wayland-3 foot   # use the number printed above
 
 # Terminal 3 — the clipboard, between two independent programs
-WAYLAND_DISPLAY=wayland-N sh -c 'echo "hello from parhelion" | wl-copy'
-WAYLAND_DISPLAY=wayland-N wl-paste          # → hello from parhelion
+WAYLAND_DISPLAY=wayland-3 sh -c 'echo "hello from parhelion" | wl-copy'
+WAYLAND_DISPLAY=wayland-3 wl-paste          # → hello from parhelion
 ```
 
 Then, inside foot: select text with the mouse and middle-click / `Ctrl+Shift+V` to

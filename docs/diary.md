@@ -773,3 +773,20 @@ guards. This closes M0.
   that trees exist. That seam was drawn in T1 for a feature nobody had specified
   yet, and it held. `make test`: 124 tests green. foot has decorations.
   `#scene` `#milestone`
+
+## The smoke, run by human eyes (2026-07-26)
+
+- **Two clients, one launched from the other, both decorated, both immediate.**
+  Roland ran the smoke: foot has its title bar; his own terminal `rt` runs and
+  looks right; starting `rt` *from inside* foot brings up a second window he can
+  type into with no perceptible lag. Resize behaves; the cursor over the window is
+  clean. The two checklist items that had been marked "eyes only" since T6 are
+  finally closed, and the milestone acquired a second witness that nobody wrote
+  for it. `#milestone`
+
+- **What the second client is worth.** foot passing is evidence; foot *and* an
+  unrelated terminal passing, with one spawning the other, is a different claim —
+  it exercises multi-window mapping, focus handover, cascade placement, and two
+  independent clients sharing a seat, none of which a single-client test can
+  reach. Everything the compositor does for foot it now demonstrably does for
+  software it has never met. `#milestone` `#discovery`

@@ -77,6 +77,11 @@ T6.
 
 ## Current state
 
+- **Interactive smoke verified by Roland (2026-07-26):** foot has its title bar;
+  a second, independent terminal (`rt`) runs and looks right; `rt` launched from
+  inside foot opens a second typeable window with no perceptible lag; resize and
+  cursor-over-window both clean. **The two M1 checklist items that no test could
+  reach — resize and cursor — are closed.**
 - **M2 T7 — Subsurfaces v1, complete 2026-07-26** (pulled to the front of M2; see
   `docs/plans/m2_tasks.md`'s reorder note). The scene grew a tree: parent links,
   parent-relative transforms, sibling order carrying the parent's own slot,

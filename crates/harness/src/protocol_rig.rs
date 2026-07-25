@@ -55,6 +55,10 @@ use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::wl_buffer::{self, WlBuffer};
 use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_compositor::WlCompositor;
+use wayland_client::protocol::wl_data_device::{self, WlDataDevice};
+use wayland_client::protocol::wl_data_device_manager::WlDataDeviceManager;
+use wayland_client::protocol::wl_data_offer::{self, WlDataOffer};
+use wayland_client::protocol::wl_data_source::{self, WlDataSource};
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
 use wayland_client::protocol::wl_pointer::{self, WlPointer};
 use wayland_client::protocol::wl_output::{self, WlOutput};
@@ -117,6 +121,22 @@ struct App {
     /// itself out against (it is scale-independent, unlike `wl_output.mode`).
     xdg_logical_size: Option<(i32, i32)>,
     xdg_logical_position: Option<(i32, i32)>,
+    /// The clipboard offer the compositor last handed this client, and the mime
+    /// types it advertised. `None` after a `selection(null)` — which is how a
+    /// client learns the clipboard was cleared.
+    selection_offer: Option<WlDataOffer>,
+    /// Mime types announced for the offer above, in arrival order.
+    offer_mimes: Vec<String>,
+    /// How many `selection` events have arrived (including the null one), so a
+    /// test can wait on "the clipboard changed" rather than on a timer.
+    selection_events: u32,
+    /// Set when one of *this client's* data sources was cancelled — the event a
+    /// client gets when its selection is replaced, or its drag refused.
+    source_cancelled: u32,
+    /// `send` requests the compositor forwarded to this client's source: the
+    /// other side wants the bytes. Recorded as (mime type, fd) so the test can
+    /// answer them.
+    send_requests: Vec<(String, std::os::fd::OwnedFd)>,
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for App {
@@ -301,6 +321,93 @@ impl Dispatch<WlOutput, ()> for App {
             } => state.output_mode = Some((width, height, refresh)),
             wl_output::Event::Scale { factor } => state.output_scale = factor,
             wl_output::Event::Done => state.output_done += 1,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlDataDeviceManager, ()> for App {
+    /// The manager emits no events; it hands out devices and sources.
+    fn event(
+        _: &mut Self,
+        _: &WlDataDeviceManager,
+        _: <WlDataDeviceManager as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WlDataDevice, ()> for App {
+    /// The clipboard arriving. `data_offer` introduces a new offer object,
+    /// `selection` says which offer (if any) is now the clipboard.
+    fn event(
+        state: &mut Self,
+        _: &WlDataDevice,
+        event: wl_data_device::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            // A fresh offer object; its mime types follow as `offer` events.
+            wl_data_device::Event::DataOffer { id } => {
+                state.selection_offer = Some(id);
+                state.offer_mimes.clear();
+            }
+            wl_data_device::Event::Selection { id } => {
+                state.selection_events += 1;
+                // `None` means the clipboard was cleared.
+                if id.is_none() {
+                    state.selection_offer = None;
+                    state.offer_mimes.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // `data_offer` is one of the few Wayland events that *creates* an object, so
+    // the client library must be told what to build and with what user data.
+    // Without this the queue panics on the first clipboard offer.
+    wayland_client::event_created_child!(App, WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (WlDataOffer, ()),
+    ]);
+}
+
+impl Dispatch<WlDataOffer, ()> for App {
+    /// Each `offer` event announces one mime type the source can produce.
+    fn event(
+        state: &mut Self,
+        _: &WlDataOffer,
+        event: wl_data_offer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_data_offer::Event::Offer { mime_type } = event {
+            state.offer_mimes.push(mime_type);
+        }
+    }
+}
+
+impl Dispatch<WlDataSource, ()> for App {
+    /// `send` means somebody wants our bytes; `cancelled` means this source is no
+    /// longer the selection (replaced, or its drag refused).
+    fn event(
+        state: &mut Self,
+        _: &WlDataSource,
+        event: wl_data_source::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_data_source::Event::Send { mime_type, fd } => {
+                state.send_requests.push((mime_type, fd));
+            }
+            wl_data_source::Event::Cancelled => state.source_cancelled += 1,
             _ => {}
         }
     }
@@ -567,6 +674,18 @@ pub enum SeatEvent {
     },
 }
 
+/// Read a pipe to EOF if the writer has finished, else `None`. The pipe is set
+/// non-blocking so a test never hangs waiting for a transfer that is not coming.
+fn try_read_to_end(fd: &std::io::PipeReader) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut reader = fd.try_clone().ok()?;
+    let mut buf = Vec::new();
+    match reader.read_to_end(&mut buf) {
+        Ok(_) if !buf.is_empty() => Some(buf),
+        _ => None,
+    }
+}
+
 /// A protocol error the server sent this client, flattened so tests need not
 /// depend on `wayland-client`'s types. Asserting on [`code`](Self::code) — not
 /// merely "the client got disconnected" — is what makes an error test mean
@@ -629,7 +748,16 @@ pub struct ScriptedClient {
     /// The registry's global list, kept so late binds (like `xdg_output`'s
     /// manager) do not need a second registry round-trip.
     globals: wayland_client::globals::GlobalList,
-    /// The bound `wl_seat` (T6).
+    /// The clipboard contents this client has published, answered when the
+    /// compositor forwards a `send` request from whoever is pasting.
+    pending_clipboard: Option<(WlDataSource, Vec<u8>)>,
+    /// The bound `wl_data_device_manager` and this client's device on the seat
+    /// (T7b) — how the clipboard reaches a client.
+    data_device_manager: WlDataDeviceManager,
+    #[allow(dead_code)]
+    data_device: WlDataDevice,
+    /// The bound `wl_seat` (T6). Held so the compositor keeps delivering this
+    /// client's input; the device objects taken from it do the talking.
     #[allow(dead_code)]
     seat: WlSeat,
     /// This client's `wl_keyboard`, obtained at connect so no test can forget to
@@ -679,6 +807,12 @@ impl ScriptedClient {
         let output: WlOutput = globals
             .bind(&qh, 1..=4, ())
             .expect("wl_output global advertised");
+        // Bind the data device (T7b): a client with no data device never hears
+        // about the clipboard, so every rig client takes one, as real clients do.
+        let data_device_manager: WlDataDeviceManager = globals
+            .bind(&qh, 1..=3, ())
+            .expect("wl_data_device_manager global advertised");
+        let data_device = data_device_manager.get_data_device(&seat, &qh, ());
         ScriptedClient {
             conn,
             queue,
@@ -689,6 +823,9 @@ impl ScriptedClient {
             output,
             xdg_output: None,
             globals,
+            data_device_manager,
+            data_device,
+            pending_clipboard: None,
             seat,
             keyboard,
             pointer,
@@ -1060,6 +1197,142 @@ impl ScriptedClient {
             self.roundtrip();
         }
         panic!("xdg_output geometry never arrived");
+    }
+
+    /// Every global the compositor advertises, as `(interface, version)`.
+    ///
+    /// Used to assert what is *not* there as well as what is: a global we
+    /// advertise but do not honour is a standing lie, so "the registry no longer
+    /// lists `wl_subcompositor`" is a property worth pinning.
+    pub fn advertised_globals(&self) -> Vec<(String, u32)> {
+        self.globals
+            .contents()
+            .clone_list()
+            .into_iter()
+            .map(|g| (g.interface, g.version))
+            .collect()
+    }
+
+    // ----- Clipboard (T7b) ---------------------------------------------------
+
+    /// Offer `contents` on the clipboard under one mime type.
+    ///
+    /// Returns the source so the test can watch it be cancelled. The serial is
+    /// the one the protocol requires: a client may only set the selection using a
+    /// serial from an input event it actually received, which is the protocol's
+    /// own answer to "who may overwrite the clipboard" — and the reason an
+    /// unfocused client cannot.
+    pub fn set_clipboard(&mut self, mime: &str, contents: &[u8]) -> WlDataSource {
+        let qh = self.queue.handle();
+        let source = self.data_device_manager.create_data_source(&qh, ());
+        source.offer(mime.to_string());
+        self.pending_clipboard = Some((source.clone(), contents.to_vec()));
+        let serial = self.last_input_serial();
+        self.data_device.set_selection(Some(&source), serial);
+        source
+    }
+
+    /// Start a drag from `window`'s surface, offering one mime type.
+    ///
+    /// The caller must first give this client a **pointer grab** — a button press
+    /// over the window — because the protocol only permits a drag in response to
+    /// one, and a compositor must deny anything else. `press_pointer_on` does
+    /// that. Parhelion's v1 policy then cancels the drag immediately (see the
+    /// compositor's DnD handler), which is what the corresponding test asserts.
+    pub fn start_drag(&mut self, window: &Toplevel) -> WlDataSource {
+        let qh = self.queue.handle();
+        let source = self.data_device_manager.create_data_source(&qh, ());
+        source.offer("text/plain".to_string());
+        let serial = self.last_input_serial();
+        self.data_device
+            .start_drag(Some(&source), &window.surface, None, serial);
+        source
+    }
+
+    /// The serial of the most recent input event this client received — what
+    /// `set_selection` must be given. Zero if it has never had input, which is
+    /// exactly the case an unfocused client is in.
+    pub fn last_input_serial(&self) -> u32 {
+        self.app
+            .input_events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                SeatEvent::Key { serial, .. } | SeatEvent::PointerButton { serial, .. } => {
+                    Some(*serial)
+                }
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    /// The mime types the current clipboard offer advertises (empty if there is
+    /// no offer).
+    pub fn clipboard_mimes(&self) -> &[String] {
+        &self.app.offer_mimes
+    }
+
+    /// Whether this client currently holds a clipboard offer.
+    pub fn has_clipboard_offer(&self) -> bool {
+        self.app.selection_offer.is_some()
+    }
+
+    /// How many `selection` events have arrived — for waiting on "the clipboard
+    /// changed" without a timer.
+    pub fn selection_event_count(&self) -> u32 {
+        self.app.selection_events
+    }
+
+    /// How many of this client's data sources have been cancelled.
+    pub fn source_cancelled_count(&self) -> u32 {
+        self.app.source_cancelled
+    }
+
+    /// Read the clipboard: ask the offer for `mime`, answer any `send` the
+    /// compositor forwards to *this* client's own source (a client can be both
+    /// ends), and return the bytes that came back through the pipe.
+    ///
+    /// This is the real transfer — a pipe, a write from the source client, a read
+    /// here — not a compositor-side copy. The compositor never sees the bytes,
+    /// which is precisely the design: it brokers the introduction and gets out of
+    /// the way.
+    pub fn read_clipboard(&mut self, mime: &str, peers: &mut [&mut ScriptedClient]) -> Vec<u8> {
+        let offer = self
+            .app
+            .selection_offer
+            .clone()
+            .expect("this client holds a clipboard offer");
+        let (read_fd, write_fd) = std::io::pipe().expect("clipboard pipe");
+        offer.receive(mime.to_string(), write_fd.as_fd());
+        self.flush();
+        drop(write_fd); // only the source keeps a writer, or the read never ends
+
+        // Give every client a chance to notice the `send` and answer it.
+        for _ in 0..1000 {
+            self.roundtrip();
+            for peer in peers.iter_mut() {
+                peer.answer_clipboard_sends();
+            }
+            self.answer_clipboard_sends();
+            if let Some(bytes) = try_read_to_end(&read_fd) {
+                return bytes;
+            }
+        }
+        panic!("no clipboard bytes arrived through the pipe");
+    }
+
+    /// Answer any pending `send` request on this client's data source by writing
+    /// the contents it published, then closing the pipe (the reader sees EOF).
+    pub fn answer_clipboard_sends(&mut self) {
+        self.roundtrip();
+        let pending = std::mem::take(&mut self.app.send_requests);
+        for (_mime, fd) in pending {
+            if let Some((_, contents)) = &self.pending_clipboard {
+                let mut file = File::from(fd);
+                let _ = file.write_all(contents);
+                // Dropping `file` closes the write end: EOF for the reader.
+            }
+        }
     }
 
     // ----- Protocol-error observation (T5) ----------------------------------

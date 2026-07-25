@@ -445,8 +445,77 @@ below, reasoning now living in the dialect spec and VISION.md.)
   is not a second compositor; it is the same one minus winit, and it exists so
   the claim "shutdown leaves no litter" is checked by CI rather than asserted.
 
+## 2026-07-25 — Clipboard v1, and the limits of "advertise only what we honour" (M1 T7b)
+
+### Clipboard v1 is core-protocol selection semantics, focus-gated
+
+- **Source:** M1 T7b (prompt 11); Roland's option (a) after T7's blocker;
+  `docs/scene_graph_v1.md` §12.2.
+- **Affects:** `crates/core/src/protocol.rs` (`DataDeviceState`,
+  `SelectionHandler`, `set_data_device_focus` in `refocus_keyboard` and
+  `refresh_selection`); `CORE-BOUNDARY.md` C3, I-7.
+- **Decision:** Offers flow only to the keyboard-focused client, and only the
+  focused client may set the selection. **The protocol's own shape is the v1
+  capability model**, and it satisfies I-7's letter: the grant is "has keyboard
+  focus", checked in the core at request time. The deeper design — security-context
+  restrictions on selection access, clipboard managers, primary selection, and a
+  smaller grant set for remote (Rayland) clients — is **deferred to M4's capability
+  work** (C8), where it gets a pointer from the dialect spec's capability section
+  when that milestone slices.
+- **Reasoning:** The clipboard is a service the display server owes every client,
+  not a shell feature — `foot` will not start without it. Focus-gating is not a
+  placeholder for a capability check; it *is* the check the protocol defines, and
+  every real clipboard tool is built around it (`wl-copy` maps a toplevel purely to
+  obtain focus, sets the selection, and destroys the window again — observed with
+  `WAYLAND_DEBUG=1`).
+
+### Drag-and-drop is refused immediately rather than half-implemented
+
+- **Source:** M1 T7b; `docs/scene_graph_v1.md` §12.2.
+- **Affects:** `ClientDndGrabHandler::started` (cancels the source), the
+  `starting_a_drag_cancels_the_source_rather_than_hanging` rig test.
+- **Decision:** A client that starts a drag has its source **cancelled at once**.
+  Protocol-legal (a compositor may cancel a drag whenever it likes), and the client
+  learns immediately instead of waiting on a drag that will never produce an enter,
+  a drop, or a cancel.
+- **Reasoning:** A real drag is a **pointer grab**, and how grabs compose with
+  Parhelion's focus model — C10 today, S1's policy in M4, and eventually shaped and
+  3D-transformed windows — is a design conversation, not an afternoon's plumbing.
+  Smithay would supply the grab machinery; the compositor-side semantics are ours
+  to decide. Half of that, shipped quietly, is the same lie the clipboard stub would
+  have been.
+
+### "Advertise only what we honour" met a client that requires the lie — reported, not resolved
+
+- **Source:** M1 T7b task 2, measured; see the T7b session summary for the traces.
+- **Affects:** `wl_subcompositor` advertisement (unchanged, deliberately);
+  `crates/harness/tests/conformance.rs` (the advertised set is now pinned).
+- **Finding, in three parts:** (1) The global **is** separable —
+  `CompositorState::subcompositor_global()` plus `DisplayHandle::remove_global`
+  withdraws it, and that was implemented and tested. (2) Withdrawing it makes
+  Parhelion **unusable by real clients**: `foot` refuses to start
+  (`err: wayland.c:1746: no sub compositor`, exit 230), which fails the milestone's
+  own acceptance criterion. (3) `foot` binds the global but calls `get_subsurface`
+  **zero** times in a full session (`WAYLAND_DEBUG=1`), so today the gap is
+  *dormant* for the clients we run.
+- **Status: the advertisement stays, as a stated debt**, because the alternative
+  breaks M1's acceptance and the ecosystem. The honest resolution is to implement
+  subsurfaces (scene work, a slice of its own, likely alongside popups) — **this is
+  Roland's call and is not taken here.** The conformance test now pins the exact set
+  of advertised globals so the next change to it is deliberate.
+- **Reasoning:** The principle is right and it is *not* being abandoned: it was
+  applied to `wl_data_device_manager` (implemented rather than stubbed) in the same
+  session. What this entry records is that the principle, applied mechanically to a
+  global the whole ecosystem probes for, produces a compositor nothing will talk to
+  — which is a worse outcome than a documented, dormant, scheduled gap.
+
 ## Pending
 
+- **Subsurfaces (raised 2026-07-25, T7b).** `wl_subcompositor` is advertised but
+  the scene does not composite subsurfaces. Withdrawing the advertisement was
+  measured and breaks real clients (see the T7b entry above), so the debt stands
+  until subsurfaces are implemented. Roland's call on when — a natural pairing
+  with popups.
 - Lock-screen fail-locked design (`CORE-BOUNDARY.md` §6 note).
 - Adoption of ENO's project-index + sessions/ + diary structure:
   agreed in principle; instantiate at repo creation.

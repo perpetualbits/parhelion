@@ -80,6 +80,53 @@ fn a_buffer_offset_past_the_pool_is_rejected() {
     );
 }
 
+/// The registry advertises exactly the set of globals Parhelion means to serve.
+///
+/// **On `wl_subcompositor`:** it is in this list, and it is the one global whose
+/// presence is a *stated debt* rather than a claim — the scene does not composite
+/// subsurfaces. Withdrawing it was tried and measured: `foot` then refuses to
+/// start (`no sub compositor`, exit 230), which fails the milestone's own
+/// acceptance criterion. The real resolution is implementing subsurfaces; see the
+/// T7b session summary for the evidence and the decision this is waiting on. The
+/// assertion below therefore pins *what is advertised today*, so that a future
+/// change to that set is deliberate.
+#[test]
+fn the_registry_advertises_exactly_the_expected_globals() {
+    let (_scene, _host, client) = fixture();
+    let globals: Vec<String> = client
+        .advertised_globals()
+        .into_iter()
+        .map(|(interface, _)| interface)
+        .collect();
+
+    for expected in [
+        "wl_compositor",
+        "wl_shm",
+        "wl_seat",
+        "wl_output",
+        "xdg_wm_base",
+        "wl_data_device_manager",
+        "zxdg_output_manager_v1",
+    ] {
+        assert!(
+            globals.iter().any(|g| g == expected),
+            "{expected} is advertised (globals: {globals:?})"
+        );
+    }
+
+    // Pinned deliberately, debt and all: changing what we advertise should be a
+    // decision, not a side effect of a dependency bump.
+    assert!(
+        globals.iter().any(|g| g == "wl_subcompositor"),
+        "wl_subcompositor is advertised (a stated debt — see this test's docs)"
+    );
+    assert_eq!(
+        globals.len(),
+        8,
+        "no global is advertised that this test does not name: {globals:?}"
+    );
+}
+
 /// `xdg_output` reports the output's **logical** geometry, and at scale 1 that is
 /// its mode. Advertised alongside `wl_output`, so it is tested alongside it
 /// rather than left as untested surface area.

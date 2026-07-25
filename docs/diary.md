@@ -605,3 +605,65 @@ guards. This closes M0.
   prompt insisted the acceptance test be *verified to fail*. `#harness`
 
 - **`make test`: 101 tests green**, on the day M1 closed. `#milestone`
+
+## M1 T7b — the compositor learns to refuse honestly, twice
+
+- **Two refusals, one principle, opposite answers.** The clipboard was refused as a
+  stub and implemented for real: `foot` would not start without
+  `wl_data_device_manager`, and advertising a hollow one would have made it start
+  while lying to every client that ever asked for a clipboard. The subcompositor
+  went the other way. Same principle — advertise only what you honour — applied to
+  a global the whole ecosystem probes for, and the answer came back that
+  withdrawing it makes Parhelion a compositor nothing will talk to. Both outcomes
+  are the principle working; only one of them is comfortable. `#design-decision`
+  `#milestone`
+
+- **The measurement that decided it.** I withdrew `wl_subcompositor` (it *is*
+  separable — `subcompositor_global()` + `remove_global`), ran foot, and got
+  `err: wayland.c:1746: no sub compositor`, exit 230. Then, before reporting, I
+  checked the severity: `WAYLAND_DEBUG=1` shows foot calls `get_subsurface` **zero**
+  times in a full session. So the global is a startup probe for foot, not something
+  it uses — the gap is real but dormant. That turned "we ship a lie" into "we ship
+  a dormant gap with a scheduled fix", which is a different sentence and a
+  defensible one. Reporting without that second measurement would have been
+  accurate and useless. `#discovery` `#tradeoff`
+
+- **The clipboard bug I only found because the test asked the right question.**
+  "A dies while B is focused; does B still hold A's clipboard?" — Smithay clears a
+  dead selection lazily, only when the selection is next *sent*, which normally
+  means on a focus change. Owner dies, focus unchanged, nobody notices: B keeps an
+  offer backed by a corpse. Fixing it needed one more thing I got wrong first —
+  the check must run *after* the dying client's teardown, because the surface's
+  `destroyed` hook fires while its data source is still alive, and a check there
+  cheerfully re-broadcasts the dying offer. Deferred flag, drained at the end of
+  the dispatch pass. `#bug` `#core`
+
+- **CI caught a test that was passing for the wrong reason.** My frame-callback
+  tripwire waited for foot to commit a *second* frame unprompted. It passed locally
+  (the shell prompt happened to arrive after frame one) and failed in CI, where it
+  didn't — because an idle terminal with its prompt already drawn has no reason to
+  commit anything at all. The fix made the test *cause* the redraw it waits for:
+  type, then wait. Stronger claim, no flake, and the sabotage check still trips it.
+  A test that only passes when something incidental happens is not a test.
+  `#harness` `#bug`
+
+- **And a second flake with a real defect underneath.** One run in eight failed the
+  "pixels outside the damage region are unchanged" assertion. Not luck: I compared
+  the typing frame against the *settled* frame, so if the terminal repainted across
+  two ticks, pixels changed by the first tick sat outside the second tick's damage.
+  The comparison has to be frame-versus-*previous*-frame. The flake was the
+  assertion being wrong, not the compositor. `#bug` `#harness`
+
+- **wl-copy taught me what the focus gate is for.** I doubted the gate when
+  `wl-copy` set the selection with no window on screen — and then traced it: it
+  creates an `xdg_toplevel`, waits to be focused, sets the selection, and destroys
+  the window, all in about a millisecond. The gate held; real clipboard tooling is
+  built around it. (It also explains why waiting for its surface to appear was a
+  sampling race — the compositor's own `selections_set` counter is the definite
+  condition, and now exists.) `#discovery`
+
+- **Where the clipboard actually lives.** Nowhere in the core. A copy publishes a
+  source, a paste asks for a pipe, and the bytes go client to client while the
+  compositor holds the introduction. Thirty-nine bytes of UTF-8 crossed between
+  `wl-copy` and `wl-paste` in the test, and Parhelion never saw a single one of
+  them. `make test`: 108 tests green. `#core` `#milestone`

@@ -110,6 +110,7 @@ use smithay::reexports::calloop::{
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason, ObjectId};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_callback::WlCallback;
+use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_shm::Format;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -134,7 +135,7 @@ use smithay::wayland::selection::data_device::{
     set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState,
     ServerDndGrabHandler,
 };
-use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTarget};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ShellClient, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
@@ -382,6 +383,39 @@ impl ClientData for ClientState {
     }
 }
 
+/// The observability counters the dispatch thread publishes and [`ProtocolHost`]
+/// reads.
+///
+/// They are grouped because they are one thing — "what the protocol side has
+/// done so far" — shared by `Arc` between the two, and because passing four
+/// separate atomics into the dispatch thread said nothing that this name does not
+/// say better. None of them is load-bearing for dispatch: every one exists so a
+/// test can assert on a number instead of a sleep.
+#[derive(Clone)]
+struct Counters {
+    /// Frame callbacks committed but not yet fired, across all clients (T2's
+    /// backpressure bound is per client; this is the total, for observability).
+    pending_frame_callbacks: Arc<AtomicUsize>,
+    /// Buffer bytes copied at commit — the damage-tracking evidence (T4).
+    bytes_copied: Arc<AtomicUsize>,
+    /// `xdg_wm_base.pong` replies received (T5).
+    pongs_received: Arc<AtomicUsize>,
+    /// `set_selection` requests accepted (T7b).
+    selections_set: Arc<AtomicUsize>,
+}
+
+impl Counters {
+    /// A fresh set, all at zero.
+    fn new() -> Self {
+        Counters {
+            pending_frame_callbacks: Arc::new(AtomicUsize::new(0)),
+            bytes_copied: Arc::new(AtomicUsize::new(0)),
+            pongs_received: Arc::new(AtomicUsize::new(0)),
+            selections_set: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
 /// What the dispatch thread tracks per live xdg toplevel. All of it is
 /// protocol-side bookkeeping; the *canonical* facts (role, placement, size,
 /// pixels) live in the scene (I-5) and this is only what is needed to drive the
@@ -490,17 +524,13 @@ struct State {
     /// Latest presentation timestamp from the render side (shared with the
     /// [`FramePresenter`]); read by [`present`] when firing callbacks.
     present_ts: Arc<AtomicU32>,
-    /// Total pending frame callbacks across all clients, republished each pass
-    /// for observability (`ProtocolHost::pending_frame_callbacks`, used by the
-    /// backpressure rig test). Not load-bearing for dispatch.
-    pending_frame_callbacks: Arc<AtomicUsize>,
-    /// Running total of buffer bytes copied at commit — the damage-tracking
-    /// counter that shows partial copies copy less than the whole buffer
-    /// (`ProtocolHost::bytes_copied`). Not load-bearing for dispatch.
-    bytes_copied: Arc<AtomicUsize>,
-    /// Count of `xdg_wm_base.pong` replies received (T5 liveness check). Pure
-    /// observability — nothing acts on an unresponsive client in M1.
-    pongs_received: Arc<AtomicUsize>,
+    /// Observability counters, shared with the host (see [`Counters`]).
+    counters: Counters,
+    /// Set when a surface was destroyed, so the selection is re-checked once the
+    /// departing client's teardown has finished (see [`refresh_selection`]).
+    ///
+    /// [`refresh_selection`]: State::refresh_selection
+    selection_needs_refresh: bool,
     /// Set by a `Shutdown` control message to end the loop.
     stop: bool,
 }
@@ -585,6 +615,37 @@ impl State {
     /// The reference policy daemon S1 takes this over in **M4**; it lives here
     /// now only because a compositor nothing can be typed into is not a
     /// compositor (C10: the core stays usable with every server dead).
+    /// Re-state the clipboard focus, which makes Smithay re-broadcast the
+    /// selection — and, crucially, **notice that its source has died**.
+    ///
+    /// Smithay clears a dead selection lazily: it checks whether the source is
+    /// still alive only when the selection is next sent, which normally happens
+    /// on a focus change. So when the clipboard's owner dies while focus does
+    /// *not* change (a background client exits; the focused window is untouched),
+    /// nobody notices, and the focused client is left holding an offer backed by
+    /// a corpse — a paste that answers with nothing.
+    ///
+    /// **Timing matters.** This must run *after* the departing client's teardown,
+    /// not during it: the `destroyed` hook for a surface fires while that
+    /// client's other objects — including its data source — are still alive, so a
+    /// liveness check there would conclude the selection is healthy and
+    /// re-broadcast a dying offer. Hence the `selection_needs_refresh` flag,
+    /// drained at the end of the dispatch pass.
+    fn refresh_selection(&mut self) {
+        let dh = self.dh.clone();
+        let seat = self.seat.clone();
+        let focused = self
+            .keyboard_focus
+            .and_then(|sid| self.wl_surface_for(sid))
+            .and_then(|s| s.client());
+        // Smithay re-broadcasts only when the clipboard focus *changes*, so
+        // restating the same client would do nothing. Clearing it first forces
+        // the re-broadcast; no client observes the intermediate state, because
+        // with no focus there is nobody the selection is sent to.
+        set_data_device_focus(&dh, &seat, None);
+        set_data_device_focus(&dh, &seat, focused);
+    }
+
     fn refocus_keyboard(&mut self) {
         let target = self.focus_map.topmost();
         if target == self.keyboard_focus {
@@ -818,7 +879,7 @@ impl XdgShellHandler for State {
     /// observability; M1 takes no action on an unresponsive client (that is
     /// policy, and it needs a timer the core does not run yet).
     fn client_pong(&mut self, _client: ShellClient) {
-        self.pongs_received.fetch_add(1, Ordering::Relaxed);
+        self.counters.pongs_received.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Popups are **out of scope for M1** (`docs/plans/m1_tasks.md` T5). This
@@ -945,7 +1006,7 @@ impl CompositorHandler for State {
                 let prev = self.surface_pixels.get(&obj).cloned();
                 match build_pixel_block(&buffer, prev, &damage_rects) {
                     Ok(Some((block, opaque, content_damage, bytes))) => {
-                        self.bytes_copied.fetch_add(bytes, Ordering::Relaxed);
+                        self.counters.bytes_copied.fetch_add(bytes, Ordering::Relaxed);
                         self.surface_pixels.insert(obj.clone(), block.clone());
                         let size = (block.width, block.height);
                         let source = TextureSource::Shm(block);
@@ -1058,6 +1119,13 @@ impl CompositorHandler for State {
             self.focus_map.unmap(sid);
             self.scene.emit(ProtocolEvent::SurfaceDestroyed { surface: sid });
             self.refocus_keyboard();
+            // The departing surface's client may have owned the clipboard. The
+            // check cannot happen *here*: this hook runs partway through that
+            // client's teardown, and its `wl_data_source` is still alive, so a
+            // liveness test would say the selection is fine and re-broadcast a
+            // dying offer. Defer it to the end of the dispatch pass, by which
+            // time the whole client is gone.
+            self.selection_needs_refresh = true;
         }
     }
 }
@@ -1148,6 +1216,21 @@ impl SelectionHandler for State {
     /// No compositor-provided selections in M1, so there is no per-selection data
     /// to carry.
     type SelectionUserData = ();
+
+    /// A client set (or cleared) the selection. The core does not look at the
+    /// content — the bytes go client-to-client through a pipe and never touch the
+    /// compositor — so this only counts the event, for observability
+    /// (`ProtocolHost::selections_set`). A test waiting for "the clipboard is
+    /// ready" needs a definite condition, and a transient copy tool's window is
+    /// not one: it can map and vanish between two polls.
+    fn new_selection(
+        &mut self,
+        _ty: SelectionTarget,
+        _source: Option<SelectionSource>,
+        _seat: Seat<Self>,
+    ) {
+        self.counters.selections_set.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl DataDeviceHandler for State {
@@ -1156,7 +1239,36 @@ impl DataDeviceHandler for State {
     }
 }
 
-impl ClientDndGrabHandler for State {}
+/// **Drag-and-drop is deferred, and says so out loud.**
+///
+/// A client that starts a drag has its source **cancelled immediately**. That is
+/// protocol-legal — a compositor may cancel a drag at any time, and `cancelled`
+/// is exactly the event a client is built to handle — and it is the honest shape
+/// of "not yet": the client learns at once that no drag is happening, instead of
+/// waiting on a drag that will never produce an enter, a drop, or a cancel.
+///
+/// Why not implement it: a real drag is a **pointer grab**, and how grabs compose
+/// with Parhelion's focus model (C10 today, S1's policy in M4) is a design
+/// conversation, not an afternoon's plumbing. Smithay would supply the grab
+/// machinery, but the compositor-side semantics — what a drag does to focus, what
+/// happens when the drag source's client dies mid-drag, how a shaped or
+/// 3D-transformed window hit-tests during one — are ours to decide. Half of that,
+/// shipped quietly, is the same lie in a different costume.
+///
+/// The clipboard, by contrast, is fully implemented: it needs no grab, and every
+/// client expects it to work.
+impl ClientDndGrabHandler for State {
+    fn started(&mut self, source: Option<WlDataSource>, _icon: Option<WlSurface>, _seat: Seat<Self>) {
+        if let Some(source) = source {
+            source.cancelled();
+        }
+    }
+}
+
+/// Server-initiated drags (the compositor starting a drag itself) are never
+/// begun, so none of these can fire. Left at their defaults deliberately: an
+/// implementation for an event that cannot occur is dead code pretending to be
+/// coverage.
 impl ServerDndGrabHandler for State {}
 
 // `delegate_data_device!` supplies the Dispatch/GlobalDispatch impls for
@@ -1327,17 +1439,9 @@ pub struct ProtocolHost {
     ///
     /// [`frame_presenter`]: ProtocolHost::frame_presenter
     presenter: FramePresenter,
-    /// Total pending frame callbacks, republished by the dispatch thread each
-    /// pass. Read by [`pending_frame_callbacks`] for the backpressure rig test.
-    ///
-    /// [`pending_frame_callbacks`]: ProtocolHost::pending_frame_callbacks
-    pending_frame_callbacks: Arc<AtomicUsize>,
-    /// Running total of buffer bytes copied at commit (damage counter). Read by
-    /// [`bytes_copied`](ProtocolHost::bytes_copied).
-    bytes_copied: Arc<AtomicUsize>,
-    /// `xdg_wm_base.pong` replies received. Read by
-    /// [`pongs_received`](ProtocolHost::pongs_received).
-    pongs_received: Arc<AtomicUsize>,
+    /// Observability counters, shared with the dispatch thread (see the
+    /// accessors below).
+    counters: Counters,
 }
 
 impl ProtocolHost {
@@ -1354,17 +1458,13 @@ impl ProtocolHost {
         // them.
         let (ping, ping_source) = make_ping().expect("create frame-present ping");
         let present_ts = Arc::new(AtomicU32::new(0));
-        let pending = Arc::new(AtomicUsize::new(0));
-        let bytes = Arc::new(AtomicUsize::new(0));
-        let pongs = Arc::new(AtomicUsize::new(0));
+        let counters = Counters::new();
 
         let presenter = FramePresenter {
             ping,
             ts: present_ts.clone(),
         };
-        let pending_for_thread = pending.clone();
-        let bytes_for_thread = bytes.clone();
-        let pongs_for_thread = pongs.clone();
+        let counters_for_thread = counters.clone();
 
         let dispatch = std::thread::Builder::new()
             .name("parhelion-proto-0".into())
@@ -1374,9 +1474,7 @@ impl ProtocolHost {
                     scene,
                     ping_source,
                     present_ts,
-                    pending_for_thread,
-                    bytes_for_thread,
-                    pongs_for_thread,
+                    counters_for_thread,
                 )
             })
             .expect("spawn dispatch thread");
@@ -1385,9 +1483,7 @@ impl ProtocolHost {
             control_tx,
             dispatch: Some(dispatch),
             presenter,
-            pending_frame_callbacks: pending,
-            bytes_copied: bytes,
-            pongs_received: pongs,
+            counters,
         }
     }
 
@@ -1460,14 +1556,14 @@ impl ProtocolHost {
     /// dispatch thread's last pass. Observability for the backpressure test; the
     /// bound this stays under (per client) is [`MAX_PENDING_FRAME_CALLBACKS`].
     pub fn pending_frame_callbacks(&self) -> usize {
-        self.pending_frame_callbacks.load(Ordering::Relaxed)
+        self.counters.pending_frame_callbacks.load(Ordering::Relaxed)
     }
 
     /// Total buffer bytes copied at commit so far — the damage-tracking counter.
     /// A small-damage commit on a large surface copies far fewer than the whole
     /// buffer (partial copy); the proportionality test asserts on the delta.
     pub fn bytes_copied(&self) -> usize {
-        self.bytes_copied.load(Ordering::Relaxed)
+        self.counters.bytes_copied.load(Ordering::Relaxed)
     }
 
     /// Send `xdg_wm_base.ping` to every shell client that has a live toplevel —
@@ -1485,7 +1581,15 @@ impl ProtocolHost {
 
     /// Number of `xdg_wm_base.pong` replies received so far.
     pub fn pongs_received(&self) -> usize {
-        self.pongs_received.load(Ordering::Relaxed)
+        self.counters.pongs_received.load(Ordering::Relaxed)
+    }
+
+    /// Number of `set_selection` requests the compositor has accepted — i.e. how
+    /// many times the clipboard changed hands. Observability for tests waiting on
+    /// "the clipboard is ready"; the content itself never passes through the
+    /// core, and this counter says nothing about it.
+    pub fn selections_set(&self) -> usize {
+        self.counters.selections_set.load(Ordering::Relaxed)
     }
 }
 
@@ -1584,6 +1688,12 @@ fn pump_display(
         }
     }
 
+    // A surface was destroyed during this pass; now that the client's teardown
+    // is complete, re-check whether it took the clipboard with it.
+    if std::mem::take(&mut state.selection_needs_refresh) {
+        state.refresh_selection();
+    }
+
     // Republish the up-to-date total *after* dispatch, so a caller that just
     // round-tripped a client observes that client's new backlog (the rig test
     // relies on this to know when the bound is reached).
@@ -1593,6 +1703,7 @@ fn pump_display(
         .map(surface_frame_backlog)
         .sum();
     state
+        .counters
         .pending_frame_callbacks
         .store(total, Ordering::Relaxed);
 
@@ -1634,7 +1745,7 @@ fn present(state: &mut State) {
         }
     }
     // Everything pending just fired.
-    state.pending_frame_callbacks.store(0, Ordering::Relaxed);
+    state.counters.pending_frame_callbacks.store(0, Ordering::Relaxed);
 }
 
 /// Run the shard-0 dispatch loop: own the `Display`, advertise `wl_compositor`,
@@ -1646,9 +1757,7 @@ fn run_dispatch(
     scene: SceneHandle,
     ping_source: PingSource,
     present_ts: Arc<AtomicU32>,
-    pending_frame_callbacks: Arc<AtomicUsize>,
-    bytes_copied: Arc<AtomicUsize>,
-    pongs_received: Arc<AtomicUsize>,
+    counters: Counters,
 ) {
     let display: Display<State> = Display::new().expect("create wayland display");
     let dh = display.handle();
@@ -1659,6 +1768,31 @@ fn run_dispatch(
     let mut event_loop: EventLoop<State> = EventLoop::try_new().expect("create calloop event loop");
     let handle = event_loop.handle();
     let compositor_state = CompositorState::new::<State>(&dh);
+    // **`wl_subcompositor`: advertised, and not yet honoured — a stated debt.**
+    //
+    // `CompositorState::new` creates this global as a side effect, and Smithay
+    // implements its protocol correctly — but *Parhelion's scene ignores
+    // subsurfaces*: only a root surface's buffer becomes a scene node, so content
+    // a client put in a subsurface would silently not render.
+    //
+    // T7b set out to withdraw it on the "advertise only what we honour"
+    // principle, and the global *is* separable
+    // (`dh.remove_global::<State>(compositor_state.subcompositor_global())`).
+    // Withdrawing it was measured, and it makes Parhelion unusable by real
+    // clients: `foot` refuses to start — `err: wayland.c:1746: no sub compositor`,
+    // exit 230 — which would fail the M1 acceptance criterion outright.
+    //
+    // What the same measurement also showed: foot binds the global but calls
+    // `get_subsurface` **zero** times in a full session (checked with
+    // `WAYLAND_DEBUG=1`). So today the gap is *dormant* for the clients we run —
+    // the global's existence is a startup sanity check they make, not something
+    // they exercise. That is a reason to schedule the real fix, not to relax about
+    // it: a client that does use subsurfaces loses that content with no error.
+    //
+    // The honest resolution is to implement subsurfaces (scene work, a slice of
+    // its own — likely alongside popups). Until then this is a recorded debt with
+    // its evidence, not an unexamined side effect. See the T7b session summary.
+
     // Advertise `wl_shm`. The mandatory `argb8888`/`xrgb8888` formats are added by
     // `ShmState::new`; we request no extras (T3 handles exactly those two).
     let shm_state = ShmState::new::<State>(&dh, std::iter::empty());
@@ -1753,9 +1887,8 @@ fn run_dispatch(
         next_toplevel_index: 0,
         scene: scene.clone(),
         present_ts,
-        pending_frame_callbacks,
-        bytes_copied,
-        pongs_received,
+        counters,
+        selection_needs_refresh: false,
         stop: false,
     };
 

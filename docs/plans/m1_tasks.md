@@ -104,5 +104,11 @@ shutdown for `parhelion-dev` plus a `--headless` mode, the conformance sweep, an
 **the automated acceptance test**: foot runs headlessly, echoes typed input, and
 typing redraws 0.62% of the output. M1 is closed.
 
-One gap found and reported rather than papered over: `wl_subcompositor` is
-advertised (by Smithay's compositor delegate) but the scene ignores subsurfaces.
+**T7b (prompt 11)** then hardened it: `wl_data_device_manager` implemented
+properly (focus-gated clipboard, DnD refused honestly), the CI failure fixed (the
+acceptance test now *causes* the redraw it waits for), and the conformance sweep's
+one gap investigated. That gap — `wl_subcompositor` advertised but subsurfaces not
+composited — **stands as a stated debt**: withdrawing the advertisement is possible
+but makes `foot` refuse to start, failing this milestone's own acceptance. The fix
+is implementing subsurfaces; it is Roland's call and sits in the decision log's
+Pending section.

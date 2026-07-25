@@ -125,15 +125,28 @@ window.PROJECT_MAP = {
     {
       id: "data-device", label: "Clipboard & DnD", layer: "protocol", status: "done",
       tags: ["M1", "T7"],
-      desc: "wl_data_device_manager: the clipboard and drag-and-drop. Not a shell feature — a service the display server owes every client, and real applications treat its absence as a broken compositor (foot refuses to start). Clipboard focus follows keyboard focus, because only the focused client may set the selection. Access is currently UNGATED: I-7 will make it a capability question when C8 lands in M4, and that debt is recorded rather than discovered later.",
+      desc: "wl_data_device_manager: the clipboard, and a deliberately deferred drag-and-drop. Not a shell feature — a service the display server owes every client, and real applications treat its absence as a broken compositor (foot refuses to start). The bytes never touch the compositor: a copy publishes a source, a paste asks the offer for a pipe, and the clients transfer directly. Focus-gating IS the v1 capability model and satisfies I-7's letter; the deeper design (security contexts, remote-client grants) is M4's C8 work. Proven end to end by wl-copy → wl-paste, two third-party programs.",
       files: ["crates/core/src/protocol.rs"],
       specs: [{ label: "scene_graph_v1.md §12.2", href: "docs/scene_graph_v1.md" }],
       parts: [
-        { label: "Clipboard (selection)", status: "done", desc: "Client-to-client transfer; focus-gated by the protocol's own rule." },
-        { label: "Drag-and-drop", status: "done", desc: "Smithay's grab machinery; the compositor initiates none of its own." },
-        { label: "Capability gating (I-7)", status: "planned", desc: "Ungated in M1; becomes a grant check with C8 (M4)." },
+        { label: "Clipboard (selection)", status: "done", desc: "Client-to-client transfer through a pipe; focus gate asserted by test, not assumed." },
+        { label: "Selection liveness", status: "done", desc: "The owner's death clears the clipboard — checked after its teardown, or the dying offer is re-broadcast." },
+        { label: "Drag-and-drop", status: "seam", desc: "Refused honestly: start_drag cancels the source at once. Real DnD is a pointer grab, and how grabs meet the focus model is its own design conversation." },
+        { label: "Capability gating (I-7)", status: "planned", desc: "Focus-gated now; security contexts and remote-client grants arrive with C8 (M4)." },
       ],
       deps: ["protocol-host", "seat-input"],
+    },
+    {
+      id: "subsurfaces", label: "Subsurfaces", layer: "protocol", status: "seam",
+      tags: ["M1", "debt"],
+      desc: "wl_subcompositor is ADVERTISED but not honoured: the scene composites only root surfaces. Withdrawing the advertisement was implemented and measured — foot then refuses to start (no sub compositor, exit 230), failing M1's acceptance — while the same trace showed foot never calls get_subsurface, so the gap is dormant for the clients we run. It stays as a stated debt with the advertised global set pinned by test; the honest fix is implementing subsurfaces, likely alongside popups.",
+      files: ["crates/core/src/protocol.rs"],
+      specs: [{ label: "scene_graph_v1.md §12.3", href: "docs/scene_graph_v1.md" }],
+      parts: [
+        { label: "Global advertised", status: "done", desc: "Clients that probe for it start; withdrawing it breaks them." },
+        { label: "Scene composition", status: "planned", desc: "Subsurface tree, parent-relative placement, commit semantics." },
+      ],
+      deps: ["scene-graph"],
     },
     {
       id: "wl-output", label: "wl_output", layer: "protocol", status: "done",

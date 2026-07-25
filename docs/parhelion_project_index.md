@@ -43,7 +43,7 @@ the standing instruction set every session obeys.
 | `docs/diary.md` | Running narrative diary; the why behind non-obvious choices, tagged. | Living |
 | `docs/sessions/` | One summary per Claude Code session (files changed, build/test result). | Living · latest `_session_2026-07-25_seat-input-winit-t6.md` |
 | `docs/plans/` | Per-milestone task breakdowns (`mN_tasks.md`), written at each milestone's start. | `m1_tasks.md` (M1 "One window, honestly", T1–T7) |
-| `docs/prompts/` | Task prompts authored in the chat project for Claude Code. | `prompt_00_scaffolding.md`, `prompt_04_scene_graph_v1.md`, `prompt_05_frame_callbacks_backpressure.md`, `prompt_06_shm_seam_check.md`, `prompt_08_xdg_shell.md`, `prompt_09_seat_input_winit.md` |
+| `docs/prompts/` | Task prompts authored in the chat project for Claude Code. | `prompt_00_scaffolding.md`, `prompt_04_scene_graph_v1.md`, `prompt_05_frame_callbacks_backpressure.md`, `prompt_06_shm_seam_check.md`, `prompt_08_xdg_shell.md`, `prompt_09_seat_input_winit.md`, `prompt_10_m1_acceptance.md`, `prompt_11_clipboard_m1_close.md` |
 | `docs/archive/` | Superseded documents, kept verbatim; do not edit. | `0002-procedural-content-open-vocabulary.md` (superseded in format by the decision log) |
 | `third_party/spine/` | Vendored, pinned SPINE core spec (v0.4) from ENO; read-only. | Empty — pending Roland copying the spec files |
 
@@ -61,7 +61,7 @@ document; never create a parallel document on the same topic.
 | Control plane (`desktop` dialect, C7) | `crates/dialect/` | `docs/parhelion_desktop_dialect.md` | Skeleton crate |
 | Milestones | — | `docs/parhelion_milestone_plan.md` | Yes |
 | Core: scene graph, render loop, snapshot | `crates/core/` (`scene/`, `render.rs`) | `docs/scene_graph_v1.md` | Scene state (roles, damage) + snapshot + CPU compositor v1 |
-| Core: protocol frontend (`ProtocolHost`) | `crates/core/src/protocol.rs` | `docs/CORE-BOUNDARY.md` §3 (C3), §7 | `wl_compositor` + `wl_shm` + `xdg_wm_base` + `wl_seat`; publishes to the scene (ledger absorbed) |
+| Core: protocol frontend (`ProtocolHost`) | `crates/core/src/protocol.rs` | `docs/CORE-BOUNDARY.md` §3 (C3), §7 | `wl_compositor` + `wl_shm` + `xdg_wm_base` + `wl_seat` + `wl_output` + `wl_data_device_manager`; publishes to the scene (ledger absorbed) |
 | Core: input funnel and focus routing | `crates/core/src/input.rs` | `docs/scene_graph_v1.md` §11 | `InputEvent` + `FocusMap`; T-input's interface (its thread is M2) |
 | Backends (headless, winit, DRM/KMS) | `crates/backend-*/` | `docs/scene_graph_v1.md` §6, §11.4 | `backend-headless` (CPU compositor + `Frame`) and `backend-winit` (nested window + `parhelion-dev`) |
 | Test harness (golden + protocol rigs) | `crates/harness/` | `docs/harness_design.md` | Golden rig, protocol rig (incl. the toplevel dance, protocol-error assertions, input injection), socket tests |
@@ -77,6 +77,22 @@ T6.
 
 ## Current state
 
+- **M1 T7b** (2026-07-25) — clipboard v1 and the CI fix. `wl_data_device_manager`
+  implemented properly (focus-gating **is** the v1 capability model, satisfying
+  I-7's letter; C8/M4 owns the deeper design), with the bytes passing client to
+  client through a pipe and never through the core. Drag-and-drop is **refused
+  honestly** — `start_drag` cancels the source at once — because grabs meeting the
+  focus model is its own design conversation. A real bug fixed: the clipboard's
+  owner dying while focus was unchanged left the focused client holding an offer
+  backed by a corpse. **Not done, deliberately:** withdrawing the
+  `wl_subcompositor` advertisement — it is separable, but doing so makes `foot`
+  refuse to start (exit 230), failing M1's own acceptance; the same measurement
+  showed foot never calls `get_subsurface`, so the gap is dormant. It stands as a
+  stated debt with the advertised global set pinned by test; subsurfaces are
+  Roland's call (decision log, Pending). Also fixed the CI failure from the T7
+  push: the acceptance test's frame-callback tripwire waited for an unprompted
+  second commit, which an idle terminal has no reason to make — it now *causes* the
+  redraw it waits for. `make test`: **108 tests green**, clippy clean.
 - **Milestone:** M1 (One window, honestly) — **COMPLETE 2026-07-25** (T7;
   `docs/plans/m1_tasks.md`, `docs/scene_graph_v1.md` §12). The acceptance run is
   an automated, headless test (`crates/harness/tests/acceptance.rs`): `foot` — a

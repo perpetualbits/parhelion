@@ -12,12 +12,13 @@
 //! 1. `foot` — a real, third-party, shm-rendering terminal — connects over a real
 //!    Wayland socket, binds our globals, and reaches a **mapped** xdg toplevel.
 //! 2. It commits real pixels (`bytes_copied` moves).
-//! 3. **Frame callbacks flow.** foot throttles its drawing on them; if they
-//!    stopped, it would render once and freeze. That makes this test the
-//!    tripwire for the whole reverse path (T2) — verified by sabotage, see below.
-//! 4. Typing reaches it through the input funnel and it redraws — and the redraw
-//!    is a small fraction of the output, with the pixels outside the damage
-//!    region byte-identical. **This is VISION's founding thesis, measured.**
+//! 3. Typing reaches it through the input funnel and **it redraws** — which is
+//!    simultaneously the proof that **frame callbacks flow**, because foot
+//!    throttles on them and will not paint again until the previous frame's
+//!    callback arrives. Break the reverse path (T2) and this step fails; that is
+//!    verified by sabotage, not assumed.
+//! 4. The redraw is a small fraction of the output, with the pixels outside the
+//!    damage region byte-identical. **This is VISION's founding thesis, measured.**
 //! 5. Killing it unmaps cleanly and leaks no scene state.
 //!
 //! # Why counters and pixels, not goldens
@@ -72,6 +73,19 @@ const TICK_MS: u32 = 16;
 /// This is a **correctness** claim (damage is honoured), not a speed one; M5 owns
 /// performance bounds.
 const TYPING_DAMAGE_FRACTION_MAX: f64 = 0.25;
+
+/// How many times the test will retype before giving up, and how long it waits
+/// between attempts. Retrying defends against one race only — a terminal that has
+/// mapped but whose shell has not yet attached to the pty — so it is deliberately
+/// few and slow: a compositor that does not deliver keys must fail, not be
+/// hammered until it looks like it works.
+const MAX_TYPING_ROUNDS: u32 = 3;
+const RETYPE_INTERVAL: Duration = Duration::from_secs(3);
+
+/// How many consecutive damage-free frames count as "the terminal has settled".
+/// Six at ~60 Hz is a tenth of a second of stillness — enough to be sure the
+/// startup repaint is over, short enough not to pad the test.
+const QUIET_TICKS: u32 = 6;
 
 /// The sentence typed into the terminal, as evdev keycodes: "hello" + Enter.
 /// Letters only — a shell will echo them, and no keymap-dependent punctuation is
@@ -220,66 +234,98 @@ fn a_real_terminal_runs_and_typing_redraws_a_region_not_a_frame() {
         "the terminal committed real shm pixels"
     );
 
-    // ---- 2. Frame callbacks flow ----------------------------------------
-    // foot throttles on them: if the reverse path were broken it would render
-    // its first frame and freeze, and `bytes_copied` would stop moving. Waiting
-    // for it to move *again*, several frames later, is the tripwire.
-    let after_map = host.bytes_copied();
+    // ---- 2. Settle ------------------------------------------------------
+    // Wait for the terminal to go quiet — shell started, prompt drawn, nothing
+    // moving. Two reasons this matters: the "before" frame must be a still one
+    // for the comparison below to attribute the change to *typing*, and the
+    // shell must have attached to the pty before we type at it, or the
+    // keystrokes land in a void.
+    let mut quiet = 0;
     let deadline = Instant::now() + BUDGET;
-    while host.bytes_copied() == after_map {
+    while quiet < QUIET_TICKS && Instant::now() < deadline {
         clock += TICK_MS;
-        tick(&h, &mut comp, &presenter, clock);
+        let t = tick(&h, &mut comp, &presenter, clock);
+        quiet = if damage_area(&t.damage) == 0 { quiet + 1 } else { 0 };
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let settled = comp.frame().clone();
+    let bytes_before_typing = host.bytes_copied();
+
+    // ---- 3. Typing, and the frame-callback tripwire ---------------------
+    // These are one step on purpose. foot throttles its drawing on frame
+    // callbacks: it will not paint a new frame until the previous one's callback
+    // arrives. So "it redrew in response to typing" *is* the proof that the
+    // reverse path (T2) is alive — and if callbacks stop, this is where the test
+    // fails, which is exactly what the sabotage check demonstrates.
+    //
+    // An earlier version waited for an unprompted second commit instead. That
+    // passed locally and failed in CI, because an idle terminal with its prompt
+    // already drawn has no reason to commit anything at all. Making the test
+    // *cause* the redraw it waits for removed the flake and strengthened the
+    // claim.
+    let mut typing_frame: Option<Tick> = None;
+    let mut previous_frame = settled.clone();
+    let deadline = Instant::now() + BUDGET;
+    let mut rounds = 0;
+    let mut last_typed = Instant::now() - RETYPE_INTERVAL; // type immediately
+    while typing_frame.is_none() {
+        // Type the sentence, and retype a few times if nothing happens. A
+        // terminal that has mapped may still be milliseconds away from having a
+        // shell on the other end of its pty, and a swallowed first keystroke is a
+        // race rather than a failure. Bounded and spaced, so a genuine "keys
+        // never arrive" still fails on the budget below instead of being drowned
+        // in retries.
+        if rounds < MAX_TYPING_ROUNDS && last_typed.elapsed() >= RETYPE_INTERVAL {
+            for (i, &code) in TYPED_KEYS.iter().enumerate() {
+                let t = clock + (i as u32 + 1) * TICK_MS;
+                host.input(InputEvent::Key {
+                    code,
+                    pressed: true,
+                    time_ms: t,
+                });
+                host.input(InputEvent::Key {
+                    code,
+                    pressed: false,
+                    time_ms: t + 1,
+                });
+            }
+            rounds += 1;
+            last_typed = Instant::now();
+        }
+
+        // `prev` is the frame *immediately* before this one — which is what the
+        // outside-damage assertion must compare against. Comparing against the
+        // settled frame instead was a real defect (and a flake): if the terminal
+        // repaints across two ticks, the pixels changed by the first tick are
+        // outside the second tick's damage, and the assertion fails for a
+        // compositor that did nothing wrong.
+        let prev = comp.frame().clone();
+        clock += TICK_MS;
+        let t = tick(&h, &mut comp, &presenter, clock);
+        if damage_area(&t.damage) > 0 && t.frame.pixels() != prev.pixels() {
+            previous_frame = prev;
+            typing_frame = Some(t);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+
         if Instant::now() > deadline {
             kill_child(&mut foot);
             panic!(
-                "foot stopped committing after its first frame — frame callbacks are not \
-                 flowing (bytes_copied stuck at {after_map})"
+                "the terminal never redrew after {rounds} round(s) of typing. Either the keys \
+                 did not reach it, or frame callbacks are not flowing — foot throttles on them \
+                 and will not paint again until the previous frame's callback arrives. \
+                 (bytes_copied {} → {})",
+                bytes_before_typing,
+                host.bytes_copied()
             );
         }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-
-    // Let it settle so the "before" frame is a quiet one.
-    for _ in 0..30 {
-        clock += TICK_MS;
-        tick(&h, &mut comp, &presenter, clock);
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let before = comp.frame().clone();
-
-    // ---- 3. Typing ------------------------------------------------------
-    for (i, &code) in TYPED_KEYS.iter().enumerate() {
-        let t = clock + (i as u32 + 1) * TICK_MS;
-        host.input(InputEvent::Key {
-            code,
-            pressed: true,
-            time_ms: t,
-        });
-        host.input(InputEvent::Key {
-            code,
-            pressed: false,
-            time_ms: t + 1,
-        });
-    }
-
-    // Find the frame in which the terminal responded: the first tick after the
-    // keystrokes whose damage is non-empty and does not cover everything.
-    let mut typing_frame: Option<Tick> = None;
-    let deadline = Instant::now() + BUDGET;
-    while typing_frame.is_none() {
-        clock += TICK_MS;
-        let t = tick(&h, &mut comp, &presenter, clock);
-        let area = damage_area(&t.damage);
-        if area > 0 && t.frame.pixels() != before.pixels() {
-            typing_frame = Some(t);
-        }
-        if Instant::now() > deadline {
-            kill_child(&mut foot);
-            panic!("the terminal never redrew after typing — did the keys reach it?");
-        }
-        std::thread::sleep(Duration::from_millis(5));
     }
     let typed = typing_frame.expect("a typing frame");
+    assert!(
+        host.bytes_copied() > bytes_before_typing,
+        "the terminal committed new pixels in response to typing"
+    );
 
     // ---- 4. The founding thesis, measured -------------------------------
     let area = damage_area(&typed.damage);
@@ -300,12 +346,13 @@ fn a_real_terminal_runs_and_typing_redraws_a_region_not_a_frame() {
         TYPING_DAMAGE_FRACTION_MAX * 100.0
     );
 
-    // Outside the damage region, nothing moved; inside it, something did.
+    // Across this one frame: outside its damage region nothing moved, inside it
+    // something did.
     let mut changed_inside = 0usize;
     let mut changed_outside = 0usize;
     for y in 0..H {
         for x in 0..W {
-            if before.pixel(x, y) == typed.frame.pixel(x, y) {
+            if previous_frame.pixel(x, y) == typed.frame.pixel(x, y) {
                 continue;
             }
             if in_damage(&typed.damage, x, y) {
@@ -324,6 +371,15 @@ fn a_real_terminal_runs_and_typing_redraws_a_region_not_a_frame() {
         "no pixel inside the damage region changed — the terminal did not actually redraw"
     );
     eprintln!("M1 acceptance: {changed_inside} px changed, all inside the damage region");
+
+    // And the terminal really did respond to the typing, rather than merely
+    // finishing something it had already started: the screen differs from the
+    // settled, pre-typing frame.
+    assert_ne!(
+        typed.frame.pixels(),
+        settled.pixels(),
+        "the screen changed after typing, not just within one repaint"
+    );
 
     // ---- 5. Teardown ----------------------------------------------------
     kill_child(&mut foot);

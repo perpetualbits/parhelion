@@ -633,7 +633,7 @@ correct rather than missing.
   unmapped counted not fatal) and the softbuffer conversion (channel order, alpha
   dropped, buffer reuse on shrink).
 
-## 12. The output, and shutdown (T7)
+## 12. The output, the clipboard, and shutdown (T7/T7b)
 
 ### 12.1 `wl_output`
 
@@ -660,22 +660,67 @@ One output, named `parhelion-0`, with:
 `xdg_output` rides alongside (Smithay derives it from the same state) and reports
 logical geometry, which at scale 1 is the mode.
 
-### 12.2 The clipboard (`wl_data_device_manager`)
+### 12.2 The clipboard and drag-and-drop (`wl_data_device_manager`)
 
 Added when the acceptance run found that `foot` will not start without it. The
 clipboard is not a shell feature — it is a service the display server owes every
 client — so it is protocol machinery (C3) with canonical per-seat state, and it
 lives in the core.
 
-**Clipboard focus follows keyboard focus.** Only the focused client may set the
-selection; that is the protocol's own answer to "who may overwrite what the user
-copied", and it is why the call sits in `refocus_keyboard` — the one place focus
-changes — rather than anywhere the word clipboard appears.
+**The bytes never touch the compositor.** A copy publishes a *source*; a paste
+asks the *offer* for a pipe; the two clients transfer through it directly. The
+core brokers the introduction and gets out of the way, which is both the
+protocol's design and the reason the clipboard costs the core nothing.
 
-**Scheduled debt (I-7):** access is *ungated*. Any focused client may read and
-write the selection. That is ordinary Wayland and correct for M1, but I-7 will
-eventually make it a capability question, and a remote (Rayland) client must land
-on the restricted side of it. The machinery is C8, arriving with M4.
+**Focus-gating is the v1 capability model.** Only the keyboard-focused client may
+set the selection, and only the focused client is handed offers. That is the
+protocol's own answer to "who may overwrite what the user copied"; it satisfies
+**I-7**'s letter (a grant — "has focus" — checked in the core at request time);
+and it is what real tooling is built around: `wl-copy` maps a toplevel purely to
+obtain focus, sets the selection, and destroys the window again (observed with
+`WAYLAND_DEBUG=1`). The call sits in `refocus_keyboard`, the one place focus
+changes, rather than anywhere the word clipboard appears.
+
+**A liveness gap, found by a test and fixed.** Smithay clears a dead selection
+lazily — it checks whether the source still exists only when the selection is next
+*sent*, which normally means on a focus change. So when the clipboard's owner dies
+while focus does not change (a background client exits), the focused client is
+left holding an offer backed by a corpse. `refresh_selection` closes that, and its
+timing is load-bearing: it must run **after** the departing client's teardown, not
+during it — the `destroyed` hook for a surface fires while that client's data
+source is still alive, so a check there re-broadcasts a dying offer. Hence the
+deferred flag, drained at the end of the dispatch pass.
+
+**Drag-and-drop is refused, not half-built.** A client that starts a drag has its
+source cancelled immediately — protocol-legal, and the client learns at once
+rather than waiting on a drag that will never resolve. A real drag is a *pointer
+grab*, and how grabs compose with the focus model (C10 now, S1 in M4, shaped and
+3D windows later) is a design conversation of its own.
+
+**Scheduled debt (I-7):** beyond the focus gate, access is ungated — no security
+context, no per-client grant, no smaller grant set for remote clients. Ordinary
+Wayland, correct for M1; C8's capability machinery (M4) is where it becomes a
+policy question.
+
+### 12.3 `wl_subcompositor`: an advertised global we do not honour
+
+Recorded here because it is the one place Parhelion advertises something it does
+not implement, and because the attempt to fix it produced a useful measurement.
+
+The scene ignores subsurfaces: only a root surface's buffer becomes a scene node.
+The global **is** separable (`CompositorState::subcompositor_global()` +
+`DisplayHandle::remove_global`), and withdrawing it was implemented and measured —
+whereupon `foot` refuses to start (`no sub compositor`, exit 230), failing M1's
+acceptance criterion. The same measurement showed `foot` never calls
+`get_subsurface`, so the gap is *dormant* for the clients we run: the global's
+existence is a startup probe, not something they exercise.
+
+So the advertisement stays as a **stated debt**; the conformance test pins the
+exact advertised set so the next change to it is deliberate; and the honest
+resolution — implementing subsurfaces — is scheduled work rather than a silent
+omission.
+
+### 12.4 Graceful shutdown
 
 `parhelion-dev` binds a real socket, and the listening socket unlinks itself (and
 its `.lock`) when dropped. A signal with no handler kills the process outright, so
@@ -690,6 +735,18 @@ a stale socket harmless on the next bind.
 binary's own plumbing testable where there is no display
 (`harness/tests/dev_binary.rs` spawns it, signals it, and asserts the files are
 gone).
+
+### 12.5 T7/T7b tests
+
+- **`harness/tests/acceptance.rs`** — the milestone's acceptance run (see §13).
+- **`harness/tests/clipboard.rs`** — copy/paste between two rig clients with the
+  bytes checked; the **focus gate asserted** with a third, unfocused client;
+  replacement cancels the previous source; the owner's death clears the selection;
+  a drag is cancelled rather than left hanging; and a round-trip between the real
+  `wl-copy` and `wl-paste` programs.
+- **`harness/tests/output.rs`**, **`conformance.rs`**, **`dev_binary.rs`** — the
+  output's advertisement, the `wl_shm` rejection paths, the pinned global set, and
+  the binary's socket/shutdown behaviour.
 
 ## 13. What later tasks add here
 

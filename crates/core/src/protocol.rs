@@ -122,12 +122,19 @@ use smithay::input::pointer::{
     AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, PointerHandle,
 };
 use smithay::input::{Seat, SeatHandler, SeatState};
+use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::utils::{Logical, Point, Serial, SERIAL_COUNTER};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     with_states, BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
     Damage, SurfaceAttributes,
 };
+use smithay::wayland::output::{OutputHandler, OutputManagerState};
+use smithay::wayland::selection::data_device::{
+    set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState,
+    ServerDndGrabHandler,
+};
+use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ShellClient, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
@@ -207,6 +214,32 @@ pub const KEY_REPEAT_DELAY_MS: i32 = 600;
 
 /// Key repeat rate in keys per second (see [`KEY_REPEAT_DELAY_MS`]).
 pub const KEY_REPEAT_RATE_HZ: i32 = 25;
+
+// ==========================================================================
+// Output constants (T7).
+// ==========================================================================
+
+/// The single output's name, as advertised to clients (`wl_output.name`).
+/// One output is all M1 models; multi-output arrives with the DRM backend (M2),
+/// which learns about real connectors.
+pub const OUTPUT_NAME: &str = "parhelion-0";
+
+/// Refresh rate advertised for the output's mode, in **millihertz** — 60 Hz.
+///
+/// It is a claim about pacing that M1 cannot yet keep: the render loop is
+/// externally ticked and has no vblank (§4). Clients ask for a number and some
+/// use it to schedule, so a plausible one is better than a zero; the real number
+/// comes from the connector's mode with the DRM backend (M2).
+pub const OUTPUT_REFRESH_MHZ: i32 = 60_000;
+
+/// The output's size until a backend states its real one with
+/// [`ProtocolHost::set_output_size`].
+///
+/// A compositor must advertise *something* the moment a client binds the output,
+/// and the protocol host starts before any backend has told it how big its
+/// window is. This is that placeholder — a plain 720p, chosen because it is
+/// unremarkable. The nested backend replaces it at startup and on every resize.
+pub const DEFAULT_OUTPUT_SIZE: (u32, u32) = (1280, 720);
 
 // ==========================================================================
 // Static Send/Sync regression guards (spike §5.5).
@@ -314,6 +347,9 @@ enum Control {
     /// dispatch thread. Producers (winit's loop, the test rig) never touch a
     /// protocol object themselves.
     Input(InputEvent),
+    /// The backend's output changed size (T7): re-advertise the mode so clients
+    /// learn the new screen size.
+    OutputSize(u32, u32),
     /// Send `xdg_wm_base.ping` to every shell client with a live toplevel (T5).
     PingClients,
     /// Stop the dispatch loop and let the thread exit.
@@ -382,6 +418,23 @@ struct State {
     /// Smithay's seat state (T6): owns the `wl_seat` global, capability
     /// advertisement, and keymap delivery.
     seat_state: SeatState<State>,
+    /// The one seat (`CORE-BOUNDARY.md` C2), needed by name so the clipboard's
+    /// focus can follow the keyboard's (T7).
+    seat: Seat<State>,
+    /// Smithay's data-device state (T7): the `wl_data_device_manager` global, the
+    /// clipboard, and drag-and-drop.
+    data_device_state: DataDeviceState,
+    /// Smithay's output-manager state (T7). Held, not read: the request dispatch
+    /// is delegated to `OutputManagerState`'s own impls (no accessor needed), so
+    /// this value's job is to own the `zxdg_output_manager_v1` global's id for the
+    /// dispatch thread's lifetime.
+    #[allow(dead_code)]
+    output_manager_state: OutputManagerState,
+    /// The single output every surface lives on (T7). Real clients need one —
+    /// they ask it for size, scale, and refresh before they draw — so it is
+    /// implemented properly rather than stubbed: a real mode, real geometry, and
+    /// `wl_surface.enter`/`leave` as surfaces map and unmap.
+    output: Output,
     /// Keyboard handle — where [`InputEvent::Key`] events are applied, and the
     /// owner of the xkb state that turns keycodes into modifiers.
     keyboard: KeyboardHandle<State>,
@@ -501,6 +554,11 @@ impl State {
     /// both unmap paths: null attach and `xdg_toplevel.destroy`.
     fn unmap_surface(&mut self, obj: &ObjectId) {
         self.surface_pixels.remove(obj);
+        // Off screen means off the output (T7) — the mirror of the `enter` sent
+        // when it mapped. Also idempotent.
+        if let Some(surface) = self.surfaces.get(obj).cloned() {
+            self.output.leave(&surface);
+        }
         if let Some(&sid) = self.obj_to_surface.get(obj) {
             self.scene.mutate(move |s| s.clear_source(sid));
             self.focus_map.unmap(sid);
@@ -534,6 +592,17 @@ impl State {
         }
         self.keyboard_focus = target;
         let surface = target.and_then(|sid| self.wl_surface_for(sid));
+
+        // The clipboard follows the keyboard (T7). Only the focused client may
+        // set the selection — that is the protocol's own answer to "who is
+        // allowed to overwrite what the user copied", and it is why this call
+        // belongs *here*, in the one place focus changes, rather than anywhere a
+        // clipboard is mentioned.
+        let dh = self.dh.clone();
+        let seat = self.seat.clone();
+        let focused_client = surface.as_ref().and_then(|s| s.client());
+        set_data_device_focus(&dh, &seat, focused_client);
+
         let keyboard = self.keyboard.clone();
         let serial = SERIAL_COUNTER.next_serial();
         // Sends leave to the old focus and enter to the new one, in that order.
@@ -911,6 +980,11 @@ impl CompositorHandler for State {
                         // surfaces never enter the table: no role, no pixels, no
                         // input (the T5 rule, extended).
                         if let Some(entry) = self.toplevels.get(&obj) {
+                            // The window is on screen now, so it is on the output
+                            // (T7). `enter` is idempotent per surface, so a
+                            // content commit on an already-mapped window sends
+                            // nothing further.
+                            self.output.enter(surface);
                             let (dx, dy) = entry.placement;
                             let rect = Rect::new(dx, dy, size.0 as i32, size.1 as i32);
                             // z is 0 for every toplevel in M1 (stacking policy is
@@ -1032,6 +1106,62 @@ impl SeatHandler for State {
 
     fn cursor_image(&mut self, _seat: &Seat<State>, _image: CursorImageStatus) {}
 }
+
+/// Nothing to do when a client binds the output: Smithay sends the geometry,
+/// mode, scale, and `done` events itself from the state we set at creation. The
+/// hook exists for compositors that track per-client output objects; we do not
+/// need to, because the output never changes identity — only its mode does, and
+/// `change_current_state` re-broadcasts that to everyone bound.
+impl OutputHandler for State {}
+
+// `delegate_output!` supplies the Dispatch/GlobalDispatch impls for wl_output
+// (and zxdg_output_manager_v1), routing them to `OutputManagerState`.
+smithay::delegate_output!(State);
+
+/// The clipboard and drag-and-drop (T7), through Smithay's data-device machinery.
+///
+/// # Why this is in the core at all
+///
+/// The clipboard is not a shell feature — it is a service the display server owes
+/// every client, and clients treat its absence as a broken compositor (`foot`
+/// refuses to start without `wl_data_device_manager`). It is protocol machinery
+/// (C3) and it needs canonical per-seat state, so it belongs here rather than in a
+/// server.
+///
+/// # What is deliberately *not* here yet
+///
+/// **Access is ungated.** Any client that has keyboard focus may read and write
+/// the selection — which is ordinary Wayland, and which invariant **I-7** will
+/// eventually make a capability question ("no privileged operation proceeds
+/// without a grant attached to the client's security context"). The capability
+/// machinery itself is C8 and arrives with the microkernel milestone (M4); a
+/// remote (Rayland) client must land on the restricted side of it. Until then the
+/// honest description is: implemented, correct, and not yet policed. Recorded in
+/// the decision log so it is a scheduled debt rather than an oversight.
+///
+/// The handler methods below are all defaults: `SelectionHandler`'s hooks matter
+/// only for *compositor-provided* selections (we set none — clipboard content
+/// passes client to client, and the compositor never reads it), and the two DnD
+/// grab handlers only for compositor-initiated drags. Smithay drives the
+/// client-to-client transfer itself.
+impl SelectionHandler for State {
+    /// No compositor-provided selections in M1, so there is no per-selection data
+    /// to carry.
+    type SelectionUserData = ();
+}
+
+impl DataDeviceHandler for State {
+    fn data_device_state(&self) -> &DataDeviceState {
+        &self.data_device_state
+    }
+}
+
+impl ClientDndGrabHandler for State {}
+impl ServerDndGrabHandler for State {}
+
+// `delegate_data_device!` supplies the Dispatch/GlobalDispatch impls for
+// wl_data_device_manager/wl_data_device/wl_data_source/wl_data_offer.
+smithay::delegate_data_device!(State);
 
 // `delegate_seat!` supplies the Dispatch/GlobalDispatch impls for
 // wl_seat/wl_keyboard/wl_pointer/wl_touch, routing them to `SeatState` (which
@@ -1310,6 +1440,15 @@ impl ProtocolHost {
         Ok(())
     }
 
+    /// Tell the compositor how big its output is (T7) — the backend's window
+    /// size in the nested case, a connector's mode in M2. Re-advertises the mode
+    /// to every client bound to `wl_output`.
+    ///
+    /// Asynchronous like every other control message; nothing waits for it.
+    pub fn set_output_size(&self, width: u32, height: u32) {
+        let _ = self.control_tx.send(Control::OutputSize(width, height));
+    }
+
     /// A clone of the render side's notice handle. Hand this to the
     /// [`RenderLoop`](crate::render::RenderLoop) so its ticks fire frame
     /// callbacks (the reverse edge).
@@ -1533,8 +1672,6 @@ fn run_dispatch(
     // advertises the `wl_seat` global with those capabilities; Smithay delivers
     // the keymap to each client that binds a keyboard.
     let mut seat_state = SeatState::<State>::new();
-    // `SeatState` owns the seat (it keeps the list of them alive); we keep only
-    // the two capability handles, which is all the input path needs.
     let mut seat = seat_state.new_wl_seat(&dh, SEAT_NAME);
     let keyboard = seat
         .add_keyboard(
@@ -1551,11 +1688,54 @@ fn run_dispatch(
         .expect("compile the default xkb keymap");
     let pointer = seat.add_pointer();
 
+    // The data device (T7): clipboard and drag-and-drop. Real applications treat
+    // a compositor without one as broken — `foot` refuses to start — because the
+    // clipboard is not a feature of the desktop shell, it is a service the
+    // display server owes every client.
+    let data_device_state = DataDeviceState::new::<State>(&dh);
+
+    // The output (T7). A real client asks the compositor how big its screen is,
+    // how it is scaled, and how fast it refreshes, *before* it draws anything —
+    // so this is a real output with a real mode, not an advertised shell. Its
+    // size tracks the backend's (the nested window's, via `Control::OutputSize`).
+    let output_manager_state = OutputManagerState::new_with_xdg_output::<State>(&dh);
+    let output = Output::new(
+        OUTPUT_NAME.to_string(),
+        PhysicalProperties {
+            // Zero physical size is the honest answer for a nested window: there
+            // is no monitor, so there are no millimetres. Clients treat 0 as
+            // "unknown" rather than computing a nonsense DPI from a made-up one.
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "Parhelion".into(),
+            model: "Nested".into(),
+        },
+    );
+    output.create_global::<State>(&dh);
+    let mode = OutputMode {
+        size: (DEFAULT_OUTPUT_SIZE.0 as i32, DEFAULT_OUTPUT_SIZE.1 as i32).into(),
+        refresh: OUTPUT_REFRESH_MHZ,
+    };
+    output.set_preferred(mode);
+    // Scale 1: fractional scaling needs `wp_fractional_scale` and a renderer that
+    // can honour it (M2+). Claiming a scale we do not implement would make every
+    // client draw at the wrong size.
+    output.change_current_state(
+        Some(mode),
+        Some(smithay::utils::Transform::Normal),
+        Some(Scale::Integer(1)),
+        Some((0, 0).into()),
+    );
+
     let mut state = State {
         compositor_state,
         shm_state,
         xdg_shell_state,
         seat_state,
+        seat: seat.clone(),
+        data_device_state,
+        output_manager_state,
+        output,
         keyboard,
         pointer,
         pointer_pos: (0.0, 0.0),
@@ -1626,6 +1806,20 @@ fn run_dispatch(
                     // The input funnel's crossing (T6): apply on this thread,
                     // where the seat's protocol objects live.
                     Control::Input(event) => apply_input(state, event),
+                    // The output resized (T7). `change_current_state` re-sends
+                    // mode + done to every client bound to the output, so a
+                    // client that laid itself out for the old size learns the
+                    // new one. The scene's own damage on resize is the backend's
+                    // business (it owns the frame); this is only the protocol
+                    // half.
+                    Control::OutputSize(w, h) => {
+                        let mode = OutputMode {
+                            size: (w as i32, h as i32).into(),
+                            refresh: OUTPUT_REFRESH_MHZ,
+                        };
+                        state.output.set_preferred(mode);
+                        state.output.change_current_state(Some(mode), None, None, None);
+                    }
                     Control::PingClients => {
                         let serial = SERIAL_COUNTER.next_serial();
                         for toplevel in state.xdg_shell_state.toplevel_surfaces() {

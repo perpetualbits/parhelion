@@ -633,10 +633,71 @@ correct rather than missing.
   unmapped counted not fatal) and the softbuffer conversion (channel order, alpha
   dropped, buffer reuse on shrink).
 
-## 12. What later tasks add here
+## 12. The output, and shutdown (T7)
 
-M1's tasks are complete through T6; T7 is the milestone's acceptance run (a real
-terminal under the nested backend), which adds no new mechanism here.
+### 12.1 `wl_output`
+
+A real client asks the compositor about its screen *before* it draws: how big,
+what scale, how fast. So `wl_output` is implemented properly rather than stubbed
+— an advertised-but-hollow global is a lie to every future client, and this one
+would be found out on the first frame.
+
+One output, named `parhelion-0`, with:
+
+- a **real mode**: the backend's size (the nested window's, restated on every
+  resize through `ProtocolHost::set_output_size`) at `OUTPUT_REFRESH_MHZ`
+  (60 Hz). The refresh is a claim M1 cannot yet keep — the render loop is
+  externally ticked and has no vblank (§4) — but clients schedule against it, so a
+  plausible number beats a zero. The real one comes from the connector in M2;
+- **scale 1**, because we implement no scaling. Claiming otherwise would make
+  every client draw at the wrong size;
+- **zero physical size**, the honest answer for a nested window: there is no
+  monitor, so there are no millimetres, and clients read 0 as "unknown" rather
+  than computing a nonsense DPI;
+- `wl_surface.enter` / `leave` as windows map and unmap — idempotent, so a
+  redraw does not re-announce anything.
+
+`xdg_output` rides alongside (Smithay derives it from the same state) and reports
+logical geometry, which at scale 1 is the mode.
+
+### 12.2 The clipboard (`wl_data_device_manager`)
+
+Added when the acceptance run found that `foot` will not start without it. The
+clipboard is not a shell feature — it is a service the display server owes every
+client — so it is protocol machinery (C3) with canonical per-seat state, and it
+lives in the core.
+
+**Clipboard focus follows keyboard focus.** Only the focused client may set the
+selection; that is the protocol's own answer to "who may overwrite what the user
+copied", and it is why the call sits in `refocus_keyboard` — the one place focus
+changes — rather than anywhere the word clipboard appears.
+
+**Scheduled debt (I-7):** access is *ungated*. Any focused client may read and
+write the selection. That is ordinary Wayland and correct for M1, but I-7 will
+eventually make it a capability question, and a remote (Rayland) client must land
+on the restricted side of it. The machinery is C8, arriving with M4.
+
+`parhelion-dev` binds a real socket, and the listening socket unlinks itself (and
+its `.lock`) when dropped. A signal with no handler kills the process outright, so
+`Drop` never runs — T6 shipped exactly that litter. The fix is the smallest thing
+that works: the signal handler sets an atomic flag, the event loop notices it and
+exits **through its normal path**, and every `Drop` runs on the way out. Nothing
+is cleaned up *in* the handler. `SIGKILL` still leaves the files behind — that is
+the kernel's contract, not a gap in ours, and wayland-server's lock protocol makes
+a stale socket harmless on the next bind.
+
+`--headless` runs the same compositor with no window, which is what makes the
+binary's own plumbing testable where there is no display
+(`harness/tests/dev_binary.rs` spawns it, signals it, and asserts the files are
+gone).
+
+## 13. What later tasks add here
+
+**M1 is complete.** The acceptance run passes as an automated test: `foot` runs
+headlessly against the compositor, echoes typed input, and typing redraws 0.62% of
+the output with every changed pixel inside the reported damage region — the
+founding thesis, measured against software we did not write, and re-proved on
+every CI push.
 
 The named successors to this document's temporary parts, all **M2**: the real
 T-input thread on libinput (§11.2), the vblank-tied frame scheduler that replaces

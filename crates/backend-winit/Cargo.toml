@@ -31,6 +31,11 @@ winit = "0.30"
 # context. The honest match for a CPU compositor — and it keeps the M1 backend
 # free of the graphics stack M2 will introduce deliberately.
 softbuffer = "0.4"
+# Signal handling for the dev binary's graceful shutdown (T7): SIGTERM/SIGINT
+# must reach the normal exit path so the listening socket and its lock file are
+# unlinked. `signal-hook`'s flag API is the small, safe subset — an atomic set
+# from the handler, polled by the loop — with no unsafe of our own.
+signal-hook = { version = "0.3", default-features = false }
 
 # Inherit the workspace lint policy (see the root Cargo.toml).
 [lints]

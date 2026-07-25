@@ -536,3 +536,72 @@ guards. This closes M0.
   wayland-server's lock protocol makes a stale socket harmless on the next bind.
   Noted rather than fixed: signal handling in the dev binary is not M1's business.
   `make test`: 89 tests green (+20), clippy clean, goldens untouched. `#backend`
+
+## M1 T7 — the acceptance run, and the word "no"
+
+- **The milestone nearly ended on a refusal.** Everything M1 built was so a
+  terminal nobody wrote for us could connect, map, render, and echo keystrokes.
+  `foot` connected, bound our globals, loaded its fonts — and quit: `no clipboard
+  available (wl_data_device_manager not implemented by server)`, exit 230. Not a
+  warning it degrades past; a hard gate. The prompt had named this exact case in
+  advance and told me what to do: stop, report, do not stub. I reported with three
+  options and the evidence; Roland chose to implement it properly. Forty lines of
+  Smithay wiring later foot started, and the milestone closed on its actual terms
+  rather than on a caveat. `#milestone` `#discovery`
+
+- **Not stubbing was the whole test.** It would have taken twenty minutes to
+  advertise `wl_data_device_manager` and answer its requests with nothing. foot
+  would have started. The window would have appeared. The screenshot would have
+  looked like success — and every future client would have believed a compositor
+  that says it has a clipboard. An advertised-but-hollow global is not a
+  shortcut, it is a lie with a long tail, and the fact that stubbing was *easy
+  and would have looked like winning* is exactly why the rule has to be written
+  down in advance rather than decided in the moment. `#design-decision`
+
+- **What M1 taught, in one line each.** T1: the narrow line between building 3D
+  and forbidding it is an extensible enum with one arm implemented. T2: two
+  threads feeding each other queues makes "what if one floods" stop being
+  theoretical. T3: the seam held — the frontend/renderer split we bought at M0
+  paid at the first real pixels. T4: incremental-equals-from-scratch is the only
+  damage property worth having, and it must be *seen* to fail. T5: convenience
+  semantics ("composite anything committed") are non-conformance wearing a
+  friendly face. T6: winit owns the main thread, so record the deviation instead
+  of pretending. T7: the last mile is where you find out whether the previous six
+  were honest. `#milestone`
+
+- **The bill for six tasks of discipline came due, and it was small.** foot got
+  further than I expected on the first try: registry, globals, shm, fonts, and a
+  clean exit path. Nothing in our protocol handling confused it; the one thing it
+  wanted, we genuinely do not have. That is the good version of a blocked
+  acceptance — a missing feature, not a broken one. `#milestone`
+
+- **Two leftovers closed on the way.** T6's socket litter is gone: signals now set
+  a flag, the loop exits through its normal path, and `Drop` unlinks the socket
+  and its lock — with a test that spawns the actual binary, signals it, and checks
+  the files. That test needed the binary to run without a display, so
+  `--headless` exists now; it is the same compositor minus winit, and it is what
+  lets CI check a claim that was previously only asserted. `#backend`
+
+- **`wl_output` is the shape of "implement, don't stub" done positively.** Real
+  mode from the backend, scale 1 because we implement no scaling, zero physical
+  size because a nested window has no millimetres, enter/leave on map and unmap.
+  Two of those values are claims M1 cannot fully keep (the refresh rate implies a
+  vblank we do not have), so the doc says so rather than letting a future reader
+  discover it. `#core`
+
+- **The number that closes M1: 0.62%.** Typing "hello⏎" into a real terminal
+  damaged 2 964 pixels of 480 000 — and all 286 pixels that actually changed were
+  inside the reported damage region. That is VISION's founding thesis (typing
+  redraws a region, not a frame) measured against software we did not write, in a
+  test CI re-proves on every push. The whole of M1 — scene graph, snapshots,
+  damage algebra, shm, xdg-shell, seat, the funnel — exists to make that one
+  number true, and it would have been just as easy to *claim* it. `#milestone`
+
+- **The tripwire earned its keep immediately.** foot throttles on frame callbacks,
+  so I sabotaged the notice path and re-ran: the test hung for thirty seconds and
+  then said "foot stopped committing after its first frame — frame callbacks are
+  not flowing". A terminal that renders once and freezes now cannot pass. That is
+  the single most valuable assertion in the suite, and it exists because the
+  prompt insisted the acceptance test be *verified to fail*. `#harness`
+
+- **`make test`: 101 tests green**, on the day M1 closed. `#milestone`

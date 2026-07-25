@@ -57,6 +57,7 @@ use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
 use wayland_client::protocol::wl_pointer::{self, WlPointer};
+use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat::{self, WlSeat};
 use wayland_client::protocol::wl_shm::{self, Format, WlShm};
@@ -64,6 +65,8 @@ use wayland_client::protocol::wl_shm_pool::WlShmPool;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
 use wayland_protocols::xdg::shell::client::xdg_popup::{self, XdgPopup};
+use wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_manager_v1::ZxdgOutputManagerV1;
+use wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_v1::{self, ZxdgOutputV1};
 use wayland_protocols::xdg::shell::client::xdg_positioner::XdgPositioner;
 use wayland_protocols::xdg::shell::client::xdg_surface::{self, XdgSurface};
 use wayland_protocols::xdg::shell::client::xdg_toplevel::{self, XdgToplevel};
@@ -102,6 +105,18 @@ struct App {
     keymap: Option<String>,
     /// Capabilities advertised on `wl_seat`, as the raw bitfield.
     seat_capabilities: u32,
+    /// What the compositor said about its output (T7): mode size, scale, and how
+    /// many `done` events closed an atomic batch of output state.
+    output_mode: Option<(i32, i32, i32)>,
+    output_scale: i32,
+    output_done: u32,
+    /// `wl_surface.enter`/`leave` — which surfaces the compositor says are on an
+    /// output, in arrival order (by client-side object id).
+    surface_outputs: Vec<(u32, bool)>,
+    /// `xdg_output`'s logical geometry, which is what a client actually lays
+    /// itself out against (it is scale-independent, unlike `wl_output.mode`).
+    xdg_logical_size: Option<(i32, i32)>,
+    xdg_logical_position: Option<(i32, i32)>,
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for App {
@@ -129,14 +144,26 @@ impl Dispatch<WlCompositor, ()> for App {
 }
 
 impl Dispatch<WlSurface, ()> for App {
+    /// Record `enter`/`leave`: which of this client's surfaces the compositor
+    /// says are on an output (T7). `true` is an enter.
     fn event(
-        _: &mut Self,
-        _: &WlSurface,
-        _: wayland_client::protocol::wl_surface::Event,
+        state: &mut Self,
+        surface: &WlSurface,
+        event: wayland_client::protocol::wl_surface::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        let id = surface.id().protocol_id();
+        match event {
+            wayland_client::protocol::wl_surface::Event::Enter { .. } => {
+                state.surface_outputs.push((id, true))
+            }
+            wayland_client::protocol::wl_surface::Event::Leave { .. } => {
+                state.surface_outputs.push((id, false))
+            }
+            _ => {}
+        }
     }
 }
 
@@ -249,6 +276,68 @@ impl Dispatch<XdgToplevel, ()> for App {
     ) {
         if let xdg_toplevel::Event::Configure { width, height, .. } = event {
             state.toplevel_configures.push((width, height));
+        }
+    }
+}
+
+impl Dispatch<WlOutput, ()> for App {
+    /// Record the output's advertised state. `mode`, `scale`, and `geometry`
+    /// arrive as a batch closed by `done`, which is what a client waits for
+    /// before trusting any of them.
+    fn event(
+        state: &mut Self,
+        _: &WlOutput,
+        event: wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_output::Event::Mode {
+                width,
+                height,
+                refresh,
+                ..
+            } => state.output_mode = Some((width, height, refresh)),
+            wl_output::Event::Scale { factor } => state.output_scale = factor,
+            wl_output::Event::Done => state.output_done += 1,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZxdgOutputManagerV1, ()> for App {
+    /// The manager emits no events; it exists to hand out `xdg_output` objects.
+    fn event(
+        _: &mut Self,
+        _: &ZxdgOutputManagerV1,
+        _: <ZxdgOutputManagerV1 as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZxdgOutputV1, ()> for App {
+    /// Record the logical geometry — the scale-independent size and position a
+    /// client lays itself out against.
+    fn event(
+        state: &mut Self,
+        _: &ZxdgOutputV1,
+        event: zxdg_output_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zxdg_output_v1::Event::LogicalSize { width, height } => {
+                state.xdg_logical_size = Some((width, height))
+            }
+            zxdg_output_v1::Event::LogicalPosition { x, y } => {
+                state.xdg_logical_position = Some((x, y))
+            }
+            _ => {}
         }
     }
 }
@@ -531,6 +620,15 @@ pub struct ScriptedClient {
     // nothing), and the rig records those events through the `Dispatch` impls
     // rather than through these handles. Held rather than dropped so the client's
     // object lifetime matches a real application's.
+    /// The bound `wl_output` (T7). Held so the compositor keeps sending this
+    /// client output state, and used to ask for the matching `xdg_output`.
+    output: WlOutput,
+    /// The `xdg_output` for [`output`](Self::output), bound lazily by the tests
+    /// that ask about logical geometry.
+    xdg_output: Option<ZxdgOutputV1>,
+    /// The registry's global list, kept so late binds (like `xdg_output`'s
+    /// manager) do not need a second registry round-trip.
+    globals: wayland_client::globals::GlobalList,
     /// The bound `wl_seat` (T6).
     #[allow(dead_code)]
     seat: WlSeat,
@@ -575,6 +673,12 @@ impl ScriptedClient {
             .expect("wl_seat global advertised");
         let keyboard = seat.get_keyboard(&qh, ());
         let pointer = seat.get_pointer(&qh, ());
+        // Bind wl_output (T7). A real client binds it before it draws, to learn
+        // the screen's size and scale; the rig does the same so its surfaces
+        // receive enter/leave.
+        let output: WlOutput = globals
+            .bind(&qh, 1..=4, ())
+            .expect("wl_output global advertised");
         ScriptedClient {
             conn,
             queue,
@@ -582,6 +686,9 @@ impl ScriptedClient {
             compositor,
             shm,
             wm_base,
+            output,
+            xdg_output: None,
+            globals,
             seat,
             keyboard,
             pointer,
@@ -666,6 +773,24 @@ impl ScriptedClient {
         let qh = self.queue.handle();
         pool.pool
             .create_buffer(0, width, height, width * 4, format.to_wl(), &qh, ())
+    }
+
+    /// Create a `wl_buffer` with **explicit** offset and stride, including values
+    /// that do not fit the pool. The conformance tests need this: a compositor
+    /// must reject impossible geometry rather than read out of bounds, and the
+    /// only way to check that is to ask for it.
+    pub fn create_buffer_raw(
+        &mut self,
+        pool: &ShmPool,
+        offset: i32,
+        width: i32,
+        height: i32,
+        stride: i32,
+        format: ShmFormat,
+    ) -> WlBuffer {
+        let qh = self.queue.handle();
+        pool.pool
+            .create_buffer(offset, width, height, stride, format.to_wl(), &qh, ())
     }
 
     /// Attach `buffer` to `surface` at offset (0, 0). Double-buffered: applied on
@@ -875,6 +1000,66 @@ impl ScriptedClient {
             self.app.input_events.len(),
             self.app.input_events
         );
+    }
+
+    // ----- Output observation (T7) ------------------------------------------
+
+    /// The output mode the compositor advertised: `(width, height, refresh_mHz)`.
+    pub fn output_mode(&self) -> Option<(i32, i32, i32)> {
+        self.app.output_mode
+    }
+
+    /// The output scale factor advertised (`wl_output.scale`).
+    pub fn output_scale(&self) -> i32 {
+        self.app.output_scale
+    }
+
+    /// How many `wl_output.done` events have closed a batch of output state.
+    pub fn output_done_count(&self) -> u32 {
+        self.app.output_done
+    }
+
+    /// `wl_surface.enter`/`leave` in arrival order, as
+    /// `(client-side surface id, is_enter)`.
+    pub fn surface_outputs(&self) -> &[(u32, bool)] {
+        &self.app.surface_outputs
+    }
+
+    /// Bind `xdg_output` for this client's output and pump until its logical
+    /// geometry arrives, then return the logical size.
+    pub fn xdg_output_logical_size(&mut self) -> (i32, i32) {
+        self.ensure_xdg_output();
+        self.app
+            .xdg_logical_size
+            .expect("xdg_output reported a logical size")
+    }
+
+    /// As [`xdg_output_logical_size`](Self::xdg_output_logical_size), for the
+    /// logical position.
+    pub fn xdg_output_logical_position(&mut self) -> (i32, i32) {
+        self.ensure_xdg_output();
+        self.app
+            .xdg_logical_position
+            .expect("xdg_output reported a logical position")
+    }
+
+    /// Bind the manager (once) and wait for the geometry batch.
+    fn ensure_xdg_output(&mut self) {
+        if self.xdg_output.is_none() {
+            let qh = self.queue.handle();
+            let manager: ZxdgOutputManagerV1 = self
+                .globals
+                .bind(&qh, 1..=3, ())
+                .expect("zxdg_output_manager_v1 global advertised");
+            self.xdg_output = Some(manager.get_xdg_output(&self.output, &qh, ()));
+        }
+        for _ in 0..1000 {
+            if self.app.xdg_logical_size.is_some() && self.app.xdg_logical_position.is_some() {
+                return;
+            }
+            self.roundtrip();
+        }
+        panic!("xdg_output geometry never arrived");
     }
 
     // ----- Protocol-error observation (T5) ----------------------------------

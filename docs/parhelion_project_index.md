@@ -77,7 +77,21 @@ T6.
 
 ## Current state
 
-- **Milestone:** M1 (One window, honestly) — **T6 complete 2026-07-25**
+- **Milestone:** M1 (One window, honestly) — **COMPLETE 2026-07-25** (T7;
+  `docs/plans/m1_tasks.md`, `docs/scene_graph_v1.md` §12). The acceptance run is
+  an automated, headless test (`crates/harness/tests/acceptance.rs`): `foot` — a
+  real third-party terminal — connects over a real Wayland socket, maps an xdg
+  toplevel, commits shm pixels, keeps drawing because frame callbacks flow,
+  receives typed keys through the input funnel, and **redraws 0.62% of the output
+  to echo them** (bound 25%), every changed pixel inside the reported damage
+  region. Verified to fail when the frame-callback notice is sabotaged. T7 also
+  added `wl_output` + `xdg_output`, `wl_data_device_manager` (foot refuses to
+  start without a clipboard; implemented properly on Roland's decision, with the
+  I-7 capability debt recorded), graceful shutdown for `parhelion-dev` with a
+  `--headless` mode, and the conformance sweep. Reported, not fixed:
+  `wl_subcompositor` is advertised but the scene ignores subsurfaces. `make test`:
+  **101 tests green**, clippy clean. Next: M2 (On the metal).
+- **M1 T6** complete 2026-07-25
   (`docs/plans/m1_tasks.md`, `docs/scene_graph_v1.md` §11). Seat, input, and the
   nested backend: `wl_seat` with keyboard + pointer, an xkb keymap, and one
   `InputEvent` funnel every source produces (winit, the rig, and later libinput) —

@@ -87,7 +87,7 @@ silent).
 **Acceptance:** protocol-rig tests for enter/leave/key/button delivery
 and focus follow; interactive smoke: a window Roland can see.
 
-## T7 — M1 acceptance run and closure *(prompt 10)*
+## T7 — M1 acceptance run and closure *(prompt 10)* — **complete**
 
 The real thing: foot or weston-terminal under the winit backend —
 launches, maps, renders, echoes typed input. Damage counters prove
@@ -97,20 +97,12 @@ line in the milestone plan.
 **Acceptance:** the milestone plan's M1 acceptance list, every item
 stated green, or an honest blocker report.
 
----
+**Status (2026-07-25): complete.** `wl_output` (pre-authorized, implemented
+properly), `wl_data_device_manager` (added on Roland's decision after `foot`
+refused to start without it — implemented properly, not stubbed), graceful
+shutdown for `parhelion-dev` plus a `--headless` mode, the conformance sweep, and
+**the automated acceptance test**: foot runs headlessly, echoes typed input, and
+typing redraws 0.62% of the output. M1 is closed.
 
-## Standing notes for all M1 tasks
-
-- No Smithay renderer or `desktop`/`space` types anywhere (decision
-  log); the seam is watched in T3 and T6 specifically.
-- Scene graph types are born 3D-ready (transform slot exists) but only
-  the axis-aligned path is implemented or tested in M1 — building 3D
-  now is scope creep; building types that *forbid* 3D is a Thesis-1
-  violation. The narrow line is T1's design job.
-- Every task lands at least one golden or rig test in the same
-  session (CLAUDE.md test discipline); goldens stay tolerance-0 while
-  rendering is CPU.
-- Deferred-by-name: `presentation-time` (M2, needs real vsync),
-  dmabuf (M2), subsurfaces and popups (post-M1 unless a terminal
-  demands popups — if foot won't run without one, stop and report
-  rather than silently growing scope).
+One gap found and reported rather than papered over: `wl_subcompositor` is
+advertised (by Smithay's compositor delegate) but the scene ignores subsurfaces.

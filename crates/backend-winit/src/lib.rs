@@ -42,12 +42,14 @@
 //!
 //! - [`keycode`] — winit keys → evdev codes (unit-tested, unmapped keys counted).
 //! - [`present`] — a composited `Frame` → softbuffer's pixel layout (unit-tested).
+//! - [`shutdown`] — SIGINT/SIGTERM → an orderly exit, so the socket is unlinked.
 //! - [`NestedBackend`] — the winit application: window, input translation, and
 //!   the render tick. The only part that needs a display, and therefore the only
 //!   part CI cannot exercise.
 
 pub mod keycode;
 pub mod present;
+pub mod shutdown;
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -91,6 +93,10 @@ pub struct NestedBackend {
     start: Instant,
     /// The window title.
     title: String,
+    /// Raised by a termination signal; polled each loop turn so the exit runs
+    /// through winit's normal path and every `Drop` (including the listening
+    /// socket's) gets to run.
+    shutdown: crate::shutdown::ShutdownFlag,
 }
 
 impl NestedBackend {
@@ -102,6 +108,7 @@ impl NestedBackend {
         host: ProtocolHost,
         render: RenderLoop<CpuCompositor>,
         title: impl Into<String>,
+        shutdown: crate::shutdown::ShutdownFlag,
     ) -> Self {
         NestedBackend {
             scene,
@@ -113,6 +120,7 @@ impl NestedBackend {
             keys: KeyTranslator::new(),
             start: Instant::now(),
             title: title.into(),
+            shutdown,
         }
     }
 
@@ -185,6 +193,14 @@ impl ApplicationHandler for NestedBackend {
     /// Translate one window event: input into the funnel, resize into an output
     /// resize, redraw into a frame.
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // A termination signal ends the loop the same way closing the window
+        // does: `exit` unwinds to `run_app`'s return, everything drops, and the
+        // socket unlinks itself (T7).
+        if self.shutdown.is_raised() {
+            event_loop.exit();
+            return;
+        }
+
         let time_ms = self.now_ms();
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),

@@ -29,6 +29,17 @@
 **Scope:** `wl_compositor`, `wl_surface`, `wl_shm`, minimal `xdg-shell` toplevel; `wl_seat` keyboard + pointer delivery to the focused client; scene graph v1 — canonical state owned by core, immutable per-frame snapshots to the render thread (thread skeleton per CORE-BOUNDARY §7 even if protocol shards = 1 for now); damage-tracked partial redraws with instrumentation counters; frame callbacks.
 **Acceptance:** weston-terminal (or foot) runs and echoes typed input under the nested/headless backend; damage counters prove partial redraws (typing redraws a region, not the frame); protocol conformance tests for the implemented globals pass; golden tests for stacking and damage.
 
+**Status: COMPLETE (2026-07-25, T7).** Every acceptance item is green, and the
+headline one is a test CI re-proves on every push
+(`crates/harness/tests/acceptance.rs`): `foot` — a real third-party terminal —
+connects over a real socket, maps an xdg toplevel, commits shm pixels, keeps
+drawing because frame callbacks flow, receives typed keys through the input
+funnel, and **redraws 0.62% of the output to echo them** (bound: 25%), with every
+changed pixel inside the reported damage region. The test was verified to fail
+when the frame-callback notice is sabotaged. Item-by-item walk and evidence:
+`docs/sessions/_session_2026-07-25_m1-acceptance-t7.md`. `make test`: 101 tests
+green, clippy clean.
+
 ## M2 — On the metal
 
 **Goal:** boots from a TTY on real hardware; cautiously daily-drivable.

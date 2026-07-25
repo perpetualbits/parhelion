@@ -380,6 +380,71 @@ below, reasoning now living in the dialect spec and VISION.md.)
   landed, and CI passed because `ubuntu-latest` happens to ship it. The change is
   therefore from *luck* to *contract*, which is the honest way to describe it.
 
+## 2026-07-25 — `wl_output`, graceful shutdown, and the acceptance blocker (M1 T7)
+
+### `wl_output` is implemented, not stubbed — one output, real mode, scale 1
+
+- **Source:** M1 T7 (prompt 10, pre-authorized scope); `docs/scene_graph_v1.md` §12.1.
+- **Affects:** `crates/core/src/protocol.rs` (`OutputManagerState`, `Output`,
+  `OUTPUT_NAME`, `OUTPUT_REFRESH_MHZ`, `DEFAULT_OUTPUT_SIZE`,
+  `ProtocolHost::set_output_size`), `CORE-BOUNDARY.md` C3 (the core's protocol
+  surface grows by one global).
+- **Decision:** One `wl_output` (plus `xdg_output`, which Smithay derives from the
+  same state) with the backend's real size, 60 Hz, scale 1, zero physical size,
+  and `wl_surface.enter`/`leave` on map/unmap. The backend restates the size on
+  every resize.
+- **Reasoning:** A real client asks about the screen before it draws, so this
+  global is on the critical path for the milestone's goal. The prompt's rule —
+  "do not stub protocols; an advertised-but-hollow global is a lie to every future
+  client" — is the whole argument: a hollow output would be found out on the first
+  frame. The two values we *cannot* honour yet are marked as such in the doc
+  (refresh is a claim without a vblank; scale is 1 because we implement no
+  scaling).
+
+### `wl_data_device_manager` is implemented in M1; clipboard access is not yet a capability
+
+- **Source:** M1 T7. `foot` 1.25 refuses to start without it
+  (`err: wayland.c:1758: no clipboard available`, exit 230) — reproduced windowed
+  and headless, with `wl_output` present. Reported to Roland as a stop-and-report
+  with three options; **he chose to implement it properly.**
+- **Affects:** `crates/core/src/protocol.rs` (`DataDeviceState`,
+  `SelectionHandler`, `DataDeviceHandler`, the DnD grab handlers,
+  `set_data_device_focus` in `refocus_keyboard`); `CORE-BOUNDARY.md` C3 (protocol
+  surface) and **I-7** (see the debt below).
+- **Decision:** The clipboard and drag-and-drop are implemented through Smithay's
+  data-device machinery, and clipboard focus follows keyboard focus — only the
+  focused client may set the selection, which is the protocol's own answer to "who
+  may overwrite what the user copied". The alternative (advertise the global,
+  answer with nothing) was rejected on T7's own rule: an advertised-but-hollow
+  global is a lie to every future client, and it would have been *easy* and would
+  have *looked* like success.
+- **Reasoning:** The clipboard is not a shell feature; it is a service the display
+  server owes every client, and real applications treat its absence as a broken
+  compositor. It is protocol machinery with canonical per-seat state, so §4 puts
+  it in the core.
+- **Scheduled debt (I-7):** access is **ungated** — any focused client may read and
+  write the selection. That is ordinary Wayland and it is correct for M1, but I-7
+  ("no privileged operation without a grant attached to the client's security
+  context") will eventually govern it, and a remote (Rayland) client must land on
+  the restricted side. The capability machinery is C8 and arrives with M4. Written
+  down here so it is a scheduled debt rather than an oversight discovered later.
+
+### Termination signals end the loop through its normal path
+
+- **Source:** M1 T7; the T6 session summary's recorded wart;
+  `docs/scene_graph_v1.md` §12.2.
+- **Affects:** `crates/backend-winit/src/shutdown.rs`, `parhelion-dev` (and its
+  new `--headless` mode), `crates/harness/tests/dev_binary.rs`.
+- **Decision:** SIGINT/SIGTERM set an atomic flag; the event loop polls it and
+  exits normally, so `Drop` unlinks the socket and its lock file. The handler
+  itself does nothing else. `parhelion-dev --headless` runs the same compositor
+  without a window so this is testable where there is no display.
+- **Reasoning:** A signal handler may safely do almost nothing — cleaning up *in*
+  the handler is how one gets a deadlock in a crash path. Asking the program to
+  end the way it already knows how is both smaller and more correct. `--headless`
+  is not a second compositor; it is the same one minus winit, and it exists so
+  the claim "shutdown leaves no litter" is checked by CI rather than asserted.
+
 ## Pending
 
 - Lock-screen fail-locked design (`CORE-BOUNDARY.md` §6 note).

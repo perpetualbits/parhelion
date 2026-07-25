@@ -38,7 +38,7 @@ the standing instruction set every session obeys.
 | `docs/parhelion_decision_log.md` | Append-only log of load-bearing decisions; read second, after this index. | Installed, living |
 | `docs/smithay_threading_spike.md` | M0 task 2 investigation spike: can Smithay be driven inside CORE-BOUNDARY §7, and which layers we consume. Report + recommendation; decision landed 2026-07-24. | Installed · complete |
 | `docs/harness_design.md` | Canonical design for the test harness: frame/golden format, comparator tolerance policy, blessing workflow, determinism contract, failure artifacts (P8). | Installed, authoritative · Draft v0.1 |
-| `docs/scene_graph_v1.md` | Canonical design for the scene graph, render loop, and snapshot mechanism (M1 T1–T3): node model (born-3D-ready/2.5D-implemented), texture-source seam incl. **real `wl_shm` copy-at-commit (§3.1, T3)**, §7 thread ownership, snapshot semantics, CPU compositor, the reverse path — frame callbacks / flush ownership / backpressure (§8, T2). Absorbs the M0 ledger. | Installed, authoritative · Draft v0.1 |
+| `docs/scene_graph_v1.md` | Canonical design for the scene graph, render loop, and snapshot mechanism (M1 T1–T4): node model (born-3D-ready/2.5D-implemented), texture-source seam incl. real `wl_shm` copy-at-commit (§3.1, T3), §7 thread ownership, snapshot semantics, CPU compositor, the reverse path (§8, T2), and **damage tracking v1 — region algebra / retained-frame rendering / partial-copy CoW (§9, T4)**. Absorbs the M0 ledger. | Installed, authoritative · Draft v0.1 |
 | `docs/parhelion_project_index.md` | This file. | Living |
 | `docs/diary.md` | Running narrative diary; the why behind non-obvious choices, tagged. | Living |
 | `docs/sessions/` | One summary per Claude Code session (files changed, build/test result). | Living · `_session_2026-07-24_scaffolding.md` |
@@ -75,8 +75,18 @@ workspace members yet; they appear at the milestone that needs them.
 
 ## Current state
 
-- **Milestone:** M1 (One window, honestly) — **T3 complete 2026-07-24**
-  (`docs/plans/m1_tasks.md`, `docs/scene_graph_v1.md` §3.1). First real pixels:
+- **Milestone:** M1 (One window, honestly) — **T4 complete 2026-07-25**
+  (`docs/plans/m1_tasks.md`, `docs/scene_graph_v1.md` §9). Damage tracking v1:
+  per-surface damage accumulates, flows through the scene into the snapshot as an
+  output-space region, and the retained-frame CPU compositor recomputes only
+  damaged pixels. Conservative, bounded (coalesces to a bbox past 16 rects),
+  subtraction-free region algebra; content-vs-structural damage split; damage-
+  aware partial buffer copy with copy-on-write isolation; counters
+  (pixels-redrawn / damage-rects / full-damage-frames / bytes-copied). The
+  governing property — incremental byte-identical to from-scratch — has its own
+  test, verified to fail under sabotage. Next is T5 (xdg-shell). `make test`: 56
+  tests green, clippy clean; goldens unchanged.
+- **M1 T3** complete 2026-07-24 (`docs/scene_graph_v1.md` §3.1). First real pixels:
   `wl_shm` buffers copied and decoded at commit into a source-neutral
   `PixelBuffer` (`argb8888`/`xrgb8888`), the `wl_buffer` released immediately, and
   the CPU compositor blitting them over solid nodes. **The seam check passed** —

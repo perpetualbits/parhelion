@@ -19,18 +19,32 @@
 //!   determinism contract (`docs/harness_design.md` §4): no floats, no time, no
 //!   randomness. Opaque nodes overwrite; translucent nodes use an integer
 //!   source-over blend (documented at [`source_over`]).
-//! - No damage/partial-redraw (that is T4): every frame clears and repaints in
-//!   full. Damage changes cost, never output.
+//! - **Retained-frame damage rendering (T4):** the frame persists between
+//!   composites; each tick recomputes only within the snapshot's damage — per
+//!   rect, clear it and redraw the nodes intersecting it, back-to-front. Pixels
+//!   outside damage keep their retained values. A `Full`-damage snapshot repaints
+//!   everything (first frame / fallback). Because damage is conservative,
+//!   incremental output is byte-identical to a from-scratch full repaint — the
+//!   governing property, exercised by the equivalence test in `harness`.
 //!
 //! Only [`Transform::Identity`] and [`Transform::Translate`] exist and are
 //! handled; there is no reachable transform math beyond integer translation
 //! (Thesis 3). When a real transform variant is added it lands with its own
 //! composited arm here — until then the `match` is exhaustive over what exists.
 
-use parhelion_core::render::Compositor;
-use parhelion_core::scene::{PixelBuffer, Snapshot, TextureSource, Transform};
+use parhelion_core::render::{CompositeStats, Compositor};
+use parhelion_core::scene::{PixelBuffer, Rect, Snapshot, SnapshotDamage, TextureSource, Transform};
 
 use crate::Frame;
+
+/// The output offset a node's transform resolves to (identity/translate only in
+/// M1). Also the surface→output origin.
+fn node_offset(transform: Transform) -> (i32, i32) {
+    match transform {
+        Transform::Identity => (0, 0),
+        Transform::Translate { dx, dy } => (dx, dy),
+    }
+}
 
 /// A CPU compositor that owns one in-memory [`Frame`] and repaints it from a
 /// [`Snapshot`] on each `composite`. The frame is read back with [`Self::frame`]
@@ -61,54 +75,102 @@ impl CpuCompositor {
 }
 
 impl Compositor for CpuCompositor {
-    fn composite(&mut self, snapshot: &Snapshot) -> usize {
-        // Clear the whole frame to the background. Full-frame clear is correct
-        // (if wasteful) until damage tracking (T4) scissors it.
-        for y in 0..self.frame.height() {
-            for x in 0..self.frame.width() {
-                self.frame.set_pixel(x, y, self.clear);
+    fn composite(&mut self, snapshot: &Snapshot) -> CompositeStats {
+        let (fw, fh) = (self.frame.width() as i32, self.frame.height() as i32);
+        let frame_rect = Rect::new(0, 0, fw, fh);
+
+        match &snapshot.damage {
+            // Full damage: repaint the whole frame (first frame / fallback).
+            SnapshotDamage::Full => {
+                let nodes = self.paint_rect(snapshot, frame_rect);
+                CompositeStats {
+                    nodes_composited: nodes,
+                    pixels_redrawn: frame_rect.area(),
+                }
+            }
+            // Region damage: repaint only the damaged rects over the retained
+            // frame. Pixels outside every rect keep their previous values.
+            SnapshotDamage::Region(region) => {
+                let mut nodes = 0;
+                let mut pixels = 0;
+                for rect in region.rects() {
+                    let clip = rect.intersect(&frame_rect);
+                    if clip.is_empty() {
+                        continue;
+                    }
+                    pixels += clip.area();
+                    nodes += self.paint_rect(snapshot, clip);
+                }
+                CompositeStats {
+                    nodes_composited: nodes,
+                    pixels_redrawn: pixels,
+                }
             }
         }
+    }
+}
 
-        // Draw back-to-front (snapshot order). Each node is a solid rect clipped
-        // to the frame; overlap resolves by draw order (later = on top).
+impl CpuCompositor {
+    /// Repaint one clip rect (already intersected with the frame): clear it to the
+    /// background, then draw every node intersecting it, back-to-front, each
+    /// clipped to `clip`. Returns the number of nodes it drew. This is the unit of
+    /// damage rendering — a `Full` frame is just this over the whole frame rect.
+    fn paint_rect(&mut self, snapshot: &Snapshot, clip: Rect) -> usize {
+        let clear = self.clear;
+        clear_rect(&mut self.frame, clip, clear);
+
+        let mut nodes = 0;
         for node in &snapshot.nodes {
-            let (ox, oy) = match node.transform {
-                Transform::Identity => (0i32, 0i32),
-                Transform::Translate { dx, dy } => (dx, dy),
-            };
+            let (ox, oy) = node_offset(node.transform);
+            let node_rect = Rect::new(ox, oy, node.size.0 as i32, node.size.1 as i32);
+            // Skip nodes that don't touch this clip rect — they cost nothing.
+            if node_rect.intersect(&clip).is_empty() {
+                continue;
+            }
+            nodes += 1;
             match &node.source {
                 TextureSource::Solid(rgba) => {
-                    blit_solid(&mut self.frame, ox, oy, node.size, *rgba, node.opaque);
+                    blit_solid(&mut self.frame, ox, oy, node.size, *rgba, node.opaque, clip);
                 }
                 TextureSource::Shm(pixels) => {
-                    blit_pixels(&mut self.frame, ox, oy, pixels, node.opaque);
+                    blit_pixels(&mut self.frame, ox, oy, pixels, node.opaque, clip);
                 }
             }
         }
+        nodes
+    }
+}
 
-        snapshot.nodes.len()
+/// Fill `clip` (assumed already within the frame) with `color`.
+fn clear_rect(frame: &mut Frame, clip: Rect, color: [u8; 4]) {
+    for y in clip.y..clip.bottom() {
+        for x in clip.x..clip.right() {
+            frame.set_pixel(x as u32, y as u32, color);
+        }
     }
 }
 
 /// Blit a solid `rgba` rectangle whose top-left is at signed screen offset
-/// `(ox, oy)` and size `size = (w, h)`, clipped to the frame. Signed offsets and
-/// the clip mean a node may sit partly or wholly off-screen without panicking —
-/// the out-of-bounds case the acceptance criteria call out. Opaque rectangles
+/// `(ox, oy)` and size `size = (w, h)`, clipped to `clip` (which the caller has
+/// already intersected with the frame). Signed offsets and the clip mean a node
+/// may sit partly or wholly off-screen without panicking. Opaque rectangles
 /// overwrite; translucent ones blend via [`source_over`].
-fn blit_solid(frame: &mut Frame, ox: i32, oy: i32, size: (u32, u32), rgba: [u8; 4], opaque: bool) {
-    let (fw, fh) = (frame.width() as i32, frame.height() as i32);
-    // Intersect the node rect [ox, ox+w) × [oy, oy+h) with the frame [0,fw)×[0,fh).
-    let x0 = ox.max(0);
-    let y0 = oy.max(0);
-    let x1 = (ox + size.0 as i32).min(fw);
-    let y1 = (oy + size.1 as i32).min(fh);
-    // Empty intersection → fully clipped, nothing to draw.
-    if x1 <= x0 || y1 <= y0 {
+fn blit_solid(
+    frame: &mut Frame,
+    ox: i32,
+    oy: i32,
+    size: (u32, u32),
+    rgba: [u8; 4],
+    opaque: bool,
+    clip: Rect,
+) {
+    // Draw region = node rect ∩ clip (clip is already within the frame).
+    let draw = Rect::new(ox, oy, size.0 as i32, size.1 as i32).intersect(&clip);
+    if draw.is_empty() {
         return;
     }
-    for y in y0..y1 {
-        for x in x0..x1 {
+    for y in draw.y..draw.bottom() {
+        for x in draw.x..draw.right() {
             let (ux, uy) = (x as u32, y as u32);
             let out = if opaque {
                 rgba
@@ -126,20 +188,16 @@ fn blit_solid(frame: &mut Frame, ox: i32, oy: i32, size: (u32, u32), rgba: [u8; 
 /// (from the node — set by the copy path: `xrgb8888` → opaque, `argb8888` →
 /// blend) selects overwrite vs integer [`source_over`]. The renderer neither
 /// knows nor cares that these bytes came from `wl_shm`.
-fn blit_pixels(frame: &mut Frame, ox: i32, oy: i32, buf: &PixelBuffer, opaque: bool) {
-    let (fw, fh) = (frame.width() as i32, frame.height() as i32);
-    // Intersect the buffer rect [ox, ox+w) × [oy, oy+h) with the frame.
-    let x0 = ox.max(0);
-    let y0 = oy.max(0);
-    let x1 = (ox + buf.width as i32).min(fw);
-    let y1 = (oy + buf.height as i32).min(fh);
-    if x1 <= x0 || y1 <= y0 {
+fn blit_pixels(frame: &mut Frame, ox: i32, oy: i32, buf: &PixelBuffer, opaque: bool, clip: Rect) {
+    // Draw region = buffer rect ∩ clip (clip is already within the frame).
+    let draw = Rect::new(ox, oy, buf.width as i32, buf.height as i32).intersect(&clip);
+    if draw.is_empty() {
         return;
     }
-    for y in y0..y1 {
-        for x in x0..x1 {
-            // Source pixel in buffer-local coordinates (guaranteed in-bounds by
-            // the clip above, since bx < width and by < height).
+    for y in draw.y..draw.bottom() {
+        for x in draw.x..draw.right() {
+            // Source pixel in buffer-local coordinates (in-bounds because the draw
+            // region is within the buffer rect, so bx < width and by < height).
             let bx = (x - ox) as usize;
             let by = (y - oy) as usize;
             let i = (by * buf.width as usize + bx) * 4;
@@ -190,6 +248,16 @@ mod tests {
         }
     }
 
+    /// Wrap nodes in a full-damage snapshot — these unit tests all paint from a
+    /// blank frame, so full damage means "paint everything" (the from-scratch
+    /// path). Region-damage behaviour is exercised end-to-end in `harness`.
+    fn full(nodes: Vec<SnapshotNode>) -> Snapshot {
+        Snapshot {
+            nodes,
+            damage: SnapshotDamage::Full,
+        }
+    }
+
     const BLACK: [u8; 4] = [0, 0, 0, 255];
     const RED: [u8; 4] = [255, 0, 0, 255];
     const BLUE: [u8; 4] = [0, 0, 255, 255];
@@ -200,7 +268,7 @@ mod tests {
     fn empty_snapshot_clears_frame() {
         let mut c = CpuCompositor::new(4, 4, BLACK);
         let n = c.composite(&Snapshot::empty());
-        assert_eq!(n, 0);
+        assert_eq!(n.nodes_composited, 0);
         for y in 0..4 {
             for x in 0..4 {
                 assert_eq!(c.frame().pixel(x, y), BLACK, "pixel ({x},{y}) cleared");
@@ -212,11 +280,9 @@ mod tests {
     #[test]
     fn single_solid_node_fills_its_rect() {
         let mut c = CpuCompositor::new(10, 10, BLACK);
-        let snap = Snapshot {
-            nodes: vec![solid_node(Transform::Translate { dx: 2, dy: 3 }, (4, 5), RED, true)],
-        };
+        let snap = full(vec![solid_node(Transform::Translate { dx: 2, dy: 3 }, (4, 5), RED, true)]);
         let n = c.composite(&snap);
-        assert_eq!(n, 1);
+        assert_eq!(n.nodes_composited, 1);
         // Inside [2,6) × [3,8) is red.
         assert_eq!(c.frame().pixel(2, 3), RED);
         assert_eq!(c.frame().pixel(5, 7), RED);
@@ -231,15 +297,13 @@ mod tests {
     #[test]
     fn stacks_back_to_front_top_wins() {
         let mut c = CpuCompositor::new(10, 10, BLACK);
-        let snap = Snapshot {
-            nodes: vec![
+        let snap = full(vec![
                 // Drawn first (further back): red covering [0,6)×[0,6).
                 solid_node(Transform::Identity, (6, 6), RED, true),
                 // Drawn second (on top): blue covering [3,9)×[3,9).
                 solid_node(Transform::Translate { dx: 3, dy: 3 }, (6, 6), BLUE, true),
-            ],
-        };
-        assert_eq!(c.composite(&snap), 2);
+            ]);
+        assert_eq!(c.composite(&snap).nodes_composited, 2);
         assert_eq!(c.frame().pixel(1, 1), RED, "red-only region");
         assert_eq!(c.frame().pixel(8, 8), BLUE, "blue-only region");
         assert_eq!(c.frame().pixel(4, 4), BLUE, "overlap: top (blue) wins");
@@ -250,15 +314,15 @@ mod tests {
     #[test]
     fn clips_out_of_bounds_nodes() {
         let mut c = CpuCompositor::new(8, 8, BLACK);
-        let snap = Snapshot {
-            nodes: vec![
+        let snap = full(vec![
                 // Straddles the top-left corner: origin (-2,-2), size 5 → visible [0,3)×[0,3).
                 solid_node(Transform::Translate { dx: -2, dy: -2 }, (5, 5), RED, true),
                 // Entirely off-screen to the right: draws nothing.
                 solid_node(Transform::Translate { dx: 20, dy: 0 }, (4, 4), BLUE, true),
-            ],
-        };
-        assert_eq!(c.composite(&snap), 2, "both counted even though one is fully clipped");
+            ]);
+        // The off-screen node is skipped (it touches no damage), so only the
+        // on-screen node is composited — damage/clip culling in action.
+        assert_eq!(c.composite(&snap).nodes_composited, 1, "only the on-screen node is composited");
         assert_eq!(c.frame().pixel(0, 0), RED, "clipped node's visible part drew");
         assert_eq!(c.frame().pixel(2, 2), RED);
         assert_eq!(c.frame().pixel(3, 3), BLACK, "past the clipped node");
@@ -276,9 +340,7 @@ mod tests {
     fn translucent_node_blends_over_background() {
         let mut c = CpuCompositor::new(2, 2, BLACK);
         let half_white = [255, 255, 255, 128];
-        let snap = Snapshot {
-            nodes: vec![solid_node(Transform::Identity, (2, 2), half_white, false)],
-        };
+        let snap = full(vec![solid_node(Transform::Identity, (2, 2), half_white, false)]);
         c.composite(&snap);
         // out = (255*128 + 0*127 + 127)/255 = (32640 + 127)/255 = 32767/255 = 128.
         assert_eq!(c.frame().pixel(0, 0), [128, 128, 128, 255]);
@@ -316,10 +378,8 @@ mod tests {
                 255, 255, 255, 255, // (1,1) white
             ],
         };
-        let snap = Snapshot {
-            nodes: vec![pixels_node(Transform::Translate { dx: 1, dy: 1 }, buf, true)],
-        };
-        assert_eq!(c.composite(&snap), 1);
+        let snap = full(vec![pixels_node(Transform::Translate { dx: 1, dy: 1 }, buf, true)]);
+        assert_eq!(c.composite(&snap).nodes_composited, 1);
         assert_eq!(c.frame().pixel(1, 1), [255, 0, 0, 255], "TL red at (1,1)");
         assert_eq!(c.frame().pixel(2, 1), [0, 255, 0, 255], "TR green at (2,1)");
         assert_eq!(c.frame().pixel(1, 2), [0, 0, 255, 255], "BL blue at (1,2)");
@@ -339,9 +399,7 @@ mod tests {
             height: 1,
             rgba: vec![255, 255, 255, 128],
         };
-        let snap = Snapshot {
-            nodes: vec![pixels_node(Transform::Identity, buf, false)],
-        };
+        let snap = full(vec![pixels_node(Transform::Identity, buf, false)]);
         c.composite(&snap);
         assert_eq!(c.frame().pixel(0, 0), [128, 128, 128, 255]);
     }

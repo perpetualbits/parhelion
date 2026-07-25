@@ -294,6 +294,12 @@ impl ScriptedClient {
     pub fn attach_null(&self, surface: &WlSurface) {
         surface.attach(None, 0, 0);
     }
+
+    /// Post surface damage (`wl_surface.damage`, surface coordinates) — the region
+    /// the client says changed, applied at the next commit.
+    pub fn damage(&self, surface: &WlSurface, x: i32, y: i32, w: i32, h: i32) {
+        surface.damage(x, y, w, h);
+    }
 }
 
 /// The two `wl_shm` formats the protocol mandates (and Parhelion supports in T3).

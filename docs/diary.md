@@ -354,3 +354,52 @@ guards. This closes M0.
   — pixel asserts guard the goldens against blessing garbage. `make test`: 47
   tests green (+7), clippy clean; the shm golden re-demonstrated it can fail (a
   one-row marker change is rejected). `#harness` `#discovery`
+
+## M1 T4 — damage tracking (the compositor learns to do less)
+
+- **One property carries the whole task: incremental == from-scratch.** Everything
+  else — the region algebra, the retained frame, the partial copy — is plumbing
+  around "damage may change cost, never output." I wrote that as a single test
+  (`assert_equiv`) that, at every step of an awkward sequence, composites
+  incrementally into a retained frame AND from scratch into a blank one, and
+  demands byte-identity. It earned its keep immediately (below). `#core`
+
+- **The equivalence test caught two bugs — one mine-in-code, one mine-in-test.**
+  The test-bug was instructive: step 7 swapped a node's whole source but I passed
+  `ContentDamage::Rects(vec![])` — empty rects = *no* damage, so incremental left
+  the stale content. The fix taught the real invariant: the protocol NEVER sends
+  empty `Rects` (`build_pixel_block` sends `Full` when there's no usable client
+  damage), so `attach_content` can honour exactly what it's given. Under-reported
+  damage is the client's bug; the compositor is conservative only where it owns
+  the decision. `#core` `#discovery`
+
+- **Content-vs-structural is the split that matters.** A small commit must redraw
+  a small region; a move/restack must repaint where the node left and landed. So
+  `attach_content` checks whether the extent changed: same extent → honour the
+  client's damage rects (proportional); changed → old ∪ new extent (structural).
+  Setters (`set_z`, `set_geometry`, …) damage as they mutate. Getting this split
+  right is the whole difference between "damage tracking" and "always full". The
+  proportionality test proves it with counters: a 10×10 update on a 100×100
+  surface redraws ~100 px, not 10 000. `#core`
+
+- **Conservative + bounded + NO subtraction.** The region is a rect list that only
+  ever rounds outward; past 16 rects it collapses to its bounding box. I resisted
+  subtraction entirely — it's where region code grows teeth (rect-splitting,
+  fragment explosions) and nothing in M1 needs it. Over-approximation is always
+  safe (repaint a bit more); under-approximation is a bug class (stale pixels).
+  Kept our own `Rect`/`Region` rather than pulling a crate or Smithay's region
+  types, so the snapshot and backend stay Smithay-free. `#design-decision`
+
+- **Partial copy is really about isolation, not speed.** At commit I patch only
+  the damaged buffer region into the surface's block — but via `Arc::make_mut`,
+  which clones first *iff* the block is still shared (an in-flight snapshot holds
+  it). So the win I care about is that a snapshot's pixels are never mutated under
+  it (CoW), byte-checked by a dedicated test driving the real protocol path. The
+  byte-count saving (copy only the dirty rect from the mmap) is a bonus. Because
+  the scene always holds a ref, make_mut clones every commit — correct, and cheap
+  enough for M1; true in-place is a later optimization. `#core`
+
+- **Sabotage confirms the net has holes where it should.** Dropped `set_z`'s
+  damage call → the equivalence test failed precisely at the restack step, then
+  reverted. A green equivalence test that never fails proves nothing. `make test`:
+  56 tests green (+9), clippy clean. `#core` `#harness`

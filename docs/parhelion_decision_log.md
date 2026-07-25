@@ -235,6 +235,22 @@ below, reasoning now living in the dialect spec and VISION.md.)
 - **Decision:** At commit, on the dispatch thread, the attached `wl_shm` buffer is copied and decoded into an owned `PixelBuffer` (RGBA8, tightly packed), the `wl_buffer` released immediately, and the node's size + source set on the scene. `argb8888` → blend; `xrgb8888` → opaque (alpha forced 255). Format knowledge lives only in the copy path; the compositor blits a source-neutral `PixelBuffer` over the existing `opaque`/`source_over` machinery. `TextureSource`/`SnapshotNode`/`SceneNode` lose `Copy` (they may hold an `Arc`); snapshots share pixels by ref-count.
 - **Reasoning:** Correctness and client-compatibility first (immediate release runs single-buffer clients; an owned copy makes destroy-after-commit safe by construction). The copy is a memcpy on the dispatch thread, **not** the frame path (I-1). Zero-copy / damage-aware partial copy is T4. Decoding to neutral RGBA at the copy keeps the renderer source-agnostic — the seam sentence stays literally true.
 
+## 2026-07-25 — Damage tracking v1 (M1 T4)
+
+### Damage is conservative, bounded, and subtraction-free; coalesces to a bounding box past a threshold
+
+- **Source:** M1 T4 (prompt 07); `docs/scene_graph_v1.md` §9.
+- **Affects:** `crates/core/src/scene/region.rs` (`Rect`, `Region`, `MAX_DAMAGE_RECTS = 16`); the damage accumulation in `scene/state.rs`; invariant I-9 (this seeds the 2.5D damage-tracked regime).
+- **Decision:** The damage region is an owned rect list with over-approximating ops and **no subtraction**. Past `MAX_DAMAGE_RECTS` rects it collapses to its bounding box (over-approximate, O(1) to carry). This is a cost knob, not a correctness one — any value ≥ 1 is sound. We do not import a region crate or Smithay's desktop-layer region handling (keeps the snapshot/backend free of Smithay geometry types); `smithay::utils` geometry is only touched at the protocol boundary.
+- **Reasoning:** The governing property — incremental rendering byte-identical to from-scratch — survives only if damage covers every changed pixel. Over-approximation is always safe; under-approximation is a bug class. Subtraction is where region code grows teeth (rect-splitting, fragment explosions) and M1 needs none. A bounded region stops a many-small-rects client from making the bookkeeping itself unbounded.
+
+### Content-vs-structural damage split; retained-frame rendering; partial copy with copy-on-write
+
+- **Source:** M1 T4; `docs/scene_graph_v1.md` §9.3–§9.5.
+- **Affects:** `scene/state.rs` (`attach_content`, damage in setters, `snapshot(&mut)`), `scene/snapshot.rs` (`SnapshotDamage`), `backend-headless/src/composite.rs` (retained frame), `protocol.rs` (`build_pixel_block`); I-1 (snapshot stays an owned lock-free copy; the copy is off the frame path).
+- **Decision:** The scene accumulates output-space damage as it mutates and drains it at snapshot. A content commit damages only the client's rects when the extent is unchanged, but old ∪ new extent on a structural change (map/move/resize). The compositor retains its frame and recomputes only within damage. At commit, only the damaged buffer region is copied into the surface's pixel block, via `Arc::make_mut` (copy-on-write) so an in-flight snapshot's shared pixels are never mutated; full copy is the fallback (no prior block / dims changed / covers-all). `Snapshot::snapshot` becomes `&mut self` to drain damage. `TextureSource` etc. lost `Copy` in T3, so snapshots already share pixels by `Arc`.
+- **Reasoning:** Damage changes cost, never output. The split is what makes a small commit cheap while keeping structural changes correct. CoW extends snapshot isolation to the pixel level without ever copying more than needed. Counters (`pixels_redrawn`, `damage_rects`, `full_damage_frames`, `bytes_copied`) make the savings measurable and are asserted — an unasserted counter drifts into a lie.
+
 ## Pending
 
 - Lock-screen fail-locked design (`CORE-BOUNDARY.md` §6 note).

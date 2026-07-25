@@ -14,7 +14,36 @@
 use std::collections::HashMap;
 
 use crate::scene::node::{ClientKey, SceneNode, SurfaceId, TextureSource, Transform};
-use crate::scene::snapshot::{Snapshot, SnapshotNode};
+use crate::scene::region::{Rect, Region};
+use crate::scene::snapshot::{Snapshot, SnapshotDamage, SnapshotNode};
+
+/// The output-space rectangle a node covers, or an empty rect if it is not
+/// visible (no source or zero area — it contributes no pixels, hence no damage).
+/// Placement is `Transform` (identity/translate only in M1); the rect's origin is
+/// the node's output offset, which is also the surface→output translation used to
+/// map client damage.
+fn node_output_rect(node: &SceneNode) -> Rect {
+    if !node.is_visible() {
+        return Rect::new(0, 0, 0, 0);
+    }
+    let (ox, oy) = match node.transform {
+        Transform::Identity => (0, 0),
+        Transform::Translate { dx, dy } => (dx, dy),
+    };
+    Rect::new(ox, oy, node.size.0 as i32, node.size.1 as i32)
+}
+
+/// The damage a content commit carries, in **surface** coordinates (which equal
+/// buffer coordinates in M1 — no scale/transform yet). `Full` is the conservative
+/// case: a new buffer with no client damage, or a partial-copy fallback, so the
+/// whole surface extent is treated as changed.
+#[derive(Debug, Clone)]
+pub enum ContentDamage {
+    /// The whole surface extent may have changed.
+    Full,
+    /// Only these surface-local rects changed (translated to output at apply).
+    Rects(Vec<Rect>),
+}
 
 /// A surface-lifecycle event published by the protocol dispatch thread to the
 /// scene owner (`docs/CORE-BOUNDARY.md` §7: the edge is one-directional and
@@ -58,16 +87,63 @@ pub enum ProtocolEvent {
 /// cleanup paths overlapping (an explicit destroy and a client disconnect): a
 /// destroy for an already-absent surface is a no-op, exactly as the M0 ledger
 /// behaved.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Scene {
     /// Live surfaces by id.
     nodes: HashMap<SurfaceId, SceneNode>,
+    /// Output-space damage accumulated since the last snapshot — the union of
+    /// every change (content and structural). Drained into the snapshot. Kept
+    /// conservative (only ever grows within a frame; see [`crate::scene::region`]).
+    pending_damage: Region,
+    /// When set, the next snapshot reports [`SnapshotDamage::Full`] regardless of
+    /// `pending_damage` — the first frame and any "don't know" fallback.
+    full_damage: bool,
+}
+
+impl Default for Scene {
+    fn default() -> Self {
+        Scene {
+            nodes: HashMap::new(),
+            pending_damage: Region::new(),
+            // The first frame has no retained output to be incremental against, so
+            // it must repaint everything.
+            full_damage: true,
+        }
+    }
 }
 
 impl Scene {
-    /// A fresh, empty scene.
+    /// A fresh, empty scene (first snapshot damages the whole output).
     pub fn new() -> Self {
         Scene::default()
+    }
+
+    // ---- Damage bookkeeping -------------------------------------------------
+
+    /// Add an output-space rect to the pending frame damage (empty rects ignored).
+    fn damage_rect(&mut self, rect: Rect) {
+        self.pending_damage.add(rect);
+    }
+
+    /// Damage a node's current visible extent (no-op if absent/invisible).
+    fn damage_node(&mut self, surface: SurfaceId) {
+        if let Some(node) = self.nodes.get(&surface) {
+            self.pending_damage.add(node_output_rect(node));
+        }
+    }
+
+    /// This node's visible output rect right now (empty if absent/invisible).
+    fn extent_of(&self, surface: SurfaceId) -> Rect {
+        self.nodes
+            .get(&surface)
+            .map(node_output_rect)
+            .unwrap_or(Rect::new(0, 0, 0, 0))
+    }
+
+    /// Force the next snapshot to full-output damage — the conservative fallback
+    /// for any case the scene cannot bound (first frame sets this in `new`).
+    pub fn damage_full(&mut self) {
+        self.full_damage = true;
     }
 
     /// Fold one protocol lifecycle event into the scene.
@@ -84,55 +160,125 @@ impl Scene {
                 }
             }
             ProtocolEvent::SurfaceDestroyed { surface } => {
+                // Removing a visible surface damages the pixels it occupied.
+                self.damage_node(surface);
                 self.nodes.remove(&surface);
             }
             ProtocolEvent::ClientGone { client } => {
+                // Damage every removed node's extent before dropping them.
+                let gone: Vec<Rect> = self
+                    .nodes
+                    .values()
+                    .filter(|n| n.client == client)
+                    .map(node_output_rect)
+                    .collect();
+                for r in gone {
+                    self.damage_rect(r);
+                }
                 self.nodes.retain(|_, node| node.client != client);
             }
         }
     }
 
-    /// Set a node's placement and size. No-op if the surface is absent — the
-    /// callers are core/test code (not hostile input), and a setter racing a
-    /// destroy is harmless. In M1 this stands in for the geometry T3/T5 will
-    /// derive from buffers and xdg-shell.
+    /// Set a node's placement and size (structural change). Damages the union of
+    /// the old and new extents, so a move or resize repaints both where it left
+    /// and where it landed. No-op if the surface is absent.
     pub fn set_geometry(&mut self, surface: SurfaceId, transform: Transform, size: (u32, u32)) {
+        let old = self.extent_of(surface);
         if let Some(node) = self.nodes.get_mut(&surface) {
             node.transform = transform;
             node.size = size;
         }
+        let new = self.extent_of(surface);
+        self.damage_rect(old);
+        self.damage_rect(new);
     }
 
-    /// Bind a node's pixel source and set its opacity. No-op if absent.
+    /// Bind a node's pixel source and set its opacity. Damages the node's extent
+    /// (the whole content is (re)placed — this is the no-client-damage-info path;
+    /// the real client path is [`attach_content`](Self::attach_content), which
+    /// honours per-commit damage). No-op if absent.
     pub fn set_source(&mut self, surface: SurfaceId, source: TextureSource, opaque: bool) {
+        let old = self.extent_of(surface);
         if let Some(node) = self.nodes.get_mut(&surface) {
             node.source = Some(source);
             node.opaque = opaque;
         }
+        let new = self.extent_of(surface);
+        self.damage_rect(old);
+        self.damage_rect(new);
     }
 
-    /// Set a node's size without touching its placement. The T3 commit path uses
-    /// this: a `wl_shm` buffer defines the surface's pixel size, but its position
-    /// is a separate concern (test setters now, xdg-shell in T5). No-op if absent.
+    /// Set a node's size without touching its placement. Damages old ∪ new extent.
+    /// No-op if absent.
     pub fn set_size(&mut self, surface: SurfaceId, size: (u32, u32)) {
+        let old = self.extent_of(surface);
         if let Some(node) = self.nodes.get_mut(&surface) {
             node.size = size;
         }
+        let new = self.extent_of(surface);
+        self.damage_rect(old);
+        self.damage_rect(new);
     }
 
-    /// Clear a node's pixel source — it becomes invisible (contributes no
-    /// snapshot node). The T3 commit path uses this for a null attach
-    /// (`wl_surface.attach(null)` then commit), which unmaps the content per
-    /// protocol. No-op if absent.
+    /// Apply a content commit: set size, source, and opacity together, and damage
+    /// correctly — the structural-vs-content split (T4). If the extent changed
+    /// (map, or a move/resize) it damages old ∪ new extent; otherwise it is a pure
+    /// content update and it damages only the client's `damage` rects, translated
+    /// from surface to output coordinates and clipped to the extent. This is the
+    /// path that makes a small commit redraw a small region. No-op if absent.
+    pub fn attach_content(
+        &mut self,
+        surface: SurfaceId,
+        size: (u32, u32),
+        source: TextureSource,
+        opaque: bool,
+        damage: ContentDamage,
+    ) {
+        let old = self.extent_of(surface);
+        let node = match self.nodes.get_mut(&surface) {
+            Some(node) => node,
+            None => return,
+        };
+        node.size = size;
+        node.source = Some(source);
+        node.opaque = opaque;
+        let new = node_output_rect(node);
+
+        if old != new {
+            // Map / move / resize: the extent itself changed — repaint both.
+            self.damage_rect(old);
+            self.damage_rect(new);
+        } else {
+            // Pure content update at the same extent: honour client damage only.
+            match damage {
+                ContentDamage::Full => self.damage_rect(new),
+                ContentDamage::Rects(rects) => {
+                    // Surface origin == output origin of the extent (new.x, new.y).
+                    for r in rects {
+                        let out = r.translate(new.x, new.y).intersect(&new);
+                        self.damage_rect(out);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Clear a node's pixel source — it becomes invisible (contributes no snapshot
+    /// node). Damages its old extent (the unmapped pixels must be repainted).
+    /// The T3 commit path uses this for a null attach. No-op if absent.
     pub fn clear_source(&mut self, surface: SurfaceId) {
+        self.damage_node(surface); // extent while still visible
         if let Some(node) = self.nodes.get_mut(&surface) {
             node.source = None;
             node.opaque = false;
         }
     }
 
-    /// Set a node's stacking order (higher composites on top). No-op if absent.
+    /// Set a node's stacking order (higher composites on top). A restack changes
+    /// what is visible within the node's extent, so damage it. No-op if absent.
     pub fn set_z(&mut self, surface: SurfaceId, z: i32) {
+        self.damage_node(surface);
         if let Some(node) = self.nodes.get_mut(&surface) {
             node.z = z;
         }
@@ -167,7 +313,11 @@ impl Scene {
     /// across runs (goldens depend on it). Persistent structural sharing is
     /// `CORE-BOUNDARY.md` §10.3 and stays an open question (see
     /// [`crate::scene::snapshot`]).
-    pub fn snapshot(&self) -> Snapshot {
+    /// Takes `&mut self` because it **drains** the accumulated damage: the region
+    /// reported here is the change since the *previous* snapshot, so once handed
+    /// out it must be reset. (The first snapshot, and any `damage_full`, report
+    /// [`SnapshotDamage::Full`].)
+    pub fn snapshot(&mut self) -> Snapshot {
         // Collect (SurfaceId, node) for the visible nodes so ties can break by id.
         let mut visible: Vec<(SurfaceId, &SceneNode)> = self
             .nodes
@@ -188,7 +338,18 @@ impl Scene {
                 opaque: n.opaque,
             })
             .collect();
-        Snapshot { nodes }
+
+        // Drain damage: full for the first frame / fallback, else the accumulated
+        // region. Reset so the next snapshot reports only its own changes.
+        let damage = if self.full_damage {
+            SnapshotDamage::Full
+        } else {
+            SnapshotDamage::Region(std::mem::take(&mut self.pending_damage))
+        };
+        self.full_damage = false;
+        self.pending_damage = Region::new();
+
+        Snapshot { nodes, damage }
     }
 }
 

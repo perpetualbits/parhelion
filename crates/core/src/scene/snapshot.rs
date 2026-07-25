@@ -22,6 +22,7 @@
 //! §10.3 is reopened with evidence; until then a `Vec` copy is correct and clear.
 
 use crate::scene::node::{TextureSource, Transform};
+use crate::scene::region::Region;
 
 /// One visible node, flattened for compositing. Carries only what the compositor
 /// needs — placement, size, source, opacity — not the lifecycle bookkeeping
@@ -44,20 +45,53 @@ pub struct SnapshotNode {
     pub opaque: bool,
 }
 
-/// An immutable, owned, back-to-front-ordered list of the scene's visible nodes.
+/// What may have changed since the previous snapshot — the damage the renderer
+/// honours to avoid repainting unchanged pixels (T4).
+///
+/// Coordinates are output/frame space. `Region` may over-approximate (that is
+/// always legal); `Full` is the conservative fallback the scene raises for the
+/// first frame and any "don't know" case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotDamage {
+    /// The whole output may have changed — clear and repaint everything.
+    Full,
+    /// Only the pixels this region covers may have changed since the previous
+    /// snapshot; everything else in the retained frame is still valid.
+    Region(Region),
+}
+
+impl Default for SnapshotDamage {
+    /// Absent information, assume everything changed — the safe default (a bare
+    /// or first snapshot repaints in full).
+    fn default() -> Self {
+        SnapshotDamage::Full
+    }
+}
+
+/// An immutable, owned, back-to-front-ordered list of the scene's visible nodes,
+/// plus the damage since the previous snapshot.
 ///
 /// "Back-to-front" means `nodes[0]` is drawn first (furthest back) and the last
 /// element is drawn last (on top) — the painter's-algorithm order the CPU
 /// compositor iterates directly, so ordering lives here (built once) rather than
 /// in the hot compositing loop.
+///
+/// The `damage` is what makes incremental rendering possible: the renderer keeps
+/// its previous frame and recomputes only within `damage`. The load-bearing
+/// property is that `damage` is *conservative* — it covers every pixel that
+/// differs from the previous snapshot's composite — so "incremental equals
+/// from-scratch" holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Snapshot {
     /// Visible nodes, sorted back-to-front (ascending `z`, ties by `SurfaceId`).
     pub nodes: Vec<SnapshotNode>,
+    /// Pixels that may have changed since the previous snapshot.
+    pub damage: SnapshotDamage,
 }
 
 impl Snapshot {
-    /// An empty snapshot — no visible nodes. Compositing it clears the frame.
+    /// An empty snapshot — no visible nodes, full damage. Compositing it clears
+    /// the frame.
     pub fn empty() -> Self {
         Snapshot::default()
     }

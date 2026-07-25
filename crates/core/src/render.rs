@@ -20,7 +20,7 @@
 //! backend in M2.
 
 use crate::protocol::FramePresenter;
-use crate::scene::{SceneHandle, Snapshot};
+use crate::scene::{SceneHandle, Snapshot, SnapshotDamage};
 
 /// The seam between the core's render loop and a concrete pixel target.
 ///
@@ -39,9 +39,22 @@ use crate::scene::{SceneHandle, Snapshot};
 /// - Runs on the frame path (I-1): the implementation must not block, allocate
 ///   unboundedly, or call into a server synchronously (I-3).
 pub trait Compositor {
-    /// Paint `snapshot` into this compositor's target, replacing the previous
-    /// frame's contents. Returns the number of nodes composited.
-    fn composite(&mut self, snapshot: &Snapshot) -> usize;
+    /// Composite `snapshot` into this compositor's target. The implementor keeps
+    /// its previous frame and recomputes only within the snapshot's damage
+    /// ([`Snapshot::damage`]) — pixels outside damage keep their retained values.
+    /// Returns per-frame [`CompositeStats`] for the counters.
+    fn composite(&mut self, snapshot: &Snapshot) -> CompositeStats;
+}
+
+/// What one [`Compositor::composite`] did, folded into [`FrameCounters`] by the
+/// render loop. Kept minimal on purpose.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CompositeStats {
+    /// Nodes touched this frame (drawn at least partly).
+    pub nodes_composited: usize,
+    /// Pixels redrawn this frame — the sum of damage-rect areas actually painted
+    /// (an upper bound when damage rects overlap; damage never subtracts).
+    pub pixels_redrawn: usize,
 }
 
 /// Per-frame instrumentation — the *mechanism* T4 (damage tracking) extends with
@@ -57,6 +70,14 @@ pub struct FrameCounters {
     pub frames_produced: u64,
     /// Total nodes composited across all frames produced.
     pub nodes_composited: u64,
+    /// Total pixels redrawn across all frames — the damage-tracking savings are
+    /// visible as this growing far slower than `frames_produced * output_area`.
+    pub pixels_redrawn: u64,
+    /// Total damage rects processed across all `Region`-damage frames.
+    pub damage_rects: u64,
+    /// Frames that fell back to full-output damage (first frame + "don't know"
+    /// cases). Counted so the conservative fallback's frequency stays visible.
+    pub full_damage_frames: u64,
 }
 
 /// The T-render skeleton: pull a [`Snapshot`] from the scene, hand it to the
@@ -121,9 +142,18 @@ impl<C: Compositor> RenderLoop<C> {
     /// there is no timer.
     pub fn tick(&mut self, time_ms: u32) {
         let snapshot = self.scene.snapshot();
-        let composited = self.compositor.composite(&snapshot);
+        let stats = self.compositor.composite(&snapshot);
         self.counters.frames_produced += 1;
-        self.counters.nodes_composited += composited as u64;
+        self.counters.nodes_composited += stats.nodes_composited as u64;
+        self.counters.pixels_redrawn += stats.pixels_redrawn as u64;
+        // Damage accounting: a full-damage frame is the conservative fallback;
+        // otherwise count the rects the region carried.
+        match &snapshot.damage {
+            SnapshotDamage::Full => self.counters.full_damage_frames += 1,
+            SnapshotDamage::Region(region) => {
+                self.counters.damage_rects += region.len() as u64;
+            }
+        }
 
         // Reverse edge (T-render → T-proto). Non-blocking enqueue only (I-1); the
         // dispatch thread owns the actual `wl_callback.done` sends and the flush.
@@ -157,9 +187,12 @@ mod tests {
     }
 
     impl Compositor for CountingCompositor {
-        fn composite(&mut self, snapshot: &Snapshot) -> usize {
+        fn composite(&mut self, snapshot: &Snapshot) -> CompositeStats {
             self.last_nodes = snapshot.len();
-            snapshot.len()
+            CompositeStats {
+                nodes_composited: snapshot.len(),
+                pixels_redrawn: 0,
+            }
         }
     }
 

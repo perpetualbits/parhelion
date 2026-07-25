@@ -95,11 +95,14 @@ use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resourc
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     with_states, BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
-    SurfaceAttributes,
+    Damage, SurfaceAttributes,
 };
 use smithay::wayland::shm::{with_buffer_contents, BufferAccessError, ShmHandler, ShmState};
 
-use crate::scene::{ClientKey, PixelBuffer, ProtocolEvent, SceneHandle, SurfaceId, TextureSource};
+use crate::scene::{
+    ClientKey, ContentDamage, PixelBuffer, ProtocolEvent, Rect, SceneHandle, SurfaceId,
+    TextureSource,
+};
 
 /// Per-client cap on **pending** (committed but not-yet-fired) `wl_surface.frame`
 /// callbacks — the M1 backpressure bound and invariant **I-10**'s fairness rider
@@ -270,6 +273,12 @@ struct State {
     /// The `WlSurface` never leaves this thread (it is not `Send`), which is the
     /// whole point: protocol objects stay on the dispatch thread (§7).
     surfaces: HashMap<ObjectId, WlSurface>,
+    /// The pixel block currently shown for each surface, retained here so a
+    /// content commit can **partial-copy** (patch only the damaged region) instead
+    /// of re-copying the whole buffer (T4). Shared by `Arc` with the scene, so
+    /// patching goes through `Arc::make_mut` (copy-on-write: an in-flight
+    /// snapshot's pixels are never mutated).
+    surface_pixels: HashMap<ObjectId, Arc<PixelBuffer>>,
     /// The publish edge to the scene owner.
     scene: SceneHandle,
     /// Latest presentation timestamp from the render side (shared with the
@@ -279,6 +288,10 @@ struct State {
     /// for observability (`ProtocolHost::pending_frame_callbacks`, used by the
     /// backpressure rig test). Not load-bearing for dispatch.
     pending_frame_callbacks: Arc<AtomicUsize>,
+    /// Running total of buffer bytes copied at commit — the damage-tracking
+    /// counter that shows partial copies copy less than the whole buffer
+    /// (`ProtocolHost::bytes_copied`). Not load-bearing for dispatch.
+    bytes_copied: Arc<AtomicUsize>,
     /// Set by a `Shutdown` control message to end the loop.
     stop: bool,
 }
@@ -337,61 +350,69 @@ impl CompositorHandler for State {
     /// A surface committed: publish `SurfaceCommitted`, and apply the
     /// double-buffered buffer state (attach) if this commit carried one.
     ///
-    /// Copy-at-commit (T3): the buffer's pixels are copied here, on the dispatch
-    /// thread where the Wayland objects live (§7), into an owned scene-side
-    /// [`PixelBuffer`]; the `wl_buffer` is **released immediately** after the copy
-    /// so single-buffer clients can reuse it. This is a memcpy on the dispatch
-    /// thread — *not* the frame path (I-1), and correctness/compatibility first:
-    /// zero-copy and damage-aware partial copies are later optimizations (T4).
+    /// Copy-at-commit (T3), damage-aware (T4): the buffer's pixels are copied here,
+    /// on the dispatch thread where the Wayland objects live (§7), into an owned
+    /// scene-side [`PixelBuffer`]; the `wl_buffer` is **released immediately** after
+    /// so single-buffer clients can reuse it. With a prior block and client damage,
+    /// only the damaged region is copied (partial copy, copy-on-write via
+    /// [`build_pixel_block`]). The copy is a memcpy on the dispatch thread — *not*
+    /// the frame path (I-1).
     fn commit(&mut self, surface: &WlSurface) {
         let Some(&sid) = self.obj_to_surface.get(&surface.id()) else {
             return;
         };
         self.scene.emit(ProtocolEvent::SurfaceCommitted { surface: sid });
 
-        // Take the just-committed buffer assignment out of the surface's *current*
-        // state so it is processed once and we own the release (Smithay would
-        // otherwise release the previous buffer only on the next attach — too late
-        // for single-buffer clients).
-        let assignment = with_states(surface, |states| {
-            states
-                .cached_state
-                .get::<SurfaceAttributes>()
-                .current()
-                .buffer
-                .take()
+        // Take the just-committed buffer assignment *and* the accumulated damage
+        // out of the surface's *current* state, so each is processed once. We own
+        // the buffer release (Smithay would otherwise release the previous buffer
+        // only on the next attach — too late for single-buffer clients).
+        let obj = surface.id();
+        let (assignment, raw_damage) = with_states(surface, |states| {
+            let mut guard = states.cached_state.get::<SurfaceAttributes>();
+            let current = guard.current();
+            (
+                current.buffer.take(),
+                std::mem::take(&mut current.damage),
+            )
         });
 
         match assignment {
             Some(BufferAssignment::NewBuffer(buffer)) => {
-                // Copy + decode while the bytes live; then release immediately.
-                match copy_shm_to_pixels(&buffer) {
-                    Ok(Some((pixels, opaque))) => {
-                        let size = (pixels.width, pixels.height);
-                        let source = TextureSource::Shm(Arc::new(pixels));
-                        // Buffer defines pixel size; placement is a separate concern
-                        // (test setters now, xdg-shell in T5), so we set size, not
-                        // transform. Only owned `Send` data crosses to the scene.
+                // Buffer==surface coordinates in M1 (no scale/transform yet); this
+                // is the marked site where the two are merged (M2+ generalizes it).
+                let damage_rects = damage_to_rects(&raw_damage);
+                let prev = self.surface_pixels.get(&obj).cloned();
+                match build_pixel_block(&buffer, prev, &damage_rects) {
+                    Ok(Some((block, opaque, content_damage, bytes))) => {
+                        self.bytes_copied.fetch_add(bytes, Ordering::Relaxed);
+                        self.surface_pixels.insert(obj, block.clone());
+                        let size = (block.width, block.height);
+                        let source = TextureSource::Shm(block);
+                        // Buffer defines pixel size; placement is separate (test
+                        // setters now, xdg-shell in T5). Only owned `Send` data
+                        // crosses to the scene, which computes the frame damage.
                         self.scene.mutate(move |s| {
-                            s.set_size(sid, size);
-                            s.set_source(sid, source, opaque);
+                            s.attach_content(sid, size, source, opaque, content_damage);
                         });
                     }
                     // Non-shm buffer or zero-size: nothing to show (no dmabuf in M1).
                     Ok(None) => {}
-                    // Access error: Smithay has already posted the protocol error /
+                    // Access error: Smithay already posted the protocol error /
                     // killed the client; nothing more to do.
                     Err(_) => {}
                 }
                 buffer.release();
             }
             // Null attach (`wl_surface.attach(null)`): unmap — the node loses its
-            // source and becomes invisible.
+            // source and becomes invisible; drop the retained block.
             Some(BufferAssignment::Removed) => {
+                self.surface_pixels.remove(&obj);
                 self.scene.mutate(move |s| s.clear_source(sid));
             }
-            // No buffer change this commit: the node keeps its current pixels
-            // (which we already copied into the scene, independent of the wl_buffer).
+            // No buffer change this commit: the node keeps its current pixels.
+            // Damage without a new buffer is a no-op — the content did not change,
+            // so there is nothing to repaint.
             None => {}
         }
     }
@@ -399,6 +420,7 @@ impl CompositorHandler for State {
     /// A surface was destroyed: drop the mappings and publish `SurfaceDestroyed`.
     fn destroyed(&mut self, surface: &WlSurface) {
         self.surfaces.remove(&surface.id());
+        self.surface_pixels.remove(&surface.id());
         if let Some(sid) = self.obj_to_surface.remove(&surface.id()) {
             self.scene.emit(ProtocolEvent::SurfaceDestroyed { surface: sid });
         }
@@ -428,29 +450,54 @@ impl BufferHandler for State {
 // entire seam: `smithay::wayland::shm`; Smithay's renderer layer is untouched.
 smithay::delegate_shm!(State);
 
-/// Copy an attached `wl_shm` buffer's pixels into an owned, decoded
-/// [`PixelBuffer`], returning it plus whether it is opaque (the format→blend
-/// mapping). Runs on the dispatch thread inside `commit`.
+/// Convert Smithay's accumulated surface damage into our surface-coordinate
+/// rects. **The marked buffer==surface site (constraint 2):** with no buffer
+/// scale or transform in M1, `Damage::Surface` and `Damage::Buffer` rectangles
+/// are the same coordinate space, so both map to a plain [`Rect`]; when scale /
+/// transform arrive (M2+), the `Buffer` arm is where the conversion goes.
+fn damage_to_rects(damage: &[Damage]) -> Vec<Rect> {
+    damage
+        .iter()
+        .map(|d| match d {
+            Damage::Surface(r) => Rect::new(r.loc.x, r.loc.y, r.size.w, r.size.h),
+            Damage::Buffer(r) => Rect::new(r.loc.x, r.loc.y, r.size.w, r.size.h),
+        })
+        .collect()
+}
+
+/// What [`build_pixel_block`] returns on success: the new (possibly CoW-cloned)
+/// pixel block, whether it is opaque, the damage to hand the scene, and the bytes
+/// copied from the buffer.
+type BuiltBlock = (Arc<PixelBuffer>, bool, ContentDamage, usize);
+
+/// Build the surface's new pixel block from an attached `wl_shm` buffer, copying
+/// only what is needed. Runs on the dispatch thread inside `commit`.
 ///
-/// Format handling lives *only* here (the seam): `argb8888` → straight RGBA,
-/// not opaque (blend); `xrgb8888` → RGBA with alpha forced to 255, opaque
-/// (overwrite). `wl_shm` bytes are little-endian `0xAARRGGBB` / `0xXXRRGGBB`, so
-/// in memory each pixel is `[B, G, R, A/X]`; we reorder to the `Frame`/scene
-/// `[R, G, B, A]` and strip the buffer's stride to a tight row.
+/// **Partial copy + copy-on-write (T4).** When there is a `prev` block of the
+/// same dimensions and the client posted real, sub-surface damage, only the
+/// damaged rects are copied — `Arc::make_mut` clones the block first *iff* it is
+/// still shared (an in-flight snapshot holds it), so shared pixels are never
+/// mutated. Otherwise (no prior block, dimensions changed, no/covers-all damage)
+/// it full-copies. Returns the block, whether it is opaque, the resulting
+/// [`ContentDamage`] for the scene, and the bytes copied from the buffer.
+///
+/// Format handling lives *only* here (the seam): `argb8888` → straight RGBA, not
+/// opaque (blend); `xrgb8888` → RGBA, alpha forced 255, opaque (overwrite).
+/// `wl_shm` bytes are little-endian, so each pixel is `[B, G, R, A/X]` in memory;
+/// we reorder to `[R, G, B, A]` and strip the stride.
 ///
 /// Returns `Ok(None)` for a non-shm buffer, an unsupported format, a zero-size
-/// buffer, or geometry that does not fit the pool (a hostile-input guard — this
-/// is a trust boundary, so we reject rather than index out of bounds). Smithay
-/// has already validated buffer geometry against the pool at `create_buffer`
-/// time; the guard is defence in depth.
+/// buffer, or geometry that does not fit the pool (a hostile-input guard — a
+/// trust boundary, so reject rather than index out of bounds).
 ///
-/// `unsafe` is confined to the one documented pool read; the workspace lints
-/// warn on `unsafe_code`, and this use is allowed with the SAFETY justification
-/// at the block (same pattern as `pump_display`).
+/// `unsafe` is confined to the one documented pool read; allowed with the SAFETY
+/// justification at the block (same pattern as `pump_display`).
 #[allow(unsafe_code)]
-fn copy_shm_to_pixels(
+fn build_pixel_block(
     buffer: &WlBuffer,
-) -> Result<Option<(PixelBuffer, bool)>, BufferAccessError> {
+    prev: Option<Arc<PixelBuffer>>,
+    damage_rects: &[Rect],
+) -> Result<Option<BuiltBlock>, BufferAccessError> {
     with_buffer_contents(buffer, |ptr, len, data| {
         let (width, height) = (data.width.max(0) as usize, data.height.max(0) as usize);
         let stride = data.stride.max(0) as usize;
@@ -475,24 +522,58 @@ fn copy_shm_to_pixels(
         // slice does not outlive the callback. A client concurrently mutating its
         // own shm can only produce torn pixels, never a memory-safety fault.
         let pool = unsafe { std::slice::from_raw_parts(ptr, len) };
-        let mut rgba = Vec::with_capacity(width * height * 4);
-        for y in 0..height {
-            let row = offset + y * stride;
-            for x in 0..width {
-                let p = row + x * 4;
-                let (b, g, r) = (pool[p], pool[p + 1], pool[p + 2]);
-                let a = if has_alpha { pool[p + 3] } else { 255 };
-                rgba.extend_from_slice(&[r, g, b, a]);
+        let read_px = |x: usize, y: usize| -> [u8; 4] {
+            let p = offset + y * stride + x * 4;
+            let (b, g, r) = (pool[p], pool[p + 1], pool[p + 2]);
+            let a = if has_alpha { pool[p + 3] } else { 255 };
+            [r, g, b, a]
+        };
+
+        // Clip client damage to the buffer; drop empties.
+        let buf_rect = Rect::new(0, 0, width as i32, height as i32);
+        let clipped: Vec<Rect> = damage_rects
+            .iter()
+            .map(|r| r.intersect(&buf_rect))
+            .filter(|r| !r.is_empty())
+            .collect();
+        let dims_match =
+            prev.as_ref().is_some_and(|p| p.width as usize == width && p.height as usize == height);
+        let covers_all = clipped
+            .iter()
+            .any(|r| r.x == 0 && r.y == 0 && r.w as usize == width && r.h as usize == height);
+
+        if dims_match && !clipped.is_empty() && !covers_all {
+            // Partial copy-on-write: clone the prior block only if shared, then
+            // patch just the damaged rects.
+            let mut arc = prev.expect("dims_match implies Some");
+            let block = Arc::make_mut(&mut arc);
+            let mut bytes = 0usize;
+            for r in &clipped {
+                for y in r.y as usize..r.bottom() as usize {
+                    let drow = y * width * 4;
+                    for x in r.x as usize..r.right() as usize {
+                        let d = drow + x * 4;
+                        block.rgba[d..d + 4].copy_from_slice(&read_px(x, y));
+                    }
+                }
+                bytes += r.area() * 4;
             }
-        }
-        Some((
-            PixelBuffer {
+            Some((arc, opaque, ContentDamage::Rects(clipped), bytes))
+        } else {
+            // Full copy (map, resize, or no usable client damage).
+            let mut rgba = Vec::with_capacity(width * height * 4);
+            for y in 0..height {
+                for x in 0..width {
+                    rgba.extend_from_slice(&read_px(x, y));
+                }
+            }
+            let block = Arc::new(PixelBuffer {
                 width: width as u32,
                 height: height as u32,
                 rgba,
-            },
-            opaque,
-        ))
+            });
+            Some((block, opaque, ContentDamage::Full, width * height * 4))
+        }
     })
 }
 
@@ -519,6 +600,9 @@ pub struct ProtocolHost {
     ///
     /// [`pending_frame_callbacks`]: ProtocolHost::pending_frame_callbacks
     pending_frame_callbacks: Arc<AtomicUsize>,
+    /// Running total of buffer bytes copied at commit (damage counter). Read by
+    /// [`bytes_copied`](ProtocolHost::bytes_copied).
+    bytes_copied: Arc<AtomicUsize>,
 }
 
 impl ProtocolHost {
@@ -536,17 +620,26 @@ impl ProtocolHost {
         let (ping, ping_source) = make_ping().expect("create frame-present ping");
         let present_ts = Arc::new(AtomicU32::new(0));
         let pending = Arc::new(AtomicUsize::new(0));
+        let bytes = Arc::new(AtomicUsize::new(0));
 
         let presenter = FramePresenter {
             ping,
             ts: present_ts.clone(),
         };
         let pending_for_thread = pending.clone();
+        let bytes_for_thread = bytes.clone();
 
         let dispatch = std::thread::Builder::new()
             .name("parhelion-proto-0".into())
             .spawn(move || {
-                run_dispatch(control_rx, scene, ping_source, present_ts, pending_for_thread)
+                run_dispatch(
+                    control_rx,
+                    scene,
+                    ping_source,
+                    present_ts,
+                    pending_for_thread,
+                    bytes_for_thread,
+                )
             })
             .expect("spawn dispatch thread");
 
@@ -555,6 +648,7 @@ impl ProtocolHost {
             dispatch: Some(dispatch),
             presenter,
             pending_frame_callbacks: pending,
+            bytes_copied: bytes,
         }
     }
 
@@ -578,6 +672,13 @@ impl ProtocolHost {
     /// bound this stays under (per client) is [`MAX_PENDING_FRAME_CALLBACKS`].
     pub fn pending_frame_callbacks(&self) -> usize {
         self.pending_frame_callbacks.load(Ordering::Relaxed)
+    }
+
+    /// Total buffer bytes copied at commit so far — the damage-tracking counter.
+    /// A small-damage commit on a large surface copies far fewer than the whole
+    /// buffer (partial copy); the proportionality test asserts on the delta.
+    pub fn bytes_copied(&self) -> usize {
+        self.bytes_copied.load(Ordering::Relaxed)
     }
 }
 
@@ -642,8 +743,12 @@ fn pump_display(
     let display = unsafe { display.get_mut() };
 
     // Drop object handles for surfaces whose client is gone, so the backlog and
-    // callback bookkeeping never touches a dead resource.
+    // callback bookkeeping never touches a dead resource; drop their retained
+    // pixel blocks too (a client that disconnects without destroying surfaces).
     state.surfaces.retain(|_, s| s.is_alive());
+    state
+        .surface_pixels
+        .retain(|obj, _| state.surfaces.contains_key(obj));
 
     // Per-client pending-callback backlog, computed once for the throttle
     // decision below (and republished for observability).
@@ -735,6 +840,7 @@ fn run_dispatch(
     ping_source: PingSource,
     present_ts: Arc<AtomicU32>,
     pending_frame_callbacks: Arc<AtomicUsize>,
+    bytes_copied: Arc<AtomicUsize>,
 ) {
     let display: Display<State> = Display::new().expect("create wayland display");
     let dh = display.handle();
@@ -751,9 +857,11 @@ fn run_dispatch(
         next_client_key: 0,
         obj_to_surface: HashMap::new(),
         surfaces: HashMap::new(),
+        surface_pixels: HashMap::new(),
         scene: scene.clone(),
         present_ts,
         pending_frame_callbacks,
+        bytes_copied,
         stop: false,
     };
 

@@ -39,11 +39,13 @@
 //! proto→scene edge is one-directional and async (I-3).
 
 pub mod node;
+pub mod region;
 pub mod snapshot;
 pub mod state;
 pub mod thread;
 
 pub use node::{ClientKey, PixelBuffer, SceneNode, SurfaceId, TextureSource, Transform};
-pub use snapshot::{Snapshot, SnapshotNode};
-pub use state::{ProtocolEvent, Scene};
+pub use region::{Rect, Region, MAX_DAMAGE_RECTS};
+pub use snapshot::{Snapshot, SnapshotDamage, SnapshotNode};
+pub use state::{ContentDamage, ProtocolEvent, Scene};
 pub use thread::{SceneHandle, SceneThread};

@@ -790,3 +790,31 @@ guards. This closes M0.
   independent clients sharing a seat, none of which a single-client test can
   reach. Everything the compositor does for foot it now demonstrably does for
   software it has never met. `#milestone` `#discovery`
+
+## The decorations were there all along (2026-07-26)
+
+- **"Decorations don't appear on the first foot, but do on the second."** That
+  sentence contains the whole diagnosis, and I did not see it until I measured.
+  foot puts its title bar at `(0, -26)` and its borders at `(-5, …)` — *outside*
+  its own surface — and says so plainly:
+  `set_window_geometry(0, -26, 696, 494)`. We placed the raw surface at the
+  cascade origin `(0,0)`, so the first window's decorations landed above the top
+  edge of the output. Every later window gets a slot at (32,32), (64,64)… which
+  has room. Nothing was missing; it was off-screen. `#bug` `#discovery`
+
+- **The fix is to place what the client declared.** Subtract the geometry origin,
+  and the *declared window* lands at the cascade slot while the overhang falls
+  outside it — which is what every real compositor does with `set_window_geometry`
+  and why the request exists. Two lines, once the measurement was in hand.
+
+- **No test of ours could have caught it.** Every rig client draws at its own
+  origin and declares no window geometry, so the suite had no client shaped like a
+  decorated app. That is worth remembering as a class: our tests describe clients
+  *we* write, and the interesting failures come from clients we don't. foot was
+  already the answer to that for protocol behaviour; this was the same lesson for
+  geometry. There is a test now, verified to fail against the old placement.
+  `#harness` `#tradeoff`
+
+- **And it took a human looking at a screen.** The compositor was correct by every
+  assertion we had, the acceptance test was green, the decorations were composited
+  exactly as instructed — into pixels nobody could see. `#milestone`

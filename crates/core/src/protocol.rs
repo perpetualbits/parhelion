@@ -140,8 +140,8 @@ use smithay::wayland::selection::data_device::{
 };
 use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTarget};
 use smithay::wayland::shell::xdg::{
-    PopupSurface, PositionerState, ShellClient, ToplevelSurface, XdgShellHandler, XdgShellState,
-    XdgToplevelSurfaceData,
+    PopupSurface, PositionerState, ShellClient, SurfaceCachedState as XdgSurfaceCachedState,
+    ToplevelSurface, XdgShellHandler, XdgShellState, XdgToplevelSurfaceData,
 };
 use smithay::wayland::shm::{with_buffer_contents, BufferAccessError, ShmHandler, ShmState};
 
@@ -718,13 +718,48 @@ impl State {
                         // placement; later commits must not touch geometry, or
                         // every frame would damage the whole extent. Subsurfaces
                         // are placed by their parent-relative position instead.
-                        if let Some(entry) = self.toplevels.get_mut(&obj)
-                            && !entry.mapped
+                        if let Some(entry) = self.toplevels.get(&obj).map(|e| e.placement)
+                            && self.toplevels.get(&obj).is_some_and(|e| !e.mapped)
                         {
-                            entry.mapped = true;
+                            // **Place the declared window, not the raw surface.**
+                            //
+                            // `xdg_surface.set_window_geometry` is how a client
+                            // with client-side decorations says "my actual window
+                            // is this rectangle; everything outside it is title
+                            // bar, border and shadow". foot declares
+                            // `(0, -26, 696, 494)` — its title bar lives 26 px
+                            // *above* its surface origin, in subsurfaces.
+                            //
+                            // Placing the surface origin at the cascade slot
+                            // therefore put foot's decorations off the top of the
+                            // output, and only for the first window: every later
+                            // cascade slot has room above it. Roland found it by
+                            // looking, which no test of ours would have — every
+                            // rig client places content at its own origin and
+                            // declares no geometry.
+                            //
+                            // Offsetting by the geometry's origin lands the
+                            // *declared* window where the policy wants it, and the
+                            // decoration overhang falls outside, which is what
+                            // every real compositor does with it.
+                            let geometry_origin = with_states(surface, |states| {
+                                states
+                                    .cached_state
+                                    .get::<XdgSurfaceCachedState>()
+                                    .current()
+                                    .geometry
+                                    .map(|r| (r.loc.x, r.loc.y))
+                                    .unwrap_or((0, 0))
+                            });
+                            if let Some(e) = self.toplevels.get_mut(&obj) {
+                                e.mapped = true;
+                            }
                             updates.push(SurfaceUpdate::Geometry {
                                 surface: sid,
-                                offset: entry.placement,
+                                offset: (
+                                    entry.0 - geometry_origin.0,
+                                    entry.1 - geometry_origin.1,
+                                ),
                                 size,
                             });
                         }

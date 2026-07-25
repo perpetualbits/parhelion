@@ -490,6 +490,23 @@ The origin being (0, 0) is also why the T3 shm goldens survived this migration
 byte-for-byte: the first toplevel lands exactly where the old raw-commit path put
 its content.
 
+**What is placed is the *declared window*, not the surface (M2 T7 follow-up).**
+`xdg_surface.set_window_geometry` is how a client with client-side decorations
+says "my real window is this rectangle; what lies outside it is title bar, border
+and shadow". foot declares `(0, -26, 696, 494)`: its title bar sits 26 px *above*
+its surface origin, in subsurfaces. Placing the raw surface at the cascade slot
+therefore pushed the first window's decorations off the top of the output — and
+only the first, because every later slot has room above it. The placement now
+subtracts the geometry's origin, so the declared rectangle lands where the policy
+intends and the decoration overhang falls outside it, which is what every real
+compositor does with it.
+
+Found by Roland looking at the screen, not by a test: every rig client draws at
+its own origin and declares no geometry, so nothing in the suite had the shape
+that fails. There is a test now
+(`a_window_is_placed_by_its_declared_geometry_not_its_surface_origin`), verified
+to fail against the old placement.
+
 ### 10.5 What T5 explicitly did **not** change
 
 - **Frame-callback semantics (§8.3) are untouched.** Every tick still fires all

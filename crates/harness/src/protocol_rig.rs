@@ -1099,6 +1099,23 @@ impl ScriptedClient {
         xdg_surface.get_popup(Some(parent), positioner, &qh, ())
     }
 
+    /// Declare a toplevel's **window geometry** (`xdg_surface.set_window_geometry`).
+    ///
+    /// The rectangle says which part of the surface is the actual window; anything
+    /// outside it is decoration overhang — title bar, borders, shadow — which for
+    /// a client-side-decorated app lives at *negative* coordinates. The compositor
+    /// places this rectangle, not the raw surface.
+    pub fn set_window_geometry(
+        &self,
+        xdg_surface: &XdgSurface,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) {
+        xdg_surface.set_window_geometry(x, y, width, height);
+    }
+
     /// Acknowledge a configure serial (`xdg_surface.ack_configure`). A serial the
     /// compositor never sent is a protocol error — deliberately reachable, since
     /// that is one of the cases under test.

@@ -14,7 +14,7 @@
 use std::os::unix::net::UnixStream;
 
 use parhelion_core::protocol::{ProtocolHost, DEFAULT_OUTPUT_SIZE};
-use parhelion_core::scene::{SceneThread, Transform};
+use parhelion_core::scene::{SceneThread, SurfaceId, Transform};
 use parhelion_harness::protocol_rig::{ScriptedClient, ShmFormat};
 
 fn fixture() -> (SceneThread, ProtocolHost, ScriptedClient) {
@@ -302,6 +302,48 @@ fn a_subsurface_without_content_never_composites() {
         snapshot.len(),
         1,
         "only the window composites; the empty subsurface contributes nothing"
+    );
+}
+
+/// **A client-side-decorated window is placed by its declared geometry, not by
+/// its surface origin.**
+///
+/// `xdg_surface.set_window_geometry` is how a CSD client says "my real window is
+/// this rectangle; what lies outside it is title bar, border and shadow". foot
+/// declares `(0, -26, 696, 494)` — its title bar sits 26 px *above* its surface
+/// origin, in subsurfaces.
+///
+/// Placing the raw surface at the cascade origin therefore put the first window's
+/// decorations off the top of the output, and only the first: every later cascade
+/// slot has room above it. Roland found that by looking at the screen, which no
+/// test of ours could have — every rig client draws at its own origin and declares
+/// no geometry. This is that test, written after the fact and kept so the next
+/// regression is caught by CI instead of by eye.
+#[test]
+fn a_window_is_placed_by_its_declared_geometry_not_its_surface_origin() {
+    let (scene, _host, mut client) = fixture();
+
+    // A window whose declared geometry begins 6 px above and 4 px left of its
+    // surface origin — the shape of a client with decorations around it.
+    let surface = client.create_surface();
+    let xdg_surface = client.create_xdg_surface(&surface);
+    let _toplevel = client.get_toplevel(&xdg_surface);
+    client.commit(&surface);
+    let serial = client.wait_for_configure();
+    client.ack_configure(&xdg_surface, serial);
+    client.set_window_geometry(&xdg_surface, -4, -6, 20, 20);
+    client.draw(&surface, 20, 20, &vec![255u8; 20 * 20 * 4]);
+    client.roundtrip();
+
+    let placement = scene
+        .handle()
+        .query(|s| s.get(SurfaceId(0)).map(|n| n.transform));
+    assert_eq!(
+        placement,
+        Some(Transform::Translate { dx: 4, dy: 6 }),
+        "the surface is offset by the geometry's origin, so the *declared window* \
+         lands at the cascade slot (0,0) — leaving the decoration overhang above \
+         and left of it, on screen"
     );
 }
 

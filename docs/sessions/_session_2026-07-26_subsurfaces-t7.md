@@ -157,3 +157,34 @@ Parhelion's internals, and it behaves like foot does. Two unrelated clients, one
 launched by the other, both decorated, both responsive.
 
 Roland's summary: *"I would call this a success."*
+
+## Follow-up: the first window's decorations were off-screen
+
+Roland's smoke found what the suite could not: **the first `foot` had no visible
+decorations; every later window did.**
+
+Measured cause — foot places its decorations outside its own surface and declares
+exactly that:
+
+```
+wl_subsurface.set_position(0, -26)      # title bar, 26 px ABOVE the surface
+wl_subsurface.set_position(-5, -26)     # borders, outside on every side
+xdg_surface.set_window_geometry(0, -26, 696, 494)
+```
+
+We placed the **raw surface** at the C10 cascade slot, and the first slot is
+`(0, 0)` — so the title bar landed at y = −26, off the top of the output. Later
+windows get (32,32), (64,64)…, which have room. The decorations were composited
+correctly the whole time, into pixels outside the screen.
+
+**Fix:** placement now subtracts the declared geometry's origin, so the *window*
+lands at the cascade slot and the decoration overhang falls outside it — what
+`set_window_geometry` is for, and what every real compositor does with it.
+
+**Test:** `a_window_is_placed_by_its_declared_geometry_not_its_surface_origin`,
+verified to fail against the old placement (`(0,0)` where `(4,6)` is required).
+
+**Worth keeping:** no test in the suite could have found this. Every rig client
+draws at its own origin and declares no geometry, so none of them had the shape
+that fails. Our tests describe clients we write; the interesting failures come
+from clients we don't.

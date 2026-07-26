@@ -720,6 +720,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "libseat"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6656c69b6e0366ffb83faa232f3e4fda5fc91161722d140f2c95ce2e90b1ef31"
+dependencies = [
+ "errno",
+ "libseat-sys",
+ "log",
+]
+
+[[package]]
+name = "libseat-sys"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8a484fa48be5f62a8d3ffed767779d0ab808cfead91de98ef4362d469097dfb"
+dependencies = [
+ "pkg-config",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1125,6 +1145,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "parhelion-backend-drm"
+version = "0.0.0"
+dependencies = [
+ "parhelion-backend-headless",
+ "parhelion-core",
+ "smithay",
+]
+
+[[package]]
 name = "parhelion-backend-headless"
 version = "0.0.0"
 dependencies = [
@@ -1135,6 +1164,7 @@ dependencies = [
 name = "parhelion-backend-winit"
 version = "0.0.0"
 dependencies = [
+ "parhelion-backend-drm",
  "parhelion-backend-headless",
  "parhelion-core",
  "signal-hook",
@@ -1563,10 +1593,13 @@ dependencies = [
  "cgmath",
  "cursor-icon",
  "downcast-rs",
+ "drm",
+ "drm-ffi",
  "drm-fourcc",
  "errno",
  "indexmap",
  "libc",
+ "libseat",
  "profiling",
  "rand",
  "rustix 1.1.4",

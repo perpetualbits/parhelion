@@ -6,7 +6,7 @@
  *
  * Status is DERIVED, never invented:
  *   - "done"    = code is in the tree with tests (verified via `make test`).
- *   - "active"  = part of the current milestone (M1) and not yet shipped.
+ *   - "active"  = part of the current milestone (M2) and not yet shipped.
  *   - "planned" = scheduled for a later milestone (M2..M9); no code yet.
  *   - "seam"    = a deliberate interface that exists now but is filled later
  *                 (e.g. the texture-source binding, the render-target trait).
@@ -29,7 +29,7 @@ window.PROJECT_MAP = {
   // rests on colour alone (the palette is CVD-validated, but shape carries it).
   statuses: {
     done:    { label: "Shipped",     hint: "Built and tested — in the tree, green under `make test`." },
-    active:  { label: "In progress", hint: "Part of the current milestone (M1); not yet shipped." },
+    active:  { label: "In progress", hint: "Part of the current milestone (M2); not yet shipped." },
     planned: { label: "Planned",     hint: "Scheduled for a later milestone; no code yet." },
     seam:    { label: "Seam",        hint: "A deliberate interface reserved now, filled by later work." },
   },
@@ -274,12 +274,16 @@ window.PROJECT_MAP = {
     {
       id: "render-loop", label: "Render loop (T-render)", layer: "render", status: "done",
       tags: ["M1", "T1"],
-      desc: "The render skeleton: pull an immutable snapshot, hand it to the compositor, and count the frame. Driven by a test-controlled tick today (no wall-clock, deterministic goldens); the vblank-tied frame scheduler that replaces the tick arrives with the DRM backend.",
+      desc: "The render skeleton: pull an immutable snapshot, hand it to the compositor, and count the frame. The tick itself never changed \u2014 what changed is who calls it: a test in the headless suite, winit's redraw when nested, and on metal a message from T-commit once per vblank (M2 T1). The scheduler proper \u2014 render-as-late-as-possible against the vblank deadline \u2014 is M2 T3.",
       files: ["crates/core/src/render.rs"],
-      specs: [{ label: "scene_graph_v1.md §4", href: "docs/scene_graph_v1.md" }],
+      specs: [
+        { label: "scene_graph_v1.md \u00a74", href: "docs/scene_graph_v1.md" },
+        { label: "scene_graph_v1.md \u00a713.1", href: "docs/scene_graph_v1.md" },
+      ],
       parts: [
         { label: "Tick + frame counters", status: "done", desc: "frames-produced / nodes-composited instrumentation." },
-        { label: "Frame scheduler (vblank)", status: "planned", desc: "Render-as-late-as-possible, tied to T-commit (M2)." },
+        { label: "Vblank-driven tick", status: "done", desc: "On metal the tick is a message from T-commit, once per vblank (M2 T1). Headless and nested tick sources unchanged." },
+        { label: "Frame scheduler", status: "planned", desc: "Render-as-late-as-possible against the deadline, plus presentation-time (M2 T3)." },
       ],
       deps: ["snapshot", "compositor-seam"],
     },
@@ -359,18 +363,48 @@ window.PROJECT_MAP = {
       ],
       parts: [
         { label: "InputEvent funnel", status: "done", desc: "The interface: every source produces it, the dispatch thread applies it." },
-        { label: "Dedicated thread", status: "planned", desc: "Arrives with libinput and the DRM backend (M2)." },
+        { label: "Dedicated thread", status: "planned", desc: "The DRM backend has landed without it (M2 T1): on metal there is no input at all until libinput arrives in M2 T2." },
       ],
       deps: ["seat-input"],
     },
     {
-      id: "drm", label: "DRM/KMS + libinput", layer: "backend", status: "planned",
-      tags: ["M2"],
-      desc: "The metal: atomic KMS commits, plane assignment, mode setting, and a hardware cursor plane driven straight from the input thread; libinput for real devices; VT switching and modeset survival.",
-      files: [],
-      specs: [{ label: "milestone M2", href: "docs/parhelion_milestone_plan.md" }],
-      parts: [],
-      deps: [],
+      id: "drm", label: "DRM/KMS backend", layer: "backend", status: "active",
+      tags: ["M2", "T1"],
+      desc: "The metal: a libseat session, atomic KMS commits into dumb buffers, the first connected connector at its preferred mode, and VT switches survived. The CPU compositor's existing frames reach glass unchanged \u2014 the GPU is deliberately later (T4\u2013T6). What the connector reports becomes what wl_output advertises, including a refresh computed from the mode's own timings rather than the whole-hertz vrefresh field, which retires the 60 Hz claim T7 had to make.",
+      files: ["crates/backend-drm/"],
+      specs: [
+        { label: "scene_graph_v1.md \u00a713", href: "docs/scene_graph_v1.md" },
+        { label: "M2 tasks \u2014 T1", href: "docs/plans/m2_tasks.md" },
+        { label: "T1 smoke checklist", href: "docs/plans/m2_t1_smoke_checklist.md" },
+      ],
+      parts: [
+        { label: "libseat session", status: "done", desc: "Runs as an ordinary user; device access granted and revoked by logind." },
+        { label: "Atomic commits + dumb buffers", status: "done", desc: "Double-buffered scanout; one conversion pass on T-render, one row-wise copy on T-commit." },
+        { label: "Connector/mode v1", status: "done", desc: "First connected connector, preferred mode; refresh from the mode timings in millihertz." },
+        { label: "VT pause/resume", status: "done", desc: "Pause drops the in-flight frame; resume re-acquires, full-damages the scene, and modesets." },
+        { label: "Cursor plane", status: "planned", desc: "Hardware cursor driven from T-input (M2 T2)." },
+        { label: "libinput / real input", status: "planned", desc: "No input on metal until M2 T2 \u2014 the keyboard is silent, by construction." },
+        { label: "Frame scheduler", status: "planned", desc: "One frame in flight today; render-as-late-as-possible is M2 T3." },
+        { label: "GPU / dmabuf", status: "planned", desc: "Dumb buffers are the honest v1; the renderer arrives at M2 T4\u2013T6." },
+        { label: "Multi-output + hotplug", status: "planned", desc: "One output, no hotplug (M9)." },
+      ],
+      deps: ["cpu-compositor", "t-commit"],
+    },
+    {
+      id: "t-commit", label: "T-commit thread", layer: "backend", status: "done",
+      tags: ["M2", "T1", "\u00a77"],
+      desc: "CORE-BOUNDARY \u00a77's commit thread, made real. It owns the libseat session, the DRM fd (and DRM master), the atomic surface, both scanout buffers, and the vblank source, in its own calloop loop \u2014 and nothing else in the process touches any of them. Its vblank is what ticks T-render, so the compositor's clock on metal is the display engine's. A rejected atomic commit is never retried in place: the loop's 100 ms timeout is the retry, because the one thread that must never spin is this one.",
+      files: ["crates/backend-drm/src/commit.rs"],
+      specs: [
+        { label: "scene_graph_v1.md \u00a713.1", href: "docs/scene_graph_v1.md" },
+        { label: "CORE-BOUNDARY \u00a77", href: "docs/CORE-BOUNDARY.md" },
+      ],
+      parts: [
+        { label: "Dedicated thread", status: "done", desc: "Named parhelion-commit; ownership answerable from a backtrace." },
+        { label: "Vblank \u2192 render tick", status: "done", desc: "One frame in flight; the watchdog restarts a stalled cycle." },
+        { label: "Session pause/resume", status: "done", desc: "VT switches handled on the thread that owns the device." },
+      ],
+      deps: ["render-loop"],
     },
 
     /* ---- Microkernel processes ------------------------------------------- */

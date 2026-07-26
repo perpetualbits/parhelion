@@ -249,12 +249,18 @@ pub const KEY_REPEAT_RATE_HZ: i32 = 25;
 /// which learns about real connectors.
 pub const OUTPUT_NAME: &str = "parhelion-0";
 
-/// Refresh rate advertised for the output's mode, in **millihertz** — 60 Hz.
+/// Default refresh rate advertised for the output's mode, in **millihertz** —
+/// 60 Hz. Used by backends that have no vblank of their own to report.
 ///
-/// It is a claim about pacing that M1 cannot yet keep: the render loop is
-/// externally ticked and has no vblank (§4). Clients ask for a number and some
-/// use it to schedule, so a plausible one is better than a zero; the real number
-/// comes from the connector's mode with the DRM backend (M2).
+/// For the nested (winit) and headless backends this is still a claim rather
+/// than a measurement — the render loop is externally ticked and has no vblank
+/// (§4) — but clients ask for a number and some schedule against it, so a
+/// plausible one beats a zero.
+///
+/// **On metal it is no longer used.** The DRM backend (M2 T1) computes the real
+/// refresh from the connector's mode timings and states it through
+/// [`ProtocolHost::set_output_mode`], so `wl_output` reports what the hardware
+/// does, not what we hoped.
 pub const OUTPUT_REFRESH_MHZ: i32 = 60_000;
 
 /// The output's size until a backend states its real one with
@@ -372,9 +378,10 @@ enum Control {
     /// dispatch thread. Producers (winit's loop, the test rig) never touch a
     /// protocol object themselves.
     Input(InputEvent),
-    /// The backend's output changed size (T7): re-advertise the mode so clients
-    /// learn the new screen size.
-    OutputSize(u32, u32),
+    /// The backend's output changed mode (T7; refresh added in M2 T1):
+    /// re-advertise it so clients learn the new screen size *and* how fast it
+    /// actually refreshes. Carries `(width, height, refresh in mHz)`.
+    OutputMode(u32, u32, i32),
     /// Send `xdg_wm_base.ping` to every shell client with a live toplevel (T5).
     PingClients,
     /// Stop the dispatch loop and let the thread exit.
@@ -1913,12 +1920,32 @@ impl ProtocolHost {
     }
 
     /// Tell the compositor how big its output is (T7) — the backend's window
-    /// size in the nested case, a connector's mode in M2. Re-advertises the mode
-    /// to every client bound to `wl_output`.
+    /// size in the nested case. Re-advertises the mode to every client bound to
+    /// `wl_output`, keeping the [`OUTPUT_REFRESH_MHZ`] default refresh.
+    ///
+    /// A backend that knows its real refresh rate calls
+    /// [`set_output_mode`](Self::set_output_mode) instead. This one is for the
+    /// backends that genuinely do not: a nested window has no vblank of its own.
     ///
     /// Asynchronous like every other control message; nothing waits for it.
     pub fn set_output_size(&self, width: u32, height: u32) {
-        let _ = self.control_tx.send(Control::OutputSize(width, height));
+        self.set_output_mode(width, height, OUTPUT_REFRESH_MHZ);
+    }
+
+    /// Tell the compositor its output's **whole** mode (M2 T1): size *and*
+    /// refresh in millihertz, as read off a real connector.
+    ///
+    /// This is what retires the 60 Hz claim T7 had to make. On metal the number
+    /// is computed from the mode's own timings (pixel clock ÷ total scanline
+    /// area), so `wl_output` reports the rate the hardware will actually deliver
+    /// — 59.951 Hz if that is what the panel does — rather than a plausible
+    /// round number.
+    ///
+    /// Asynchronous like every other control message; nothing waits for it.
+    pub fn set_output_mode(&self, width: u32, height: u32, refresh_mhz: i32) {
+        let _ = self
+            .control_tx
+            .send(Control::OutputMode(width, height, refresh_mhz));
     }
 
     /// A clone of the render side's notice handle. Hand this to the
@@ -2349,10 +2376,10 @@ fn run_dispatch(
                     // new one. The scene's own damage on resize is the backend's
                     // business (it owns the frame); this is only the protocol
                     // half.
-                    Control::OutputSize(w, h) => {
+                    Control::OutputMode(w, h, refresh) => {
                         let mode = OutputMode {
                             size: (w as i32, h as i32).into(),
-                            refresh: OUTPUT_REFRESH_MHZ,
+                            refresh,
                         };
                         state.output.set_preferred(mode);
                         state.output.change_current_state(Some(mode), None, None, None);

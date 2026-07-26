@@ -31,10 +31,23 @@
 # the package the test skips loudly rather than failing, which is exactly what a
 # developer without foot should get — and exactly what CI must not.
 #
+# **`libseat`** — a stated dependency since M2 T1:
+#
+#   - The DRM/KMS backend runs under a libseat session, which is what lets the
+#     compositor open a DRM device and survive VT switches without being root.
+#     Smithay's `backend_session_libseat` links against the library, so the crate
+#     does not *build* without the headers.
+#   - CI **builds** `parhelion-backend-drm` and runs its unit tests (mode
+#     selection, refresh arithmetic, stride handling — all pure functions over
+#     plain data). It never opens a device, never takes DRM master, and never
+#     touches a connector: there is no GPU and no seat on a CI runner, and a test
+#     that pretended otherwise would be testing the mock.
+#
 # Everything else still holds: no libwayland, no GPU packages, no display server.
-# When the DRM/KMS backend arrives (M2) the hardware-touching tests get their own
-# job with the packages they need; the nested winit backend is *built* here but
-# never run, since it needs a display.
+# The winit and DRM backends are *built* here but their hardware paths are never
+# run — one needs a display, the other a TTY. What proves those works is the
+# interactive checklist in `docs/plans/m2_t1_smoke_checklist.md` and Roland's
+# eyes, and the session summaries say so item by item.
 name: CI
 
 on:
@@ -56,13 +69,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The two system dependencies (see the header): xkbcommon for wl_keyboard's
-      # keymap (`-dev`, since the crate links against it at build time), and foot
-      # for the M1 acceptance test.
+      # The three system dependencies (see the header): xkbcommon for
+      # wl_keyboard's keymap, foot for the M1 acceptance test, and libseat for
+      # the DRM backend's session layer. The two `-dev` packages are needed
+      # because their crates link at build time; `foot` is a runtime dependency
+      # of one test.
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libxkbcommon-dev foot
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libseat-dev foot
 
       # Stable toolchain with clippy — `make test` runs `cargo clippy` with
       # warnings denied, so the clippy component is required.

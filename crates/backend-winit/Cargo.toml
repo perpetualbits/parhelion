@@ -23,6 +23,12 @@ parhelion-core = { path = "../core" }
 # headless backend owns both; presenting them in a window is this crate's whole
 # addition, which is why there is no third copy of the compositor here.
 parhelion-backend-headless = { path = "../backend-headless" }
+# The DRM/KMS backend, for `parhelion-dev --drm` (M2 T1). This is a dependency of
+# the *binary*, not of the nested backend library — `NestedBackend` names nothing
+# from it. One binary that can select its backend is what the task asked for, and
+# cargo has no per-target dependency to express that; when a third backend appears
+# `parhelion-dev` earns its own crate and this line goes away.
+parhelion-backend-drm = { path = "../backend-drm" }
 # Window creation and desktop input intake. Pinned to the 0.30 series (0.31 is
 # still in beta); the API churn winit is known for lands behind this crate,
 # which is the only place that names it.

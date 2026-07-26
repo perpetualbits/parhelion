@@ -1,0 +1,50 @@
+# crates/backend-drm — the DRM/KMS backend: Parhelion on the metal (M2 T1).
+#
+# Governing docs: `docs/scene_graph_v1.md` §13 (this backend: T-commit, the frame
+# handoff, VT semantics), `docs/plans/m2_tasks.md` T1, `docs/CORE-BOUNDARY.md`
+# §3 C1 (DRM/KMS is in the core) and §7 (T-commit's ownership).
+#
+# # Which Smithay layers this consumes, and which it still does not
+#
+# The decision "2026-07-24 — Smithay threading fit" consume-listed Smithay's
+# hardware backends for "M1/M2" while permanently bypassing its renderer and
+# desktop layers. This crate is that "later": `backend_drm` (device, atomic
+# surface, vblank event source) and `backend_session_libseat` (the seat/session,
+# VT switching, device revocation).
+#
+# The bypass is intact and grep-verifiable: `smithay::backend::renderer` appears
+# nowhere in this crate or the workspace. Notably **no `backend_gbm`, no
+# `backend_egl`** either — dumb buffers need neither, and pulling GBM in would
+# drag the graphics stack M2 T4/T5 will introduce on purpose.
+#
+# One deliberate reach past Smithay: dumb-buffer creation and mapping go straight
+# to `smithay::reexports::drm`. Smithay's own `DumbAllocator` hands out a
+# `DumbBuffer` that exposes only `handle(&self) -> &Handle`, while
+# `map_dumb_buffer` needs `&mut` — so the wrapper cannot map the buffer it
+# allocated. Owning the four ioctls ourselves is smaller than working around
+# that, and it keeps the per-frame path something we can read.
+[package]
+name = "parhelion-backend-drm"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# The core: the scene this backend snapshots, the render loop it drives, and the
+# protocol host it tells the real output mode to.
+parhelion-core = { path = "../core" }
+# The CPU compositor and the `Frame` it paints. M2 T1 presents the *existing*
+# CPU-rendered frames on real hardware; the GPU renderer is T4–T6. So there is no
+# third compositor here — only the copy from `Frame` to a scanout buffer.
+parhelion-backend-headless = { path = "../backend-headless" }
+# Pinned exactly, per the Smithay-threading decision. `default-features = false`
+# plus these two features is the whole hardware surface we consume; see the
+# header for what is deliberately absent.
+smithay = { version = "=0.7.0", default-features = false, features = [
+    "backend_drm",
+    "backend_session_libseat",
+] }
+
+# Inherit the workspace lint policy (see the root Cargo.toml).
+[lints]
+workspace = true

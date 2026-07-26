@@ -38,12 +38,12 @@ the standing instruction set every session obeys.
 | `docs/parhelion_decision_log.md` | Append-only log of load-bearing decisions; read second, after this index. | Installed, living |
 | `docs/smithay_threading_spike.md` | M0 task 2 investigation spike: can Smithay be driven inside CORE-BOUNDARY §7, and which layers we consume. Report + recommendation; decision landed 2026-07-24. | Installed · complete |
 | `docs/harness_design.md` | Canonical design for the test harness: frame/golden format, comparator tolerance policy, blessing workflow, determinism contract, failure artifacts (P8). | Installed, authoritative · Draft v0.1 |
-| `docs/scene_graph_v1.md` | Canonical design for the scene graph, render loop, and snapshot mechanism (M1 T1–T4): node model (born-3D-ready/2.5D-implemented), texture-source seam incl. real `wl_shm` copy-at-commit (§3.1, T3), §7 thread ownership, snapshot semantics, CPU compositor, the reverse path (§8, T2), **damage tracking v1 — region algebra / retained-frame rendering / partial-copy CoW (§9, T4)**, **mapping semantics + roles (§10, T5)**, and **input, focus, and the nested backend (§11, T6: the InputEvent funnel, the read-mostly focus replica, the recorded §7 winit deviation)**. Absorbs the M0 ledger. | Installed, authoritative · Draft v0.1 |
+| `docs/scene_graph_v1.md` | Canonical design for the scene graph, render loop, and snapshot mechanism (M1 T1–T4): node model (born-3D-ready/2.5D-implemented), texture-source seam incl. real `wl_shm` copy-at-commit (§3.1, T3), §7 thread ownership, snapshot semantics, CPU compositor, the reverse path (§8, T2), **damage tracking v1 — region algebra / retained-frame rendering / partial-copy CoW (§9, T4), including the named re-stated-state rule (§9.3)**, **mapping semantics + roles (§10, T5)**, **input, focus, and the nested backend (§11, T6: the InputEvent funnel, the read-mostly focus replica, the recorded §7 winit deviation)**, and **the DRM/KMS backend (§13, M2 T1: T-commit's ownership, connector/mode and the real refresh, the frame handoff, VT semantics, and what is verified how)**. Absorbs the M0 ledger. | Installed, authoritative · Draft v0.1 |
 | `docs/parhelion_project_index.md` | This file. | Living |
 | `docs/diary.md` | Running narrative diary; the why behind non-obvious choices, tagged. | Living |
-| `docs/sessions/` | One summary per Claude Code session (files changed, build/test result). | Living · latest `_session_2026-07-25_seat-input-winit-t6.md` |
-| `docs/plans/` | Per-milestone task breakdowns (`mN_tasks.md`), written at each milestone's start. | `m1_tasks.md` (M1 "One window, honestly", T1–T7 — **complete**), `m2_tasks.md` (M2 "On the metal", T0–T8 — T0 in progress) |
-| `docs/prompts/` | Task prompts authored in the chat project for Claude Code. | `prompt_00_scaffolding.md`, `prompt_04_scene_graph_v1.md`, `prompt_05_frame_callbacks_backpressure.md`, `prompt_06_shm_seam_check.md`, `prompt_08_xdg_shell.md`, `prompt_09_seat_input_winit.md`, `prompt_10_m1_acceptance.md`, `prompt_11_clipboard_m1_close.md` |
+| `docs/sessions/` | One summary per Claude Code session (files changed, build/test result). | Living · latest `_session_2026-07-26_drm-session-t1.md` |
+| `docs/plans/` | Per-milestone task breakdowns (`mN_tasks.md`), plus operational checklists for work no test can reach. | `m1_tasks.md` (M1 "One window, honestly", T1–T7 — **complete**), `m2_tasks.md` (M2 "On the metal", T0–T8 — T0, T7, T1 complete), `m2_t1_smoke_checklist.md` (the TTY smoke protocol for the DRM backend) |
+| `docs/prompts/` | Task prompts authored in the chat project for Claude Code. | `prompt_00_scaffolding.md`, `prompt_04_scene_graph_v1.md`, `prompt_05_frame_callbacks_backpressure.md`, `prompt_06_shm_seam_check.md`, `prompt_08_xdg_shell.md`, `prompt_09_seat_input_winit.md`, `prompt_10_m1_acceptance.md`, `prompt_11_clipboard_m1_close.md`, `prompt_14_drm_session.md` |
 | `docs/archive/` | Superseded documents, kept verbatim; do not edit. | `0002-procedural-content-open-vocabulary.md` (superseded in format by the decision log) |
 | `third_party/spine/` | Vendored, pinned SPINE core spec (v0.4) from ENO; read-only. | Empty — pending Roland copying the spec files |
 
@@ -63,19 +63,39 @@ document; never create a parallel document on the same topic.
 | Core: scene graph, render loop, snapshot | `crates/core/` (`scene/`, `render.rs`) | `docs/scene_graph_v1.md` | Scene state (roles, damage) + snapshot + CPU compositor v1 |
 | Core: protocol frontend (`ProtocolHost`) | `crates/core/src/protocol.rs` | `docs/CORE-BOUNDARY.md` §3 (C3), §7 | `wl_compositor` + `wl_shm` + `xdg_wm_base` + `wl_seat` + `wl_output` + `wl_data_device_manager`; publishes to the scene (ledger absorbed) |
 | Core: input funnel and focus routing | `crates/core/src/input.rs` | `docs/scene_graph_v1.md` §11 | `InputEvent` + `FocusMap`; T-input's interface (its thread is M2) |
-| Backends (headless, winit, DRM/KMS) | `crates/backend-*/` | `docs/scene_graph_v1.md` §6, §11.4 | `backend-headless` (CPU compositor + `Frame`) and `backend-winit` (nested window + `parhelion-dev`) |
+| Backends (headless, winit, DRM/KMS) | `crates/backend-*/` | `docs/scene_graph_v1.md` §6, §11.4, §13 | `backend-headless` (CPU compositor + `Frame`), `backend-winit` (nested window + `parhelion-dev`), and `backend-drm` (libseat session, atomic KMS, dumb buffers, T-commit) |
 | Test harness (golden + protocol rigs) | `crates/harness/` | `docs/harness_design.md` | Golden rig, protocol rig (incl. the toplevel dance, protocol-error assertions, input injection), socket tests |
 | Supervisor (P0) | `crates/supervisor/` | `docs/CORE-BOUNDARY.md` §6, §8 | Not yet (from M4) |
 | Reference policy daemon (S1) | `crates/policyd/` | (no standalone doc yet) | Not yet (from M4) |
 | Vendored SPINE core spec | `third_party/spine/` | ENO's spec at pinned v0.4 — read-only | Dir present, empty |
 
-Future crates (`backend-drm`, `supervisor`, `policyd`) are not workspace members
-yet; they appear at the milestone that needs them. `backend-winit` joined at M1
-T6.
+Future crates (`supervisor`, `policyd`) are not workspace members yet; they appear
+at the milestone that needs them. `backend-winit` joined at M1 T6, `backend-drm`
+at M2 T1.
 
 ---
 
 ## Current state
+
+- **M2 T1 — Session, DRM/KMS atomic, dumb buffers, complete 2026-07-26**
+  (`docs/plans/m2_tasks.md`; `docs/scene_graph_v1.md` §13). `parhelion-dev --drm`
+  boots from a TTY: a libseat session, atomic KMS commits into double-buffered
+  dumb buffers, the first connected connector at its preferred mode, and VT
+  switches survived (pause drops the in-flight frame; resume re-acquires,
+  full-damages the scene, and modesets). **T-commit is born** — its own named
+  thread owning the DRM fd, the session, the surface, the buffers, and the vblank
+  source — and **its vblank is what ticks T-render**, so the render loop finally
+  has a real clock. The headless and nested tick sources are unchanged, which is
+  why the whole existing suite still proves what it proved. `wl_output` now
+  advertises a refresh computed from the mode's own timings in millihertz, not the
+  whole-hertz `vrefresh` field, **retiring T7's 60 Hz claim**. No renderer feature
+  from Smithay entered the tree. `make test`: **142 tests green**, clippy clean;
+  17 new tests, all of them CI-runnable pure logic.
+  **Not verified by any test, by construction:** that a mode-set happens at all,
+  that the picture is not sheared, that VT switching returns a correct screen, and
+  that the console comes back — those are `docs/plans/m2_t1_smoke_checklist.md`
+  and Roland's eyes. **Verdict pending.** Also absent on metal, deliberately:
+  **no input and no cursor** until T2.
 
 - **Interactive smoke verified by Roland (2026-07-26):** foot has its title bar;
   a second, independent terminal (`rt`) runs and looks right; `rt` launched from

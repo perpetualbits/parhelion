@@ -818,3 +818,66 @@ guards. This closes M0.
 - **And it took a human looking at a screen.** The compositor was correct by every
   assertion we had, the acceptance test was green, the decorations were composited
   exactly as instructed — into pixels nobody could see. `#milestone`
+
+## The metal (2026-07-26)
+
+- **The seam check I was told to stop and report on: it passed, and it was not
+  close.** `backend_drm` + `backend_session_libseat` with `default-features =
+  false` build without pulling `backend::renderer`, `backend_gbm`, or
+  `backend_egl`. I checked before writing a line of the crate — a scratch crate
+  that just names `LibSeatSession`, `DrmDevice`, `DumbAllocator` and
+  `framebuffer_from_dumb_buffer`, compiled and linked. The layer table from the M0
+  spike has now predicted the shape of three separate integrations. `#design-decision`
+
+- **Then the wrapper I had just verified turned out to be unusable.** Smithay's
+  `DumbBuffer` exposes `handle(&self) -> &Handle`; `map_dumb_buffer` takes
+  `&mut`. So the allocator can hand you a buffer it cannot let you write into,
+  and writing into it is the *only* thing this backend does per frame. Four
+  ioctls of our own were smaller than any way around that. Worth recording as a
+  category rather than a grumble: a dependency can be right at the layer you
+  chose it for and still not fit at the method you need. `#discovery` `#tradeoff`
+
+- **`Rc` decided the startup sequence.** `LibSeatSession` is a `Weak` and its
+  notifier holds the `Rc` — both `!Send`. I had planned to open the session and
+  scan connectors on the setup thread and hand the device to T-commit; that is
+  not expressible. So *all* hardware setup happens on T-commit and the discovered
+  mode travels back over a channel, which is why the sequence is "spawn, learn the
+  mode, then build the compositor". The version that reads worse in a design
+  sketch is the one the types permit, and it has a real virtue: `wl_output` is
+  told the truth before the compositor it describes exists, so no client can ever
+  observe the placeholder size. `#core` `#discovery`
+
+- **The prompt said the render thread hands `Frame`s over a channel. It cannot.**
+  The CPU compositor *retains* its frame — that is what damage tracking is — so
+  the frame cannot be moved out from under it, and cloning it per vblank is 8 MB
+  of memcpy for nothing. What crosses is a recycled `Vec<u8>` holding the frame
+  already converted to `XRGB8888`: work that has to happen anyway, done on the
+  thread that just touched every pixel, leaving T-commit one `copy_from_slice` per
+  row. One pass, one copy. The design note that made this obvious was §9.4, which
+  I read for a different reason. `#tradeoff` `#design-decision`
+
+- **The refresh rate is the whole point of the task and it is four lines of
+  arithmetic.** `drm_mode_modeinfo` carries `vrefresh` in whole hertz, and using
+  it would have been one accessor call and a lie: a panel that runs at 59.953 Hz
+  gets reported as 60, clients schedule against it, and they drift a frame every
+  twenty minutes. The kernel's own formula in millihertz is
+  `clock_kHz × 10⁶ / (htotal × vtotal)`. My first test asserted 59_952 and the
+  code said 59_953 — I had done the division in my head and rounded the wrong
+  way. The code was right; the test was the thing that was wrong, which is the
+  good version of that failure. `#core` `#bug`
+
+- **The watchdog exists because of what T-commit must never do.** If an atomic
+  commit is rejected, the obvious response is to retry it. Retrying in place is a
+  spin, on the one thread in the process that must not spin (I-1's whole
+  neighbourhood). So a rejected commit sets "next one is a modeset" and *does
+  nothing else*; the loop's 100 ms timeout is the retry. The same timeout is how
+  the shutdown flag gets noticed. One interval, two jobs, no busy loop.
+  `#invariant` `#design-decision`
+
+- **The hardware-honesty rule has nothing to record yet, and that is the honest
+  entry.** This session wrote the code and the checklist; the connector's actual
+  reported mode, the stride, and whether it is padded are Roland's to read off a
+  TTY. The checklist asks for exactly those four facts. Until they come back, the
+  only hardware claim in this session's ledger is that the crate compiles and its
+  arithmetic is tested — and the summary says so rather than implying more.
+  `#open-question` `#milestone`

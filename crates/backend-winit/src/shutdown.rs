@@ -53,6 +53,17 @@ impl ShutdownFlag {
         self.raised.store(true, Ordering::Relaxed);
     }
 
+    /// The bare shared flag, for a loop that lives in another crate.
+    ///
+    /// The DRM backend's commit thread polls the same flag but must not depend on
+    /// this crate to do it (a backend depending on a sibling backend would be the
+    /// wrong shape), so it takes a plain `Arc<AtomicBool>`. Handing out the inner
+    /// `Arc` is what keeps there being exactly one flag rather than two that have
+    /// to be kept in step.
+    pub fn shared(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.raised)
+    }
+
     /// Arrange for `SIGINT` and `SIGTERM` to raise this flag.
     ///
     /// Returns an error if the handlers cannot be installed, which the caller

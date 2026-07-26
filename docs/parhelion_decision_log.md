@@ -644,6 +644,140 @@ below, reasoning now living in the dialect spec and VISION.md.)
 - **Effect:** foot renders **with its decorations**, and the acceptance test
   asserts they composite. The Pending item for subsurfaces is struck.
 
+## 2026-07-26 — Session, DRM/KMS atomic, dumb buffers (M2 T1)
+
+### T-commit owns the metal; the render tick becomes a message, and no backend trait is introduced
+
+- **Source:** M2 T1 (prompt 14); `docs/scene_graph_v1.md` §13.1.
+- **Affects:** `crates/backend-drm/` (new crate, new workspace member),
+  `CORE-BOUNDARY.md` §7 (T-commit — **satisfied, not amended**) and §3 C1.
+- **Decision:** A dedicated `parhelion-commit` thread owns the libseat session,
+  the DRM fd (and DRM master), the atomic surface, both scanout buffers, and the
+  vblank source, in its own `calloop` loop. `parhelion-render` runs the existing
+  `RenderLoop` on its own thread, ticked **by a message from T-commit once per
+  vblank**. The backends therefore differ only in *who calls `tick`* — and so
+  **no backend trait was added**. The prompt allowed the interface to grow if it
+  needed to; it did not. The core already has the seam that matters (the
+  `Compositor` trait, §6), and a trait over two callers with different
+  lifecycles would have been abstraction beyond the task.
+- **Reasoning:** §7 names T-commit's ownership set almost exactly, and the value
+  of writing it down was always that one thread would eventually have to hold it.
+  Making the tick a message rather than a trait method keeps the headless and
+  nested tick sources **byte-for-byte unchanged**, which is what lets the whole
+  existing suite go on proving what it proved. The §11.2 winit deviation is
+  untouched and still stands until T2.
+- **Discovered, and load-bearing:** Smithay's `LibSeatSession` **and** its
+  notifier are `Rc`-based and therefore **not `Send`**. The session cannot be
+  created on one thread and handed to another, so *all* hardware setup happens on
+  T-commit and the discovered mode travels back over a channel. This is why the
+  startup sequence is "spawn, then learn the mode, then build the compositor"
+  rather than the reverse.
+
+### Pixels cross the thread boundary, not `Frame`s
+
+- **Source:** M2 T1; `docs/scene_graph_v1.md` §13.3.
+- **Affects:** the T-render → T-commit channel; `backend-drm/src/present.rs`.
+- **Decision:** T-render converts its composited frame to `XRGB8888` into a
+  **recycled** `Vec<u8>` and sends that; T-commit copies it row-wise into the back
+  buffer's mapping and page-flips. The buffer returns with the next tick, so
+  steady-state allocation is zero.
+- **Reasoning:** The prompt's parenthetical put the copy on T-commit ("hands
+  completed `Frame`s over a channel"). It cannot be done that way: the CPU
+  compositor **retains** its frame for damage tracking (§9.4), so the frame cannot
+  be moved out from under it, and cloning it would add a whole second full-frame
+  copy. Converting on the thread that just touched every pixel costs one pass —
+  work that has to happen regardless — and leaves T-commit one memcpy per row.
+  One pass, one copy, is the minimum for two threads that must not share memory.
+- **Recorded consequence:** `blit_to_pitch` and `frame_to_xrgb8888` duplicate the
+  shape of `backend-winit`'s `present::frame_to_argb`. Three similar lines beat a
+  premature abstraction (CLAUDE.md), and the two differ in target format and
+  stride handling; unifying them is a cleanup for whenever a third presenter
+  appears.
+
+### Dumb buffers go straight to `drm`; Smithay's allocator wrapper cannot map what it allocates
+
+- **Source:** M2 T1; `crates/backend-drm/src/buffer.rs`.
+- **Affects:** the consume/bypass layer table (decision "Smithay threading fit"
+  entry 2 — **confirmed and extended**, not amended).
+- **Verdict on the seam check the prompt asked for: clean.** `backend_drm` +
+  `backend_session_libseat` build with `default-features = false` and pull **no**
+  `backend::renderer`, no `backend_gbm`, and no `backend_egl`.
+  `smithay::backend::renderer` appears nowhere in the workspace (grep-verifiable).
+- **Decision:** Dumb-buffer creation, mapping, and framebuffer attachment use
+  `smithay::reexports::drm` directly rather than `smithay::backend::allocator::dumb`.
+  Smithay's `DumbBuffer` exposes only `handle(&self) -> &Handle` while
+  `map_dumb_buffer` requires `&mut` — so the wrapper **cannot map the buffer it
+  allocated**, and writing into that mapping is the one thing this backend does
+  every frame.
+- **Reasoning:** Four ioctls of our own are smaller and more readable than a
+  workaround, and they keep the per-frame path something a reviewer can follow.
+  This is not a bypass of the layer decision; it is the decision's own rule
+  ("consume the frontend and the hardware layers, supply our own pixels") landing
+  on a wrapper that does not fit.
+
+### `wl_output`'s refresh comes from the mode's timings, not from `vrefresh`
+
+- **Source:** M2 T1; `docs/scene_graph_v1.md` §13.2. **Retires** the scheduled
+  claim in the T7 entry "`wl_output` is implemented, not stubbed".
+- **Affects:** `crates/core/src/protocol.rs` (`Control::OutputMode`,
+  `ProtocolHost::set_output_mode`, `OUTPUT_REFRESH_MHZ`'s meaning),
+  `crates/backend-drm/src/mode.rs`.
+- **Decision:** `ProtocolHost::set_output_mode(w, h, refresh_mhz)` joins
+  `set_output_size`, and the DRM backend computes the refresh as
+  `clock_kHz × 10⁶ / (htotal × vtotal)` in millihertz — the kernel's own formula,
+  with interlace/double-scan/vscan handled — rather than reading
+  `drm_mode_modeinfo.vrefresh`. `OUTPUT_REFRESH_MHZ` survives as the **default for
+  backends with no vblank** (nested, headless), which is an honest use of it.
+- **Reasoning:** `vrefresh` is whole hertz. Rounding a panel's 59.953 Hz to 60 is
+  precisely the plausible-looking lie T7 was forced into and this task exists to
+  retire; clients schedule against the advertised rate, so a 0.08% error is a
+  frame of drift every twenty minutes. Degenerate timings return `None` and the
+  caller substitutes the default **and says so on stderr** — a wrong number
+  delivered confidently is worse than a stated fallback.
+- **Connector/mode policy v1 (recorded so it is not re-litigated):** first
+  connected connector with any mode, at its preferred mode; without a preferred
+  mode, largest area then higher refresh then earlier index — a **total** order,
+  because two runs picking differently would make "it looked right yesterday"
+  evidence of nothing. Multi-output, hotplug, and non-preferred modes are **M9**.
+
+### The re-stated-state rule is named, and scoped to where it is actually enforced
+
+- **Source:** M2 T1, codifying T7's 76% measurement; `docs/scene_graph_v1.md` §9.3.
+- **Affects:** the damage section as a named rule; every future setter.
+- **Rule:** *State re-stated by the protocol must be a no-op when it has not
+  changed. Every setter that damages compares first, and damages only on a real
+  difference.*
+- **Reasoning:** Wayland restates state constantly — a subsurface's position on
+  every effective parent commit, buffer scale/transform with every attach — so a
+  setter that damages unconditionally turns every commit into a structural one and
+  damage tracking silently stops tracking. Both versions are *correct* (§9.1
+  survives, because over-approximation is always legal), which is exactly why it
+  must be a stated rule rather than something a test catches: the proportionality
+  tests notice it as a number drifting, not as a failure.
+- **Scope, stated honestly:** the rule is enforced today in exactly one place,
+  `set_subsurface_position`. `set_geometry`, `set_z`, `set_source`, and `set_role`
+  damage unconditionally and that is *presently* harmless — nothing restates them;
+  they are reached only from `place_solid` and from genuine xdg transitions. That
+  is a property of today's call graph, not of those functions, so the rule carries
+  an obligation: **a setter that acquires a per-commit caller acquires the check in
+  the same change.**
+
+### CI gains its second stated system dependency: `libseat`
+
+- **Source:** M2 T1; `.github/workflows/ci.yml` (header extended, not replaced).
+- **Affects:** CI; the M0 "no apt step" rule, amended once more.
+- **Decision:** CI installs `libseat-dev`, **builds** `parhelion-backend-drm`, and
+  runs its unit tests — all of which are pure functions over plain data (mode
+  policy, refresh arithmetic, stride and channel-order handling). It never opens a
+  device, takes DRM master, or touches a connector.
+- **Reasoning:** Unlike `libxkbcommon` (which turned out to be linked implicitly
+  already — luck made contract), this one is a genuinely new requirement: Smithay's
+  libseat session links against the library, so the crate does not build without
+  the headers. The rule that still holds: no libwayland, no GPU packages, no
+  display server, and no hardware path ever executed in CI. What proves the
+  hardware path is `docs/plans/m2_t1_smoke_checklist.md` and Roland's eyes, and the
+  session summary says so item by item.
+
 ## Pending
 
 - Lock-screen fail-locked design (`CORE-BOUNDARY.md` §6 note).

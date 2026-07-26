@@ -85,6 +85,44 @@ fn resizing_the_output_readvertises_the_mode() {
     );
 }
 
+/// The M2 T1 half of the same edge: a backend that knows its **real** refresh
+/// rate states it, and the client hears that number rather than the 60 Hz
+/// default.
+///
+/// This is the unit half of "refresh is advertised from the real mode". The
+/// arithmetic that turns a connector's mode line into this number is tested in
+/// `parhelion-backend-drm`'s `mode` module; what is tested here is that the
+/// number survives the trip to a client — mocked, because CI has no connector.
+/// The value is a real one: 59.953 Hz is what a laptop panel with a 138.7 MHz
+/// pixel clock over a 1560×1483 total actually does, and it is exactly the sort
+/// of number `vrefresh` would have rounded to a comfortable lie.
+#[test]
+fn a_backend_with_a_real_mode_advertises_its_real_refresh() {
+    let (_scene, host, mut client) = fixture();
+    client.roundtrip();
+    client.roundtrip();
+    let before = client.output_done_count();
+
+    host.set_output_mode(1920, 1200, 59_953);
+    for _ in 0..1000 {
+        if client.output_done_count() > before {
+            break;
+        }
+        client.roundtrip();
+    }
+
+    assert_eq!(
+        client.output_mode(),
+        Some((1920, 1200, 59_953)),
+        "the connector's own geometry and refresh reached the client"
+    );
+    assert_ne!(
+        client.output_mode().map(|(_, _, r)| r),
+        Some(OUTPUT_REFRESH_MHZ),
+        "and it is not the placeholder 60 Hz T7 had to claim"
+    );
+}
+
 /// A mapped window is on the output and is told so; unmapping takes it off
 /// again. This is what lets a client know which screen it is showing on (and, in
 /// M2, which scale to render for).

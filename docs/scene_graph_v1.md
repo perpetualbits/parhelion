@@ -3,8 +3,8 @@
 > **Re-entrancy header.**
 > **Status:** Draft v0.1 · **Date:** 2026-07-24 · **Kind:** subsystem design (the scene graph, render loop, and snapshot mechanism).
 > **Upstream:** `VISION.md` Theses 1 & 3; `CORE-BOUNDARY.md` §3 (C4 scene graph, C5 render loop), §7 (threading), §10.3 (snapshot representation — open); `docs/plans/m1_tasks.md` T1.
-> **Downstream:** T2 (frame callbacks / flush ownership / backpressure — landed, §8), T3 (wl_shm → real `Shm` source — landed, §3.1), T4 (damage tracking — landed, §9), T5 (xdg-shell, roles, and the mapping-semantics migration — landed, §10), T6 (seat/input, focus, and the nested winit backend — landed, §11).
-> **Canonical for:** `crates/core/src/scene/`, `crates/core/src/input.rs`, `crates/core/src/render.rs`, the protocol frontend's scene/input edges in `crates/core/src/protocol.rs`, and the backends in `crates/backend-headless/` and `crates/backend-winit/`.
+> **Downstream:** T2 (frame callbacks / flush ownership / backpressure — landed, §8), T3 (wl_shm → real `Shm` source — landed, §3.1), T4 (damage tracking — landed, §9), T5 (xdg-shell, roles, and the mapping-semantics migration — landed, §10), T6 (seat/input, focus, and the nested winit backend — landed, §11), M2 T7 (subsurfaces — landed, §12.3), M2 T1 (the DRM/KMS backend and T-commit — landed, §13).
+> **Canonical for:** `crates/core/src/scene/`, `crates/core/src/input.rs`, `crates/core/src/render.rs`, the protocol frontend's scene/input edges in `crates/core/src/protocol.rs`, and the backends in `crates/backend-headless/`, `crates/backend-winit/`, and `crates/backend-drm/`.
 > **Change control:** this document is the single canonical scene-graph doc (CLAUDE.md: one doc per subsystem). It supersedes the M0 ledger's role; the ledger is gone.
 
 ---
@@ -355,6 +355,43 @@ content update and it damages only the client's rects. This is what makes a smal
 commit redraw a small region. The scene accumulates this into `pending_damage`,
 which `snapshot()` **drains** (hence `&mut self`) into
 [`SnapshotDamage::{Full, Region}`].
+
+#### The re-stated-state rule (named in M2 T1, learned in T7)
+
+> **State re-stated by the protocol must be a no-op when it has not changed.
+> Every setter that damages compares first, and damages only on a real
+> difference.**
+
+This is a rule about damage, not an optimisation of it. Wayland is full of state
+a client restates as a matter of course: a subsurface's position is re-sent on
+every effective parent commit, a buffer's scale and transform accompany every
+attach, a window's geometry rides its configure. A setter that damages
+unconditionally therefore turns *every* commit into a structural one, and damage
+tracking silently stops tracking anything.
+
+T7 measured exactly that: damaging unconditionally in `set_position` repainted
+**76% of the output per keystroke** in the acceptance run, against 0.62% with the
+equality check. Both versions were *correct* — the governing property in §9.1
+held in each, because over-approximation is always legal — which is precisely why
+this needs to be a stated rule rather than something a test would catch. The
+proportionality tests (`small_damage_redraws_a_small_region`, and the acceptance
+run's 25% bound) are what notice a violation, and they notice it as a number
+drifting rather than as a failure, so the rule is written down where the setters
+are written.
+
+**Where it is enforced today:** `Scene::set_subsurface_position` — the one setter
+currently on a re-statement path, and the one the measurement came from.
+`set_geometry`, `set_z`, `set_source` and `set_role` damage unconditionally and
+that is *presently* harmless, because nothing restates them: they are reached only
+from `SceneHandle::place_solid` (core-owned content, once) and from the xdg
+lifecycle at genuine transitions. That is a property of today's call graph, not of
+those functions.
+
+**The obligation, therefore:** a setter that acquires a per-commit caller acquires
+the equality check in the same change. The candidates are already visible —
+buffer scale and transform (§9.3's marked assumption, M2), `xdg_surface`
+geometry, and opaque regions (M5) — and each of them is state the protocol
+restates by design.
 
 ### 9.4 Retained-frame rendering
 
@@ -855,7 +892,7 @@ gone).
 
 ### 12.5 T7/T7b tests
 
-- **`harness/tests/acceptance.rs`** — the milestone's acceptance run (see §13).
+- **`harness/tests/acceptance.rs`** — the milestone's acceptance run (see §14).
 - **`harness/tests/clipboard.rs`** — copy/paste between two rig clients with the
   bytes checked; the **focus gate asserted** with a third, unfocused client;
   replacement cancels the previous source; the owner's death clears the selection;
@@ -865,7 +902,186 @@ gone).
   output's advertisement, the `wl_shm` rejection paths, the pinned global set, and
   the binary's socket/shutdown behaviour.
 
-## 13. What later tasks add here
+## 13. The DRM backend — session, T-commit, dumb buffers (M2 T1)
+
+`parhelion-dev` stops being the artifact. This section is canonical for
+[`crates/backend-drm`](../crates/backend-drm/): a compositor that boots from a
+TTY, presents the existing CPU-rendered frames through atomic KMS commits into
+dumb buffers, and survives VT switches.
+
+Nothing in §§1–12 changed to make this work. The scene is the same, the snapshot
+is the same, the CPU compositor is the same — a fact worth stating, because it is
+the seam of §6 (the `Compositor` trait, and the core naming no backend type)
+paying for itself. What the metal adds is a second thread and a real clock.
+
+### 13.1 Thread ownership — T-commit is born
+
+§4's diagram gains its third consumer. On metal:
+
+```
+   ┌──────────┐  Snapshot   ┌──────────────┐  XRGB8888 bytes  ┌───────────────┐
+   │ T-scene  │────────────▶│  T-render    │─────────────────▶│  T-commit     │
+   │ canonical│             │  composites  │                  │  OWNS the DRM │
+   │ state    │◀──damage────│  (CpuComp.)  │◀─── tick ────────│  fd, session, │
+   │ (C4/I-5) │   _full     └──────────────┘  (+ recycled     │  surface,     │
+   └──────────┘   on resume                    buffer)        │  buffers      │
+                                                              └───────┬───────┘
+                                                        atomic commit │ vblank
+                                                                      ▼
+                                                                    CRTC
+```
+
+**T-commit** ([`commit.rs`](../crates/backend-drm/src/commit.rs)) owns, and is the
+only thread that touches: the libseat session and its event source, the DRM
+device fd (and with it DRM master), the atomic surface — CRTC, connector, primary
+plane — the two scanout buffers and their framebuffer objects, and the vblank
+event source. It runs its own `calloop` loop. This is CORE-BOUNDARY §7's T-commit,
+made real rather than described.
+
+**T-render** ([`render.rs`](../crates/backend-drm/src/render.rs)) is the same
+`RenderLoop` §4 describes, on its own thread. Both threads are *named*
+(`parhelion-commit`, `parhelion-render`) so ownership is answerable from a
+backtrace, the way T-render's was.
+
+**The vblank is the tick.** M1's `RenderLoop::tick` was called by whoever owned
+the loop — a test, or winit's redraw. On metal it is called once per vblank, by a
+message from T-commit. That is the whole of "the render tick is driven by real
+vblank events", and it is why the advertised refresh becomes a description rather
+than a hope. **The headless and nested tick sources are untouched**, which is what
+lets the entire existing suite keep proving what it proved.
+
+### 13.2 Connector and mode — the 60 Hz claim retired
+
+[`mode.rs`](../crates/backend-drm/src/mode.rs) holds the policy and the
+arithmetic, both over plain data structs rather than `drm` types, so both run in
+CI on a machine with no GPU.
+
+- **Policy v1:** the first connected connector that has any mode, at its
+  preferred mode. Without a preferred mode: largest area, then higher refresh,
+  then earlier in the list — a *total* order, because two runs on the same
+  hardware picking differently would make "it looked right yesterday" evidence of
+  nothing. A connected connector with an empty mode list is skipped, not fatal.
+  Multi-output, hotplug, and non-preferred modes are **M9**.
+- **Refresh from the timings, not from `vrefresh`.** `drm_mode_modeinfo` carries a
+  whole-hertz `vrefresh`, and rounding a panel's 59.953 Hz to 60 is exactly the
+  plausible-looking lie §12.1 had to tell for want of hardware. Instead
+  `refresh_mhz` computes `clock_kHz × 10⁶ / (htotal × vtotal)` in millihertz — the
+  kernel's own formula — with interlacing doubling the field rate, double-scan
+  halving it, and a vertical-scan multiplier dividing it. Degenerate timings
+  return `None` rather than a confident wrong number; the caller substitutes the
+  default and says so on stderr.
+
+The result goes to `ProtocolHost::set_output_mode(width, height, refresh_mhz)`
+**before the compositor is built**, so no client can ever observe the placeholder
+size. `set_output_size` remains, unchanged in meaning, for the backends that
+genuinely have no vblank to report.
+
+### 13.3 The frame handoff, and why pixels cross rather than frames
+
+The obvious design hands the composited `Frame` to T-commit. It cannot: the CPU
+compositor **retains** its frame and repaints only damaged pixels (§9.4), so the
+frame cannot be moved out from under it.
+
+What crosses instead is a recycled `Vec<u8>` holding the frame already converted
+to `XRGB8888` — work that has to happen anyway, done on the thread that has just
+touched every pixel. T-commit's remaining job is one `copy_from_slice` per row
+into the back buffer's mapping. **One conversion pass, one copy**: the minimum for
+two threads that must not share memory. The buffer travels back on the next tick,
+so steady-state allocation is zero.
+
+Two details that are the classic silent-corruption bugs, and so are unit-tested
+([`present.rs`](../crates/backend-drm/src/present.rs)):
+
+- **Stride.** The kernel picks the scanout pitch and is free to round it up for
+  alignment. The copy is per-row, always, even when the pitch happens to be
+  tight — a flat block copy shears the image progressively down the screen, which
+  looks like a driver problem and is not.
+- **Channel order.** `XRGB8888` is a little-endian `0xXXRRGGBB` word, i.e. the
+  bytes `[B, G, R, X]`. The conversion writes those bytes directly rather than
+  composing a `u32`, so it is correct on a big-endian machine for free instead of
+  quietly wrong there. `X` is written `0xFF`, not zero: scanout ignores it, but
+  tools that alias the buffer as `ARGB8888` read zero as fully transparent and
+  show a black screen that looks exactly like a failed mode-set.
+
+Exactly **one frame is in flight** at a time: T-commit ticks only after a vblank,
+and only when no flip is pending and no tick is outstanding. That is the whole of
+M2 T1's frame scheduling, and the honest amount until T3 builds a real one
+(render-as-late-as-possible, `presentation-time`).
+
+`FB_DAMAGE_CLIPS` is deliberately not used yet. It would let the driver re-scan
+only changed rectangles, and the payoff is plane offload, which is **M5**. Passing
+no damage clips means "all of it changed" — always correct, never a lie.
+
+### 13.4 VT switching
+
+logind revokes device access when the session leaves and grants it back on
+return; both arrive as session events on T-commit.
+
+- **Pause** — stop committing and `DrmDevice::pause`. A frame in flight from
+  T-render is **dropped, not queued**: it describes a screen nobody is looking at,
+  and a queue that grows while paused is a queue that would have to be bounded.
+  Its allocation is kept for recycling, so the drop costs nothing.
+- **Resume** — reacquire the device, reset the surface's state (the other VT left
+  the hardware however it liked), tell the scene **everything is damaged** so the
+  next frame is a full repaint, and force the next submission to be a full modeset
+  rather than a page-flip.
+
+**The watchdog.** T-commit's loop wakes at least every 100 ms. That interval does
+two jobs: it is how often the shutdown flag is noticed (a signal handler may only
+set a flag — §12.4), and it restarts the frame cycle if an atomic commit is ever
+rejected. Without the second, one rejected commit would leave the pipeline waiting
+for a vblank that will never arrive and the compositor would look hung. A failed
+commit is **not** retried in place, because a commit retried in a tight loop is a
+spin, and T-commit is the one thread that must never spin.
+
+Shutdown drops the buffers, the surface, and finally the device fd — which is what
+releases DRM master and lets the kernel restore the console. Nothing happens in a
+signal handler.
+
+### 13.5 The seam, held at the place it was most likely to slip
+
+Smithay supplies the session, the DRM device, the atomic surface, and the vblank
+source — exactly the "hardware backends later" the threading-fit decision
+reserved. It supplies **no renderer**: `smithay::backend::renderer` appears nowhere
+in the workspace (grep-verifiable), and `backend_gbm` / `backend_egl` are not
+enabled, because dumb buffers need neither.
+
+One deliberate reach past Smithay: dumb-buffer creation and mapping go straight to
+`smithay::reexports::drm`. Smithay's `DumbAllocator` hands out a buffer exposing
+only `handle(&self) -> &Handle` while `map_dumb_buffer` needs `&mut` — so the
+wrapper cannot map the buffer it allocated, and writing into that mapping is the
+one thing this backend does every frame. Four ioctls of our own are smaller than
+the workaround, and they keep the per-frame path readable.
+
+### 13.6 What is verified how
+
+This is the first task whose acceptance no test can reach, so the split is stated
+rather than implied:
+
+- **CI (unit tests, no hardware):** mode-selection policy including its total
+  order; refresh arithmetic including interlace/double-scan/vscan and degenerate
+  timings; the `XRGB8888` conversion's channel order and alpha handling; the
+  stride-aware blit including padded pitches, tight pitches, and a short
+  destination. Plus a `wl_output` test that a stated real refresh reaches a
+  client. The crate is **built** in CI and its hardware paths never run.
+- **The dev machine, by eye:** everything else — that a mode-set happens at all,
+  that the picture is not sheared, that VT switching returns a correct screen,
+  that the console comes back. The protocol for that is
+  [`docs/plans/m2_t1_smoke_checklist.md`](plans/m2_t1_smoke_checklist.md), and its
+  verdict is recorded afterwards.
+
+### 13.7 What is deliberately absent on metal
+
+**No input.** libinput and the real T-input thread are **T2**. On metal the
+keyboard is silent and there is no pointer: a client maps and renders, and nothing
+can be typed into it. This is expected, it is the single most confusing thing
+about a first TTY run, and the checklist says so in bold.
+
+**No cursor plane** (T2). **No frame scheduler or `presentation-time`** (T3). **No
+GPU, dmabuf, or explicit sync** (T4–T6). **No multi-output, hotplug, or
+suspend/resume** (M9). **No plane offload beyond the primary** (M5).
+
+## 14. What later tasks add here
 
 **M1 is complete.** The acceptance run passes as an automated test: `foot` runs
 headlessly against the compositor, echoes typed input, and typing redraws 0.62% of
@@ -874,11 +1090,13 @@ founding thesis, measured against software we did not write, and re-proved on
 every CI push.
 
 The named successors to this document's temporary parts, all **M2**: the real
-T-input thread on libinput (§11.2), the vblank-tied frame scheduler that replaces
-the test-controlled tick (§4), the cursor plane (§11.4), `presentation-time`
-pacing and occlusion-gated frame callbacks (§8.3), and buffer scale/transform,
-which un-merges the surface-vs-buffer coordinate site marked in §9.3. Placement
-and focus policy leave for the policy daemon S1 in **M4** (§10.4, §11.3).
+T-input thread on libinput (§11.2), the frame scheduler that replaces both the
+test-controlled tick (§4) and §13.3's one-frame-in-flight pacing, the cursor plane
+(§11.4), `presentation-time` pacing and occlusion-gated frame callbacks (§8.3),
+and buffer scale/transform, which un-merges the surface-vs-buffer coordinate site
+marked in §9.3 — and, by §9.3's re-stated-state rule, arrives with its equality
+check. Placement and focus policy leave for the policy daemon S1 in **M4** (§10.4,
+§11.3).
 
 Anything requiring 3D transform math, opaque-region occlusion culling (M5), or
 persistent snapshot sharing (§10.3) is out of scope until explicitly scheduled.

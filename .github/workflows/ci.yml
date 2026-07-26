@@ -67,7 +67,13 @@ jobs:
     name: make test (build + tests + clippy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # v7 (current major), up from v4: v4 targets Node.js 20, which GitHub has
+      # deprecated and now force-runs on Node 24. The warning is harmless today
+      # and becomes a failure when the runners drop the shim, so this is paid
+      # early rather than on the morning it breaks. Going to the current major
+      # rather than the nearest working one buys the same fix and does not have
+      # to be done again next quarter.
+      - uses: actions/checkout@v7
 
       # The three system dependencies (see the header): xkbcommon for
       # wl_keyboard's keymap, foot for the M1 acceptance test, and libseat for
